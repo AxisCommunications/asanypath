@@ -1,0 +1,83 @@
+# Development-only compose file for cloud storage emulators.
+# Usage: docker compose up -d
+#
+# MinIO (S3-compatible):
+#   Endpoint: http://localhost:9000
+#   Console:  http://localhost:9001
+#   Access Key: minioadmin
+#   Secret Key: minioadmin
+#   Bucket:   bench-asanypath (auto-created)
+#
+# Azurite (Azure Blob Storage):
+#   Endpoint: http://localhost:10000/devstoreaccount1
+#   Account: devstoreaccount1
+#   Key: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+#   Container: benchcontainer (auto-created)
+#
+# fake-gcs-server (Google Cloud Storage):
+#   Endpoint: http://localhost:4443
+#   Bucket:   bench-asanypath (auto-created)
+#   No auth required.
+
+services:
+  minio:
+    image: minio/minio
+    env_file:
+      - .env
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    env_file:
+      - .env
+    ports:
+      - "10000:10000"  # Blob service
+      - "10001:10001"  # Queue service
+      - "10002:10002"  # Table service
+    command: azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck --oauth basic
+
+  fake-gcs:
+    image: fsouza/fake-gcs-server
+    env_file:
+      - .env
+    ports:
+      - "4443:4443"
+    command: -scheme http -port 4443 -backend memory
+
+  init:
+    image: amazon/aws-cli
+    depends_on:
+      minio:
+        condition: service_healthy
+      azurite:
+        condition: service_started
+      fake-gcs:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        sleep 1
+        aws --endpoint-url http://minio:9000 s3 mb s3://bench-asanypath 2>/dev/null || true
+        echo "minio: bench-asanypath ready"
+        curl -sf -X POST http://fake-gcs:4443/storage/v1/b \
+          -H 'Content-Type: application/json' -d '{"name":"bench-asanypath"}' >/dev/null || true
+        echo "gcs: bench-asanypath ready"
+        curl -sf -X PUT 'http://azurite:10000/devstoreaccount1/benchcontainer?restype=container' \
+          -H 'Authorization: Bearer init' -H 'x-ms-version: 2020-10-02' >/dev/null || true
+        echo "azurite: benchcontainer ready"

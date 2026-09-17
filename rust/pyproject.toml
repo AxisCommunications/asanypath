@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[project]
+name = "asanypath-native"
+dynamic = ["version"]
+description = "Native cloud acceleration for asanypath (Rust/tokio/reqwest)"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "asanypath_native"
+features = ["pyo3/extension-module"]
