@@ -1,0 +1,153 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0-dev"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/asanypath/_version.py"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[tool.uv.sources]
+asanypath-native = { path = "rust" }
+
+[tool.hatchling.build]
+root = "src"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["rust"]
+
+[tool.hatch.metadata.hooks.custom]
+
+[project]
+name = "asanypath"
+dynamic = ["version", "dependencies"]
+description = "Async pathlib for local and cloud storage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["async", "cloud-storage", "pathlib", "storage"]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=4",
+    "pytest>=8",
+    "pytest-asyncio>=1.3",
+    "pytest-cov>=7.1.0",
+    "asanypath[all,cli]",
+]
+cli = ["rich-click>=1.9.7"]
+ftp = ["aioftp>=0.21"]
+ssh = ["asyncssh>=2.14"]
+credstore = ["keyring>=24"]
+bench = [
+    "fsspec",
+    "s3fs",
+    "adlfs",
+    "gcsfs",
+    "cloudpathlib[all]",
+    "aiobotocore",
+    "gcloud-aio-storage",
+    "azure-storage-blob",
+    "aiofiles",
+    "requests",
+]
+all = ["asanypath[ssh,credstore,ftp]"]
+[project.scripts]
+asanypath = "asanypath.cli:main"
+
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "asanypath.cli"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["attr-defined", "arg-type", "assignment"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.local"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["type-var", "misc", "override", "return-value"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.common"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["arg-type", "assignment", "misc", "attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.http"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["override", "type-arg", "return-value", "assignment"]
+
+[[tool.mypy.overrides]]
+module = ["asanypath.s3", "asanypath.gcs", "asanypath.azure", "asanypath.artifactory"]
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["no-any-return", "attr-defined", "assignment", "override"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.cloud"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["no-any-return", "arg-type"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.asanypath"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["no-any-return", "misc", "union-attr", "type-var"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.batcher"
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["asanypath"]
+omit = ["src/asanypath/cli.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
