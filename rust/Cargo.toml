@@ -1,0 +1,33 @@
+[package]
+name = "asanypath-native"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "asanypath_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+futures = "0.3"
+aws-sigv4 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+quick-xml = "0.42"
+http = "1"
+bytes = "1"
+urlencoding = "2"
+serde = { version = "1", features = ["derive"] }
+sonic-rs = "0.5"
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
+backon = "1"
+ring = "0.17"
+pem = "4"
+scraper = { version = "0.27", default-features = false }
+url = "2"

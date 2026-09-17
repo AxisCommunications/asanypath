@@ -1,0 +1,182 @@
+name: Publish Python and native Package to pypi
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  release-version:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Validate release tag
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          case "$TAG" in
+            R[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Release tag must be R<major>.<minor>.<patch>." >&2; exit 1 ;;
+          esac
+          echo "value=${TAG#R}" >> "$GITHUB_OUTPUT"
+
+  build-native:
+    needs: release-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: macos-13
+            target: x86_64
+            manylinux: off
+          - os: macos-14
+            target: aarch64
+            manylinux: off
+          - os: windows-latest
+            target: x64
+            manylinux: off
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set native package version
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-version.outputs.value }}
+        run: |
+          sed -i.bak -E "s/^version = \".*\"$/version = \"${VERSION}\"/" rust/Cargo.toml
+          rm rust/Cargo.toml.bak
+
+      - name: Build native wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: rust
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 3.14
+
+      - name: Upload native wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-${{ matrix.os }}-${{ matrix.target }}
+          path: rust/dist/*.whl
+          if-no-files-found: error
+
+  build-native-sdist:
+    needs: release-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set native package version
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-version.outputs.value }}
+        run: |
+          sed -i.bak -E "s/^version = \".*\"$/version = \"${VERSION}\"/" rust/Cargo.toml
+          rm rust/Cargo.toml.bak
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
+
+      - name: Build native source distribution
+        run: uvx maturin sdist --manifest-path rust/Cargo.toml --out dist
+
+      - name: Upload native source distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-python:
+    needs: [release-version, build-native, build-native-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
+
+      - name: Build Python distributions
+        run: uv build --out-dir dist
+
+      - name: Verify native dependency version
+        env:
+          VERSION: ${{ needs.release-version.outputs.value }}
+        run: |
+          unzip -p dist/*.whl '*/METADATA' | grep -Fx "Requires-Dist: asanypath-native~=${VERSION}.0"
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish-native:
+    needs: [build-native, build-native-sdist, build-python]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/asanypath-native
+    permissions:
+      id-token: write
+    steps:
+      - name: Download native distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish native distribution
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+
+  publish-python:
+    needs: [publish-native, build-python]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/asanypath
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Python distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-distributions
+          path: dist
+
+      - name: Publish Python distribution
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
