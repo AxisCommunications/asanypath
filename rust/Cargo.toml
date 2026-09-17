@@ -29,5 +29,5 @@ base64 = "0.22"
 backon = "1"
 ring = "0.17"
 pem = "3"
-scraper = { version = "0.21", default-features = false }
+scraper = { version = "0.27", default-features = false }
 url = "2"
