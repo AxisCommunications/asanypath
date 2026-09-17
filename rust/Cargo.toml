@@ -28,6 +28,6 @@ sha2 = "0.10"
 base64 = "0.22"
 backon = "1"
 ring = "0.17"
-pem = "3"
+pem = "4"
 scraper = { version = "0.21", default-features = false }
 url = "2"
