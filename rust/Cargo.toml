@@ -23,7 +23,7 @@ bytes = "1"
 urlencoding = "2"
 serde = { version = "1", features = ["derive"] }
 sonic-rs = "0.5"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 base64 = "0.22"
 backon = "1"
