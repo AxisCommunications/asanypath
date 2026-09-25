@@ -144,7 +144,7 @@ jobs:
     needs: [build-native, build-native-sdist, build-python]
     runs-on: ubuntu-latest
     environment:
-      name: pypi
+      name: pypi-native
       url: https://pypi.org/p/asanypath-native
     permissions:
       id-token: write
