@@ -3,6 +3,12 @@ name: Publish Python and native Package to pypi
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v<major>.<minor>.<patch> tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,17 +17,19 @@ jobs:
   release-version:
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.version.outputs.tag }}
       value: ${{ steps.version.outputs.value }}
     steps:
       - name: Validate release tag
         id: version
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           case "$TAG" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "Release tag must be v<major>.<minor>.<patch>." >&2; exit 1 ;;
           esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
 
   build-native:
@@ -47,7 +55,7 @@ jobs:
       - name: Checkout release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.release-version.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -81,7 +89,7 @@ jobs:
       - name: Checkout release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.release-version.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -115,7 +123,7 @@ jobs:
       - name: Checkout release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.release-version.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
