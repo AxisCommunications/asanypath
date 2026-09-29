@@ -445,6 +445,38 @@ def test_credentials_from_env():
     assert p._region == "ap-southeast-1"
 
 
+@pytest.mark.parametrize(
+    "region,endpoint_override,expected",
+    [
+        ("us-east-1", None, "https://s3.amazonaws.com"),
+        ("eu-west-1", None, "https://s3.eu-west-1.amazonaws.com"),
+        ("cn-north-1", None, "https://s3.cn-north-1.amazonaws.com.cn"),
+        ("eu-west-1", "https://s3.example.test", "https://s3.example.test"),
+    ],
+    ids=["us-east-1", "regional", "china", "custom-endpoint"],
+)
+def test_endpoint_from_region_and_env(region, endpoint_override, expected):
+    env = {
+        "AWS_REGION": region,
+        "AWS_PROFILE": "default",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_CONFIG_FILE": "/dev/null",
+    }
+    if endpoint_override is not None:
+        env["AWS_ENDPOINT_URL"] = endpoint_override
+
+    with (
+        patch("asanypath.s3.getenv", side_effect=lambda k, d=None: env.get(k, d)),
+        patch("asanypath.s3.ConfigParser.read", return_value=[]),
+    ):
+        S3Path._env_config = None
+        try:
+            p = S3Path("s3://bucket/key")
+            assert p._endpoint_url == expected
+        finally:
+            S3Path._env_config = None
+
+
 def test_env_credentials_override_profile(tmp_path):
     """Env vars must take precedence over the shared-credentials profile."""
     creds = tmp_path / "credentials"

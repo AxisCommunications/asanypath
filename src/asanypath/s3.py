@@ -34,6 +34,13 @@ from asanypath_native import (
 )
 
 
+def _default_s3_endpoint(region: str) -> str:
+    if region == "us-east-1":
+        return "https://s3.amazonaws.com"
+    suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    return f"https://s3.{region}.{suffix}"
+
+
 class S3Path(CloudPathMixin):
     protocol: str = "s3"
     _supports_range_read: bool = True
@@ -128,6 +135,7 @@ class S3Path(CloudPathMixin):
             "aws_session_token": getenv("AWS_SESSION_TOKEN"),
         }
         cfg.update({k: v for k, v in env.items() if v is not None})
+        cfg["endpoint_url"] = cfg["endpoint_url"] or _default_s3_endpoint(cfg["aws_region"])
 
         return SimpleNamespace(**cfg)
 

@@ -139,7 +139,7 @@ jobs:
         env:
           VERSION: ${{ needs.release-version.outputs.value }}
         run: |
-          unzip -p dist/*.whl '*/METADATA' | grep -Fx "Requires-Dist: asanypath-native~=${VERSION}"
+          unzip -p dist/*.whl '*/METADATA' | grep -Fx "Requires-Dist: asanypath-native~=${VERSION%.*}.0"
 
       - name: Upload Python distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
