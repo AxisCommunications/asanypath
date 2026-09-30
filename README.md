@@ -288,55 +288,55 @@ uv run --extra bench python scripts/bench.py --backend art --rounds 3 --concurre
 
 | Operation | asanypath | s3fs | aiobotocore | cloudpathlib |
 |-----------|-----------|------|-------------|--------------|
-| write | 8.47 ms | 9.52 ms | 43.39 ms | 48.02 ms |
-| read | 4.03 ms | 9.43 ms | 20.16 ms | 13.30 ms |
-| exists | 3.58 ms | 4.54 ms | 20.49 ms | 4.48 ms |
-| iterdir | 38.91 ms | 39.33 ms | 57.76 ms | 41.95 ms |
+| write | **8.47 ms** | 9.52 ms | 43.39 ms | 48.02 ms |
+| read | **4.03 ms** | 9.43 ms | 20.16 ms | 13.30 ms |
+| exists | **3.58 ms** | 4.54 ms | 20.49 ms | 4.48 ms |
+| iterdir | **38.91 ms** | 39.33 ms | 57.76 ms | 41.95 ms |
 
 ### Azure — Azurite emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | azure-sdk | adlfs | cloudpathlib |
 |-----------|-----------|-----------|-------|--------------|
-| write | 1.77 ms | 1.86 ms | 1.93 ms | 8.29 ms |
-| read | 0.68 ms | 1.15 ms | 2.50 ms | 3.46 ms |
-| exists | 0.56 ms | 0.83 ms | 1.04 ms | 1.02 ms |
-| iterdir | 1.34 ms | 2.21 ms | 4.37 ms | 2.59 ms |
+| write | **1.77 ms** | 1.86 ms | 1.93 ms | 8.29 ms |
+| read | **0.68 ms** | 1.15 ms | 2.50 ms | 3.46 ms |
+| exists | **0.56 ms** | 0.83 ms | 1.04 ms | 1.02 ms |
+| iterdir | **1.34 ms** | 2.21 ms | 4.37 ms | 2.59 ms |
 
 ### GCS — fake-gcs-server emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | gcloud-aio | cloudpathlib | gcsfs |
 |-----------|-----------|------------|--------------|-------|
-| write | 0.22 ms | 0.24 ms | 2.88 ms | 0.33 ms |
-| read | 0.12 ms | 0.14 ms | 1.34 ms | 0.19 ms |
-| exists | 0.12 ms | 0.14 ms | 0.44 ms | 0.41 ms |
-| iterdir | 0.20 ms | 0.16 ms | 0.55 ms | 0.24 ms |
+| write | **0.22 ms** | 0.24 ms | 2.88 ms | 0.33 ms |
+| read | **0.12 ms** | 0.14 ms | 1.34 ms | 0.19 ms |
+| exists | **0.12 ms** | 0.14 ms | 0.44 ms | 0.41 ms |
+| iterdir | 0.20 ms | **0.16 ms** | 0.55 ms | 0.24 ms |
 
 ### Artifactory — live server (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | aiohttp | requests |
 |-----------|-----------|---------|----------|
-| write | 39.77 ms | 38.00 ms | 36.67 ms |
-| read | 4.29 ms | 4.75 ms | 5.43 ms |
-| exists | 2.97 ms | 3.02 ms | 4.52 ms |
-| iterdir | 4.59 ms | 4.18 ms | 6.26 ms |
+| write | 39.77 ms | 38.00 ms | **36.67 ms** |
+| read | **4.29 ms** | 4.75 ms | 5.43 ms |
+| exists | **2.97 ms** | 3.02 ms | 4.52 ms |
+| iterdir | 4.59 ms | **4.18 ms** | 6.26 ms |
 
 ### SSH / SFTP — localhost emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | asyncssh |
 |-----------|-----------|----------|
-| write | 0.32 ms | 0.27 ms |
-| read | 0.34 ms | 0.33 ms |
-| exists | 0.11 ms | 0.11 ms |
-| iterdir | 0.52 ms | 0.40 ms |
+| write | 0.32 ms | **0.27 ms** |
+| read | 0.34 ms | **0.33 ms** |
+| exists | **0.11 ms** | **0.11 ms** |
+| iterdir | 0.52 ms | **0.40 ms** |
 
 ### FTP — localhost emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | aioftp |
 |-----------|-----------|--------|
-| write | 0.40 ms | 0.34 ms |
-| read | 0.36 ms | 0.32 ms |
-| exists | 1.12 ms | 0.92 ms |
-| iterdir | 1.10 ms | 0.92 ms |
+| write | 0.40 ms | **0.34 ms** |
+| read | 0.36 ms | **0.32 ms** |
+| exists | 1.12 ms | **0.92 ms** |
+| iterdir | 1.10 ms | **0.92 ms** |
 
 Latencies are per-operation medians over 20 rounds. S3 and Artifactory ran
 against live services; Azure, GCS, SSH/SFTP, and FTP against local emulators
