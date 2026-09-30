@@ -358,9 +358,16 @@ API across all backends.
 | `az://`, `azure://` | `AzurePath` | reqwest + SharedKey |
 | `art://` | `ArtifactoryPath` | reqwest + Bearer |
 | `http://`, `https://` | `HTTPPath` / `HTTPSPath` | reqwest |
+| `ssh://` | `SSHPath` | `asyncssh` (SFTP) |
+| `ftp://` | `FTPPath` | `aioftp` |
+| `ftps://` | `FTPSPath` | `aioftp` + TLS |
+| any other scheme | `UnsupportedProtocolPath` | none — pure-path only |
 
-All network I/O is handled by `asanypath-native` (Rust/PyO3 + reqwest) with
-jittered exponential backoff retry for transient errors.
+Cloud and HTTP network I/O is handled by `asanypath-native` (Rust/PyO3 + reqwest)
+with jittered exponential backoff retry for transient errors; SSH/SFTP and
+FTP/FTPS use `asyncssh` and `aioftp` respectively. Unknown schemes construct an
+`UnsupportedProtocolPath`: pure-path operations (`.name`, `.parent`, joins) work,
+while any backend operation raises `UnsupportedProtocolError`.
 
 ## API Reference
 
