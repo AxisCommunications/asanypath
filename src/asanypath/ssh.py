@@ -353,9 +353,10 @@ class SSHPath(CloudPathMixin):
             "key_path": key_path,
             "key_passphrase": None,
             "use_agent": use_agent,
-            # Empty tuple == checking disabled (asyncssh convention); any
-            # other value keeps strict ~/.ssh/known_hosts verification.
-            "strict_host_key": self._known_hosts != (),
+            # asyncssh disables host-key checking for ``None``; SSHPath also
+            # maps SSH_KNOWN_HOSTS=none -> (). Mirror both so native parity
+            # holds; any other value keeps strict verification.
+            "strict_host_key": self._known_hosts not in (None, ()),
         }
 
     # ------------------------------------------------------------------
