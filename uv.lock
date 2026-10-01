@@ -320,7 +320,7 @@ requires-dist = [
     { name = "s3fs", marker = "extra == 'bench'" },
     { name = "yarl", specifier = ">=1.2" },
 ]
-provides-extras = ["all", "bench", "cli", "credstore", "dev", "ftp", "ssh"]
+provides-extras = ["all", "bench", "cli", "credstore", "dev", "ftp"]
 
 [[package]]
 name = "asanypath-native"
