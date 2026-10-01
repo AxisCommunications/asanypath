@@ -55,7 +55,11 @@ static S3_AWS_CONFIGS: OnceLock<AsyncMutex<HashMap<String, S3AwsConfig>>> = Once
 
 async fn s3_aws_config(region_override: Option<String>) -> Result<S3AwsConfig, String> {
     let profile = std::env::var("AWS_PROFILE").ok();
-    let cache_key = format!("{}|{}", profile.as_deref().unwrap_or_default(), region_override.as_deref().unwrap_or_default());
+    let cache_key = format!(
+        "{}|{}",
+        profile.as_deref().unwrap_or_default(),
+        region_override.as_deref().unwrap_or_default()
+    );
     let configs = S3_AWS_CONFIGS.get_or_init(|| AsyncMutex::new(HashMap::new()));
     let mut configs = configs.lock().await;
     if let Some(config) = configs.get(&cache_key) {
@@ -98,15 +102,15 @@ pub fn s3_get_credentials<'py>(
             .await
             .map_err(PyRuntimeError::new_err)?;
         let resolved = match (access_key, secret_key) {
-            (Some(access_key), Some(secret_key)) => {
-                (access_key, secret_key, session_token)
-            }
+            (Some(access_key), Some(secret_key)) => (access_key, secret_key, session_token),
             _ => {
                 let credentials = config
                     .credentials_provider
                     .provide_credentials()
                     .await
-                    .map_err(|error| PyRuntimeError::new_err(format!("AWS credentials: {error}")))?;
+                    .map_err(|error| {
+                        PyRuntimeError::new_err(format!("AWS credentials: {error}"))
+                    })?;
                 (
                     credentials.access_key_id().to_string(),
                     credentials.secret_access_key().to_string(),
