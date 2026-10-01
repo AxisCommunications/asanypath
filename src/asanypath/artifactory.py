@@ -170,6 +170,18 @@ class ArtifactoryPath(CloudPathMixin):
     def _item_path(self) -> str:
         return self._repo_path
 
+    def _bind_path_attrs(self) -> None:
+        raw = str(self)[len("art://") :]
+        idx = raw.find("/artifactory/")
+        if idx >= 0:
+            self._base_url = raw[: idx + len("/artifactory")]
+            self._repo_path = raw[idx + len("/artifactory/") :]
+        else:
+            self._base_url = raw.split("/")[0]
+            self._repo_path = "/".join(raw.split("/")[1:])
+        self._is_folder = None
+        self._cached_info = None
+
     @property
     def _native_kwargs(self) -> dict:
         return {

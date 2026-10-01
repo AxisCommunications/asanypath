@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
 from os import linesep
 
+from yarl import URL
+
 from asanypath._transfer import (
     async_destination_state,
     has_async_transfer_api,
@@ -133,6 +135,25 @@ class CloudPathMixin(CommonPurePathMixin):
     def _item_path(self) -> str:
         """The backend-specific object / blob / key path.  Override in subclasses."""
         raise NotImplementedError(f"{type(self).__name__} must define _item_path")
+
+    def _spawn(self, uri: str) -> Self:
+        """Build a sibling path from a canonical URI, inheriting this path's
+        credentials and config without re-parsing the scheme or re-reading env.
+
+        Used by ``iterdir``/``glob``/``walk`` where many children share the
+        parent's connection settings and differ only in their object key.
+        """
+        obj = object.__new__(type(self))
+        obj.__dict__.update(self.__dict__)
+        obj._path = URL(uri, encoded="?" in uri)
+        obj._bind_path_attrs()
+        return obj
+
+    def _bind_path_attrs(self) -> None:
+        """Recompute path-derived attributes after ``_path`` is reassigned.
+
+        Subclasses that store path-derived attributes override this.
+        """
 
     @property
     def _native_kwargs(self) -> dict:
@@ -376,7 +397,7 @@ class CloudPathMixin(CommonPurePathMixin):
                 ts, uris = entry
                 if (time.monotonic() - ts) < self.listing_cache_ttl:
                     for uri in uris:
-                        yield type(self)(uri)
+                        yield self._spawn(uri)
                     return
 
         uris = await self._fetch_listing()
@@ -385,7 +406,7 @@ class CloudPathMixin(CommonPurePathMixin):
             cache[cache_key] = (time.monotonic(), uris)
 
         for uri in uris:
-            yield type(self)(uri)
+            yield self._spawn(uri)
 
     def chmod(self, mode: int, *, follow_symlinks: bool = True) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support chmod")

@@ -428,6 +428,30 @@ def test_path_join_via_truediv():
     assert str(child) == "s3://bucket/prefix/subdir/file.txt"
 
 
+def test_spawn_inherits_credentials_and_rebinds_path():
+    parent = _make_s3path(
+        "s3://bucket/prefix",
+        aws_region="eu-west-1",
+        aws_access_key_id="KEYID",
+        aws_secret_access_key="SECRET",
+    )
+    child = parent._spawn("s3://bucket/prefix/child.txt")
+    full = S3Path(
+        "s3://bucket/prefix/child.txt",
+        aws_region="eu-west-1",
+        aws_access_key_id="KEYID",
+        aws_secret_access_key="SECRET",
+    )
+    assert isinstance(child, S3Path)
+    assert str(child) == "s3://bucket/prefix/child.txt"
+    assert child._item_path == full._item_path == "prefix/child.txt"
+    assert child._native_kwargs == full._native_kwargs
+    # Service-root listing yields a different bucket; _bind_path_attrs must refresh it.
+    sibling = parent._spawn("s3://other-bucket/key")
+    assert sibling._bucket == "other-bucket"
+    assert sibling._item_path == "key"
+
+
 @pytest.mark.asyncio
 async def test_read_bytes_resolves_role_credentials():
     config = SimpleNamespace(

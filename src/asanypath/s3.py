@@ -128,6 +128,9 @@ class S3Path(CloudPathMixin):
     def _item_path(self) -> str:
         return cast(URL, self._path).path.strip("/")
 
+    def _bind_path_attrs(self) -> None:
+        self._bucket = cast(URL, self._path)._netloc
+
     @property
     def _native_kwargs(self) -> dict:
         return {

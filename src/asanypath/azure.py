@@ -162,6 +162,10 @@ class AzurePath(CloudPathMixin):
     def _item_path(self) -> str:
         return self._blob_path
 
+    def _bind_path_attrs(self) -> None:
+        self._container = self._path.host or ""
+        self._blob_path = self._path.path.lstrip("/")
+
     @property
     def _native_kwargs(self) -> dict:
         return {
