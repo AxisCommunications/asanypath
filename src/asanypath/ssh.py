@@ -813,13 +813,12 @@ class SSHPath(CloudPathMixin):
             for name, size, mtime, atime, uid, gid, permissions in entries:
                 if name in (".", ".."):
                     continue
-                child = self / name
                 # ``read_dir`` already returned attrs for every entry; cache
                 # them so ``stat()``/``is_dir()`` don't issue another stat.
-                child._cached_attrs = SimpleNamespace(  # type: ignore[attr-defined]
+                attrs = SimpleNamespace(
                     size=size, mtime=mtime, atime=atime, uid=uid, gid=gid, permissions=permissions
                 )
-                yield child
+                yield self._child(str(self._path / name), _cached_attrs=attrs)
             return
         sftp = await self._sftp()
         try:
@@ -829,11 +828,9 @@ class SSHPath(CloudPathMixin):
         for entry in names:
             if entry.filename in (".", ".."):
                 continue
-            child = self / entry.filename
             # ``readdir`` already returned attrs for every entry; cache
             # them so ``stat()``/``is_dir()`` don't issue another LSTAT.
-            child._cached_attrs = entry.attrs  # type: ignore[attr-defined]
-            yield child
+            yield self._child(str(self._path / entry.filename), _cached_attrs=entry.attrs)
 
     async def walk(
         self,
