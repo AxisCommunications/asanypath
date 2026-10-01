@@ -35,6 +35,7 @@ url = "2"
 russh = "0.63"
 russh-sftp = "3"
 anyhow = "1"
+ssh2-config = { version = "0.8", default-features = false, features = ["nolog"] }
 
 [profile.release]
 strip = "symbols"

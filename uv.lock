@@ -256,13 +256,13 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "aioftp" },
-    { name = "asyncssh" },
     { name = "keyring" },
 ]
 bench = [
     { name = "adlfs" },
     { name = "aiobotocore" },
     { name = "aiofiles" },
+    { name = "asyncssh" },
     { name = "azure-storage-blob" },
     { name = "cloudpathlib", extra = ["all"] },
     { name = "fsspec" },
@@ -279,7 +279,6 @@ credstore = [
 ]
 dev = [
     { name = "aioftp" },
-    { name = "asyncssh" },
     { name = "keyring" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -289,9 +288,6 @@ dev = [
 ]
 ftp = [
     { name = "aioftp" },
-]
-ssh = [
-    { name = "asyncssh" },
 ]
 
 [package.metadata]
@@ -304,9 +300,7 @@ requires-dist = [
     { name = "aioftp", marker = "extra == 'ftp'", specifier = ">=0.21" },
     { name = "anyio", specifier = ">=4" },
     { name = "asanypath-native", directory = "rust" },
-    { name = "asyncssh", marker = "extra == 'all'", specifier = ">=2.14" },
-    { name = "asyncssh", marker = "extra == 'dev'", specifier = ">=2.14" },
-    { name = "asyncssh", marker = "extra == 'ssh'", specifier = ">=2.14" },
+    { name = "asyncssh", marker = "extra == 'bench'", specifier = ">=2.14" },
     { name = "azure-storage-blob", marker = "extra == 'bench'" },
     { name = "cloudpathlib", extras = ["all"], marker = "extra == 'bench'" },
     { name = "fsspec", marker = "extra == 'bench'" },

@@ -20,9 +20,11 @@ use russh::client::{self, Handle};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, check_known_hosts, load_secret_key};
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::OpenFlags;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
+use ssh2_config::{ParseRule, SshConfig};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+
+use std::sync::Mutex;
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -179,14 +181,43 @@ async fn authenticate(
             .await
             .map_err(|e| format!("password auth: {e}"))?
             .success();
-        return if authed {
-            Ok(())
-        } else {
-            Err("password auth failed".to_string())
-        };
+        if authed {
+            return Ok(());
+        }
+        // Many servers run password auth as keyboard-interactive (PAM); answer
+        // the challenge prompts with the supplied password.
+        return keyboard_interactive(handle, user, password).await;
     }
 
     Err("no authentication method provided".to_string())
+}
+
+/// Keyboard-interactive auth, answering every prompt with `password`.
+/// Covers PAM / password-via-kbdint; true multi-prompt OTP would need a
+/// Python callback bridge.
+async fn keyboard_interactive(
+    handle: &mut Handle<Handler>,
+    user: &str,
+    password: &str,
+) -> Result<(), String> {
+    use russh::client::KeyboardInteractiveAuthResponse as Resp;
+    let mut resp = handle
+        .authenticate_keyboard_interactive_start(user, None)
+        .await
+        .map_err(|e| format!("kbdint start: {e}"))?;
+    loop {
+        match resp {
+            Resp::Success => return Ok(()),
+            Resp::Failure { .. } => return Err("keyboard-interactive auth failed".to_string()),
+            Resp::InfoRequest { prompts, .. } => {
+                let answers = prompts.iter().map(|_| password.to_string()).collect();
+                resp = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(|e| format!("kbdint respond: {e}"))?;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +248,7 @@ async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
         auth.fingerprint()
     );
     {
-        let guard = sftp_pool().lock().await;
+        let guard = sftp_pool().lock().unwrap();
         if let Some(existing) = guard.get(&key) {
             return Ok(existing.clone());
         }
@@ -246,8 +277,16 @@ async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
         .map_err(|e| format!("sftp init: {e}"))?;
 
     let built = Arc::new(SftpConn { handle, sftp });
-    sftp_pool().lock().await.insert(key, built.clone());
+    sftp_pool().lock().unwrap().insert(key, built.clone());
     Ok(built)
+}
+
+/// Close and drop all pooled SFTP sessions (dropping each `Handle` disconnects).
+#[pyfunction]
+pub fn ssh_disconnect_all() {
+    if let Some(pool) = POOL_CELL.get() {
+        pool.lock().unwrap().clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +478,84 @@ pub fn ssh_stat<'py>(
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let md = session.sftp.metadata(&path).await.map_err(err)?;
         Ok((md.size, md.mtime, md.atime, md.uid, md.gid, md.permissions))
+    })
+}
+
+/// Like `ssh_stat` but does not follow symlinks (SFTP `lstat`).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn ssh_lstat<'py>(
+    py: Python<'py>,
+    path: String,
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    key_passphrase: Option<String>,
+    use_agent: bool,
+    strict_host_key: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conn = conn!(
+        host,
+        port,
+        user,
+        password,
+        key_path,
+        key_passphrase,
+        use_agent,
+        strict_host_key
+    );
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
+        let md = session.sftp.symlink_metadata(&path).await.map_err(err)?;
+        Ok((md.size, md.mtime, md.atime, md.uid, md.gid, md.permissions))
+    })
+}
+
+/// Set remote file metadata (SFTP `setstat`). Only the provided fields are
+/// changed — covers chmod (permissions), chown (uid/gid) and utime (atime/mtime).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn ssh_setstat<'py>(
+    py: Python<'py>,
+    path: String,
+    permissions: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    atime: Option<u32>,
+    mtime: Option<u32>,
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    key_passphrase: Option<String>,
+    use_agent: bool,
+    strict_host_key: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conn = conn!(
+        host,
+        port,
+        user,
+        password,
+        key_path,
+        key_passphrase,
+        use_agent,
+        strict_host_key
+    );
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
+        let attrs = FileAttributes {
+            permissions,
+            uid,
+            gid,
+            atime,
+            mtime,
+            ..Default::default()
+        };
+        session.sftp.set_metadata(&path, attrs).await.map_err(err)?;
+        Ok(())
     })
 }
 
@@ -637,4 +754,35 @@ pub fn ssh_rename<'py>(
         session.sftp.rename(&src, &dst).await.map_err(err)?;
         Ok(())
     })
+}
+
+/// Resolve an OpenSSH client-config alias. Parses the given config files (in
+/// order, first-obtained-value wins, matching OpenSSH) and returns the host's
+/// (HostName, Port, User, first IdentityFile). Replaces the asyncssh config
+/// parser so SSHPath needs no Python SSH library at runtime.
+#[pyfunction]
+pub fn ssh_resolve_config(
+    host: String,
+    config_paths: Vec<String>,
+) -> PyResult<(Option<String>, Option<u16>, Option<String>, Option<String>)> {
+    let mut combined = String::new();
+    for path in &config_paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            combined.push_str(&content);
+            combined.push('\n');
+        }
+    }
+    if combined.trim().is_empty() {
+        return Ok((None, None, None, None));
+    }
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(combined.into_bytes()));
+    let config = SshConfig::default()
+        .parse(&mut reader, ParseRule::ALLOW_UNSUPPORTED_FIELDS)
+        .map_err(|e| PyRuntimeError::new_err(format!("ssh_config parse: {e}")))?;
+    let params = config.query(&host);
+    let identity = params
+        .identity_file
+        .and_then(|files| files.into_iter().next())
+        .map(|p| p.to_string_lossy().into_owned());
+    Ok((params.host_name, params.port, params.user, identity))
 }

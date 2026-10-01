@@ -105,11 +105,15 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ssh::ssh_write, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_exists, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_stat, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_lstat, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_setstat, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_list, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_mkdir, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_rmdir, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_unlink, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_rename, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_resolve_config, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_disconnect_all, m)?)?;
     // Unified
     m.add_function(wrap_pyfunction!(backend::range_read, m)?)?;
     Ok(())
