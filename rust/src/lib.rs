@@ -21,6 +21,7 @@ pub mod artifactory;
 pub mod azure;
 pub mod gcs;
 pub mod s3;
+pub mod ssh;
 
 // ---------------------------------------------------------------------------
 // Python module
@@ -98,6 +99,17 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(http::http_exists, m)?)?;
     m.add_function(wrap_pyfunction!(http::http_request, m)?)?;
     m.add_function(wrap_pyfunction!(http::http_scrape_links, m)?)?;
+    // SSH / SFTP (prototype)
+    m.add_function(wrap_pyfunction!(ssh::ssh_read, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_read_range, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_write, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_exists, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_stat, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_list, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_mkdir, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_rmdir, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_unlink, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_rename, m)?)?;
     // Unified
     m.add_function(wrap_pyfunction!(backend::range_read, m)?)?;
     Ok(())

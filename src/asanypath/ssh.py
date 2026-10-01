@@ -57,9 +57,24 @@ from asyncssh.config import SSHClientConfig
 
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath_native import (
+    ssh_list,
+    ssh_mkdir,
+    ssh_read,
+    ssh_read_range,
+    ssh_rename,
+    ssh_rmdir,
+    ssh_stat,
+    ssh_unlink,
+    ssh_write,
+)
 
 if TYPE_CHECKING:
     from typing import Self
+
+# Opt-in native (russh) SFTP transport. asyncssh remains the default so
+# ssh_config alias resolution and the exec/find walk fast-path stay intact.
+_SSH_NATIVE = getenv("ASANYPATH_SSH_NATIVE") == "1"
 
 
 _CONN_CACHE: dict[tuple, asyncssh.SSHClientConnection] = {}
@@ -86,6 +101,20 @@ _sftp_no_such_file = getattr(asyncssh.sftp, "SFTPNoSuchFile", None)
 _NOT_FOUND_ERRORS: tuple[type[BaseException], ...] = (
     (FileNotFoundError, _sftp_no_such_file) if _sftp_no_such_file else (FileNotFoundError,)
 )
+
+
+def _map_native_error(exc: Exception, path: str) -> None:
+    """Translate a native russh/SFTP error into the stdlib OSError family."""
+    msg = str(exc).lower()
+    if "no such file" in msg or "not found" in msg or "does not exist" in msg:
+        raise FileNotFoundError(2, "No such file or directory", path) from exc
+    if "permission denied" in msg:
+        raise PermissionError(13, "Permission denied", path) from exc
+    if "not a directory" in msg:
+        raise NotADirectoryError(20, "Not a directory", path) from exc
+    if "already exists" in msg or "file exists" in msg:
+        raise FileExistsError(17, "File exists", path) from exc
+    raise exc
 
 
 def _interactive() -> bool:
@@ -303,10 +332,30 @@ class SSHPath(CloudPathMixin):
 
     @property
     def _native_kwargs(self) -> dict:
+        # Single source of connection truth for the native russh backend,
+        # spread as ``**self._native_kwargs`` like every other backend.
+        # Auth precedence mirrors ssh: explicit password, then key file,
+        # else fall back to the agent.
+        keys = self._client_keys or ()
+        key_path = keys[0] if keys else None
+        if self._password is not None:
+            use_agent = False
+            key_path = None
+        elif key_path is not None:
+            use_agent = False
+        else:
+            use_agent = True
         return {
             "host": self._resolved_host,
             "port": self._resolved_port,
             "user": self._resolved_user,
+            "password": self._password,
+            "key_path": key_path,
+            "key_passphrase": None,
+            "use_agent": use_agent,
+            # Empty tuple == checking disabled (asyncssh convention); any
+            # other value keeps strict ~/.ssh/known_hosts verification.
+            "strict_host_key": self._known_hosts != (),
         }
 
     # ------------------------------------------------------------------
@@ -474,6 +523,18 @@ class SSHPath(CloudPathMixin):
         cached = getattr(self, "_cached_attrs", None)
         if cached is not None and follow_symlinks:
             return cached
+        # Native stat follows symlinks (SFTP ``stat``); ``lstat`` stays on
+        # asyncssh so is_symlink() keeps working.
+        if _SSH_NATIVE and follow_symlinks:
+            try:
+                size, mtime, atime, uid, gid, permissions = await ssh_stat(
+                    path=self._item_path, **self._native_kwargs
+                )
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
+            return SimpleNamespace(
+                size=size, mtime=mtime, atime=atime, uid=uid, gid=gid, permissions=permissions
+            )
         sftp = await self._sftp()
         try:
             if follow_symlinks:
@@ -587,17 +648,33 @@ class SSHPath(CloudPathMixin):
     # ------------------------------------------------------------------
 
     async def read_bytes(self) -> bytes:
+        if _SSH_NATIVE:
+            try:
+                return bytes(await ssh_read(path=self._item_path, **self._native_kwargs))
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
         sftp = await self._sftp()
         async with sftp.open(self._item_path, "rb") as f:
             return await f.read()
 
     async def write_bytes(self, data: bytes) -> int:
+        if _SSH_NATIVE:
+            return await ssh_write(path=self._item_path, data=data, **self._native_kwargs)
         sftp = await self._sftp()
         async with sftp.open(self._item_path, "wb") as f:
             await f.write(data)
         return len(data)
 
     async def _range_read(self, start: int, end: int) -> bytes:
+        if _SSH_NATIVE:
+            try:
+                return bytes(
+                    await ssh_read_range(
+                        path=self._item_path, start=start, end=end, **self._native_kwargs
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
         sftp = await self._sftp()
         async with sftp.open(self._item_path, "rb") as f:
             await f.seek(start)
@@ -608,6 +685,16 @@ class SSHPath(CloudPathMixin):
     # ------------------------------------------------------------------
 
     async def unlink(self, missing_ok: bool = False) -> None:
+        if _SSH_NATIVE:
+            try:
+                await ssh_unlink(path=self._item_path, **self._native_kwargs)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _map_native_error(e, str(self))
+                except FileNotFoundError:
+                    if not missing_ok:
+                        raise
+            return
         sftp = await self._sftp()
         try:
             await sftp.remove(self._item_path)
@@ -616,6 +703,18 @@ class SSHPath(CloudPathMixin):
                 raise FileNotFoundError(2, "No such file or directory", str(self)) from None
 
     async def mkdir(self, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
+        if _SSH_NATIVE:
+            if not (parents or exist_ok) and await self.exists():
+                raise FileExistsError(17, "File exists", str(self))
+            try:
+                await ssh_mkdir(path=self._item_path, parents=parents, **self._native_kwargs)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _map_native_error(e, str(self))
+                except FileExistsError:
+                    if not exist_ok:
+                        raise
+            return
         sftp = await self._sftp()
         try:
             if parents:
@@ -627,6 +726,12 @@ class SSHPath(CloudPathMixin):
                 raise
 
     async def rmdir(self, *, recursive: bool = False) -> None:
+        if _SSH_NATIVE and not recursive:
+            try:
+                await ssh_rmdir(path=self._item_path, **self._native_kwargs)
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
+            return
         sftp = await self._sftp()
         if recursive:
             await sftp.rmtree(self._item_path)
@@ -648,6 +753,16 @@ class SSHPath(CloudPathMixin):
                 require_force(force, target_path)
             return await super().rename(str(target), force=True)
         if (target_path._host, target_path._port) == (self._host, self._port):
+            if _SSH_NATIVE:
+                try:
+                    await ssh_rename(
+                        src=self._item_path,
+                        dst=target_path._item_path,
+                        **self._native_kwargs,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    _map_native_error(e, str(self))
+                return target_path
             sftp = await self._sftp()
             await sftp.rename(self._item_path, target_path._item_path)
             return target_path
@@ -656,6 +771,19 @@ class SSHPath(CloudPathMixin):
     async def replace(self, target: str | Self) -> Self:
         target_path = target if isinstance(target, type(self)) else type(self)(str(target))
         if (target_path._host, target_path._port) == (self._host, self._port):
+            if _SSH_NATIVE:
+                # russh-sftp has no posix_rename; emulate atomic-ish replace
+                # by removing an existing destination first.
+                await target_path.unlink(missing_ok=True)
+                try:
+                    await ssh_rename(
+                        src=self._item_path,
+                        dst=target_path._item_path,
+                        **self._native_kwargs,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    _map_native_error(e, str(self))
+                return target_path
             sftp = await self._sftp()
             # posix_rename atomically replaces dest if it exists.
             await sftp.posix_rename(self._item_path, target_path._item_path)
@@ -673,6 +801,25 @@ class SSHPath(CloudPathMixin):
         await self.write_bytes(b"")
 
     async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
+        if _SSH_NATIVE:
+            try:
+                entries = await ssh_list(path=self._item_path, **self._native_kwargs)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _map_native_error(e, str(self))
+                except FileNotFoundError as fe:
+                    raise NotADirectoryError(20, f"Not a directory: '{self}'") from fe
+            for name, size, mtime, atime, uid, gid, permissions in entries:
+                if name in (".", ".."):
+                    continue
+                child = self / name
+                # ``read_dir`` already returned attrs for every entry; cache
+                # them so ``stat()``/``is_dir()`` don't issue another stat.
+                child._cached_attrs = SimpleNamespace(  # type: ignore[attr-defined]
+                    size=size, mtime=mtime, atime=atime, uid=uid, gid=gid, permissions=permissions
+                )
+                yield child
+            return
         sftp = await self._sftp()
         try:
             names = await sftp.readdir(self._item_path)
