@@ -59,6 +59,7 @@ cli = ["rich-click>=1.9.7"]
 ftp = ["aioftp>=0.21"]
 credstore = ["keyring>=24"]
 bench = [
+    "asyncssh>=2.14",
     "fsspec",
     "s3fs",
     "adlfs",
