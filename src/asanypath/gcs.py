@@ -129,6 +129,10 @@ class GCSPath(CloudPathMixin):
     def _item_path(self) -> str:
         return self._object_path
 
+    def _bind_path_attrs(self) -> None:
+        self._bucket = self._path.host or ""
+        self._object_path = self._path.path.lstrip("/")
+
     @property
     def _native_kwargs(self) -> dict:
         return {

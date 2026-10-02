@@ -8,9 +8,12 @@
  * https://opensource.org/licenses/MIT.
  */
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
+use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SigningParams, SigningSettings, sign,
 };
@@ -26,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::http::{do_request, extract_host, status_to_pyerr};
 use crate::xml::local_name;
 use futures::future::join_all;
+use tokio::sync::Mutex as AsyncMutex;
 
 // ---------------------------------------------------------------------------
 // S3 credentials
@@ -38,6 +42,90 @@ pub(crate) struct S3Creds {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct S3AwsConfig {
+    region: String,
+    endpoint_url: Option<String>,
+    credentials_provider: SharedCredentialsProvider,
+}
+
+static S3_AWS_CONFIGS: OnceLock<AsyncMutex<HashMap<String, S3AwsConfig>>> = OnceLock::new();
+
+async fn s3_aws_config(region_override: Option<String>) -> Result<S3AwsConfig, String> {
+    let profile = std::env::var("AWS_PROFILE").ok();
+    let cache_key = format!(
+        "{}|{}",
+        profile.as_deref().unwrap_or_default(),
+        region_override.as_deref().unwrap_or_default()
+    );
+    let configs = S3_AWS_CONFIGS.get_or_init(|| AsyncMutex::new(HashMap::new()));
+    let mut configs = configs.lock().await;
+    if let Some(config) = configs.get(&cache_key) {
+        return Ok(config.clone());
+    }
+
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(profile) = profile {
+        loader = loader.profile_name(profile);
+    }
+    if let Some(region) = region_override {
+        loader = loader.region(Region::new(region));
+    }
+    let sdk_config = loader.load().await;
+    let config = S3AwsConfig {
+        region: sdk_config
+            .region()
+            .map(|region| region.as_ref().to_string())
+            .unwrap_or_else(|| "us-east-1".to_string()),
+        endpoint_url: sdk_config.endpoint_url().map(str::to_string),
+        credentials_provider: sdk_config
+            .credentials_provider()
+            .ok_or_else(|| "AWS credential provider chain is unavailable".to_string())?,
+    };
+    configs.insert(cache_key, config.clone());
+    Ok(config)
+}
+
+/// Resolve credentials using the AWS SDK's cached default provider chain.
+#[pyfunction]
+pub fn s3_get_credentials<'py>(
+    py: Python<'py>,
+    region_override: Option<String>,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    session_token: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let config = s3_aws_config(region_override)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        let resolved = match (access_key, secret_key) {
+            (Some(access_key), Some(secret_key)) => (access_key, secret_key, session_token),
+            _ => {
+                let credentials = config
+                    .credentials_provider
+                    .provide_credentials()
+                    .await
+                    .map_err(|error| {
+                        PyRuntimeError::new_err(format!("AWS credentials: {error}"))
+                    })?;
+                (
+                    credentials.access_key_id().to_string(),
+                    credentials.secret_access_key().to_string(),
+                    credentials.session_token().map(str::to_string),
+                )
+            }
+        };
+        Ok((
+            resolved.0,
+            resolved.1,
+            resolved.2,
+            config.region,
+            config.endpoint_url,
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------

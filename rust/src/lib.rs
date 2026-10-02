@@ -32,6 +32,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(s3::s3_is_dir, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_get_acl, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_put_acl, m)?)?;
+    m.add_function(wrap_pyfunction!(s3::s3_get_credentials, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_presign, m)?)?;
     // S3 batch
     m.add_function(wrap_pyfunction!(s3::s3_list_batch, m)?)?;

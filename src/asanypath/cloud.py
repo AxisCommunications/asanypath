@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
 from os import linesep
 
+from yarl import URL
+
 from asanypath._transfer import (
     async_destination_state,
     has_async_transfer_api,
@@ -108,7 +110,7 @@ class CloudPathMixin(CommonPurePathMixin):
                 else None
             ),
             "use_h2": False,
-            **self._native_kwargs,
+            **(await self._get_native_kwargs()),
         }
         await type(self)._copy_batch_fn(**kwargs)
         if not want_size:
@@ -134,10 +136,33 @@ class CloudPathMixin(CommonPurePathMixin):
         """The backend-specific object / blob / key path.  Override in subclasses."""
         raise NotImplementedError(f"{type(self).__name__} must define _item_path")
 
+    def _spawn(self, uri: str) -> Self:
+        """Build a sibling path from a canonical URI, inheriting this path's
+        credentials and config without re-parsing the scheme or re-reading env.
+
+        Used by ``iterdir``/``glob``/``walk`` where many children share the
+        parent's connection settings and differ only in their object key.
+        """
+        obj = object.__new__(type(self))
+        obj.__dict__.update(self.__dict__)
+        obj._path = URL(uri, encoded="?" in uri)
+        obj._bind_path_attrs()
+        return obj
+
+    def _bind_path_attrs(self) -> None:
+        """Recompute path-derived attributes after ``_path`` is reassigned.
+
+        Subclasses that store path-derived attributes override this.
+        """
+
     @property
     def _native_kwargs(self) -> dict:
         """Auth / endpoint kwargs forwarded to batcher and native calls."""
         raise NotImplementedError(f"{type(self).__name__} must define _native_kwargs")
+
+    async def _get_native_kwargs(self) -> dict:
+        """Resolve request credentials asynchronously when a backend needs it."""
+        return self._native_kwargs
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix. Override in subclasses."""
@@ -203,9 +228,10 @@ class CloudPathMixin(CommonPurePathMixin):
 
     async def exists(self) -> bool:
         """Check if object exists."""
+        native_kwargs = await self._get_native_kwargs()
         return await self._get_batcher().exists(
             item=self._item_path,
-            **self._native_kwargs,
+            **native_kwargs,
         )
 
     async def is_file(self) -> bool:
@@ -216,9 +242,10 @@ class CloudPathMixin(CommonPurePathMixin):
 
     async def read_bytes(self) -> bytes:
         """Read object content as bytes."""
+        native_kwargs = await self._get_native_kwargs()
         return await self._get_batcher().get(
             item=self._item_path,
-            **self._native_kwargs,
+            **native_kwargs,
         )
 
     async def iter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
@@ -249,7 +276,12 @@ class CloudPathMixin(CommonPurePathMixin):
         from asanypath_native import range_read
 
         return bytes(
-            await range_read(path=self._item_path, start=start, end=end, **self._native_kwargs)
+            await range_read(
+                path=self._item_path,
+                start=start,
+                end=end,
+                **(await self._get_native_kwargs()),
+            )
         )
 
     async def read_text(
@@ -275,13 +307,14 @@ class CloudPathMixin(CommonPurePathMixin):
         options_json = (
             msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
         )
+        native_kwargs = await self._get_native_kwargs()
         await self._get_batcher().put(
             item=(
                 self._item_path,
                 data,
                 options_json,
             ),
-            **self._native_kwargs,
+            **native_kwargs,
         )
         return len(data)
 
@@ -307,9 +340,10 @@ class CloudPathMixin(CommonPurePathMixin):
     async def unlink(self, missing_ok: bool = False) -> None:
         """Delete object."""
         try:
+            native_kwargs = await self._get_native_kwargs()
             await self._get_batcher().delete(
                 item=self._item_path,
-                **self._native_kwargs,
+                **native_kwargs,
             )
         except FileNotFoundError:  # pragma: no cover
             if not missing_ok:  # pragma: no cover
@@ -321,9 +355,10 @@ class CloudPathMixin(CommonPurePathMixin):
         if containers is not None:
             return containers
         try:
+            native_kwargs = await self._get_native_kwargs()
             return await self._get_batcher().list(
                 item=self._item_path,
-                **self._native_kwargs,
+                **native_kwargs,
             )
         except FileNotFoundError:
             raise NotADirectoryError(20, f"Not a directory: '{self}'")
@@ -362,7 +397,7 @@ class CloudPathMixin(CommonPurePathMixin):
                 ts, uris = entry
                 if (time.monotonic() - ts) < self.listing_cache_ttl:
                     for uri in uris:
-                        yield type(self)(uri)
+                        yield self._spawn(uri)
                     return
 
         uris = await self._fetch_listing()
@@ -371,7 +406,7 @@ class CloudPathMixin(CommonPurePathMixin):
             cache[cache_key] = (time.monotonic(), uris)
 
         for uri in uris:
-            yield type(self)(uri)
+            yield self._spawn(uri)
 
     def chmod(self, mode: int, *, follow_symlinks: bool = True) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support chmod")
@@ -803,7 +838,7 @@ class CloudPathMixin(CommonPurePathMixin):
             is_dir_results = await batch_fn(
                 prefixes=prefixes,
                 use_h2=len(prefixes) >= H2_BATCH_THRESHOLD,
-                **self._native_kwargs,
+                **(await self._get_native_kwargs()),
             )
         elif entries:
             import asyncio
@@ -976,10 +1011,9 @@ class _CloudFile:
         if "r" in self._mode:
             if self._path._supports_range_read:
                 try:
+                    native_kwargs = runner.run(self._path._get_native_kwargs())
                     headers = runner.run(
-                        self._path._get_batcher().head(
-                            item=self._path._item_path, **self._path._native_kwargs
-                        )
+                        self._path._get_batcher().head(item=self._path._item_path, **native_kwargs)
                     )
                     size = self._get_size(headers)
                     if size is not None and size > self._chunk_size:
@@ -1016,8 +1050,9 @@ class _CloudFile:
         if "r" in self._mode:
             if self._path._supports_range_read:
                 try:
+                    native_kwargs = await self._path._get_native_kwargs()
                     headers = await self._path._get_batcher().head(
-                        item=self._path._item_path, **self._path._native_kwargs
+                        item=self._path._item_path, **native_kwargs
                     )
                     size = self._get_size(headers)
                     if size is not None and size > self._chunk_size:

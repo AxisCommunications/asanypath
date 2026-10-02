@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import msgspec
@@ -427,77 +428,102 @@ def test_path_join_via_truediv():
     assert str(child) == "s3://bucket/prefix/subdir/file.txt"
 
 
-def test_credentials_from_env():
-    env = {
-        "AWS_REGION": "ap-southeast-1",
-        "AWS_ACCESS_KEY_ID": "ENVKEY",
-        "AWS_SECRET_ACCESS_KEY": "ENVSECRET",
-        "AWS_PROFILE": "default",
-        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
-        "AWS_CONFIG_FILE": "/dev/null",
-    }
+def test_spawn_inherits_credentials_and_rebinds_path():
+    parent = _make_s3path(
+        "s3://bucket/prefix",
+        aws_region="eu-west-1",
+        aws_access_key_id="KEYID",
+        aws_secret_access_key="SECRET",
+    )
+    child = parent._spawn("s3://bucket/prefix/child.txt")
+    full = S3Path(
+        "s3://bucket/prefix/child.txt",
+        aws_region="eu-west-1",
+        aws_access_key_id="KEYID",
+        aws_secret_access_key="SECRET",
+    )
+    assert isinstance(child, S3Path)
+    assert str(child) == "s3://bucket/prefix/child.txt"
+    assert child._item_path == full._item_path == "prefix/child.txt"
+    assert child._native_kwargs == full._native_kwargs
+    # Service-root listing yields a different bucket; _bind_path_attrs must refresh it.
+    sibling = parent._spawn("s3://other-bucket/key")
+    assert sibling._bucket == "other-bucket"
+    assert sibling._item_path == "key"
+
+
+@pytest.mark.asyncio
+async def test_read_bytes_resolves_role_credentials():
+    config = SimpleNamespace(
+        endpoint_url=None,
+        aws_region=None,
+        aws_access_key_id=None,
+        aws_secret_access_key=None,
+        aws_session_token=None,
+    )
+    batcher = AsyncMock()
+    batcher.get.return_value = b"data"
+    resolver = AsyncMock(
+        return_value=("ROLEKEY", "ROLESECRET", "ROLETOKEN", "ap-southeast-1", None)
+    )
     with (
-        patch("asanypath.s3.getenv", side_effect=lambda k, d=None: env.get(k, d)),
-        patch("asanypath.s3.ConfigParser.read", return_value=[]),
+        patch.object(S3Path, "_create_env_config", return_value=config),
+        patch("asanypath.s3.s3_get_credentials", new=resolver),
+        patch.object(S3Path, "_get_batcher", return_value=batcher),
     ):
         S3Path._env_config = None
-        p = S3Path("s3://bucket/key")
-    assert p._region == "ap-southeast-1"
+        try:
+            path = S3Path("s3://bucket/key")
+            assert await path.read_bytes() == b"data"
+        finally:
+            S3Path._env_config = None
+
+    resolver.assert_awaited_once_with(
+        region_override=None,
+        access_key=None,
+        secret_key=None,
+        session_token=None,
+    )
+    batcher.get.assert_awaited_once_with(
+        item="key",
+        endpoint="https://s3.ap-southeast-1.amazonaws.com",
+        bucket="bucket",
+        region="ap-southeast-1",
+        access_key="ROLEKEY",
+        secret_key="ROLESECRET",
+        session_token="ROLETOKEN",
+    )
 
 
 @pytest.mark.parametrize(
-    "region,endpoint_override,expected",
+    "region,aws_endpoint,expected",
     [
         ("us-east-1", None, "https://s3.amazonaws.com"),
         ("eu-west-1", None, "https://s3.eu-west-1.amazonaws.com"),
         ("cn-north-1", None, "https://s3.cn-north-1.amazonaws.com.cn"),
         ("eu-west-1", "https://s3.example.test", "https://s3.example.test"),
     ],
-    ids=["us-east-1", "regional", "china", "custom-endpoint"],
+    ids=["us-east-1", "regional", "china", "configured-endpoint"],
 )
-def test_endpoint_from_region_and_env(region, endpoint_override, expected):
-    env = {
-        "AWS_REGION": region,
-        "AWS_PROFILE": "default",
-        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
-        "AWS_CONFIG_FILE": "/dev/null",
-    }
-    if endpoint_override is not None:
-        env["AWS_ENDPOINT_URL"] = endpoint_override
-
+@pytest.mark.asyncio
+async def test_endpoint_from_aws_config(region, aws_endpoint, expected):
+    config = SimpleNamespace(
+        endpoint_url=None,
+        aws_region=None,
+        aws_access_key_id=None,
+        aws_secret_access_key=None,
+        aws_session_token=None,
+    )
+    resolver = AsyncMock(return_value=("KEY", "SECRET", None, region, aws_endpoint))
     with (
-        patch("asanypath.s3.getenv", side_effect=lambda k, d=None: env.get(k, d)),
-        patch("asanypath.s3.ConfigParser.read", return_value=[]),
+        patch.object(S3Path, "_create_env_config", return_value=config),
+        patch("asanypath.s3.s3_get_credentials", new=resolver),
     ):
         S3Path._env_config = None
         try:
-            p = S3Path("s3://bucket/key")
-            assert p._endpoint_url == expected
-        finally:
-            S3Path._env_config = None
-
-
-def test_env_credentials_override_profile(tmp_path):
-    """Env vars must take precedence over the shared-credentials profile."""
-    creds = tmp_path / "credentials"
-    creds.write_text(
-        "[default]\naws_access_key_id = PROFILEKEY\naws_secret_access_key = PROFILESECRET\n"
-    )
-    env = {
-        "AWS_ACCESS_KEY_ID": "ENVKEY",
-        "AWS_SECRET_ACCESS_KEY": "ENVSECRET",
-        "AWS_REGION": "ap-southeast-1",
-        "AWS_PROFILE": "default",
-        "AWS_SHARED_CREDENTIALS_FILE": str(creds),
-        "AWS_CONFIG_FILE": "/dev/null",
-    }
-    with patch("asanypath.s3.getenv", side_effect=lambda k, d=None: env.get(k, d)):
-        S3Path._env_config = None
-        try:
-            p = S3Path("s3://bucket/key")
-            assert p._access_key == "ENVKEY"
-            assert p._secret_key == "ENVSECRET"
-            assert p._region == "ap-southeast-1"
+            path = S3Path("s3://bucket/key")
+            await path._get_native_kwargs()
+            assert path._endpoint_url == expected
         finally:
             S3Path._env_config = None
 

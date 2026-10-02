@@ -7,22 +7,28 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from configparser import ConfigParser
 from datetime import datetime, timezone
-from os import getenv
-from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import msgspec
+from yarl import URL
 
 from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import (
+    AccessAction,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
+)
 from asanypath_native import (
     s3_copy_batch,
     s3_delete_batch,
     s3_exists_batch,
     s3_get_acl,
     s3_get_batch,
+    s3_get_credentials,
     s3_head_batch,
     s3_is_dir,
     s3_is_dir_batch,
@@ -80,12 +86,16 @@ class S3Path(CloudPathMixin):
     ):
         super().__init__(*args, **kwargs)
         cfg = self.env_config
-        self._endpoint_url = endpoint_url or cfg.endpoint_url
-        self._region = aws_region or cfg.aws_region
+        self._endpoint_override = endpoint_url or cfg.endpoint_url
+        self._region_override = aws_region or cfg.aws_region
+        self._endpoint_url = self._endpoint_override or _default_s3_endpoint(
+            self._region_override or "us-east-1"
+        )
+        self._region = self._region_override or "us-east-1"
         self._access_key = aws_access_key_id or cfg.aws_access_key_id
         self._secret_key = aws_secret_access_key or cfg.aws_secret_access_key
         self._session_token = aws_session_token or cfg.aws_session_token
-        self._bucket = self._path._netloc
+        self._bucket = cast(URL, self._path)._netloc
         # Promote explicit params into class cache so derived instances
         # (parent, /, with_name, etc.) inherit them.
         if endpoint_url:
@@ -101,43 +111,14 @@ class S3Path(CloudPathMixin):
 
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
-        """Build config from credential files, then AWS env vars (env takes precedence)."""
-        profile = getenv("AWS_PROFILE", "default")
-        credsfile = str(
-            Path(getenv("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials")).expanduser()
+        """Hold explicit per-path overrides; aws-config resolves AWS configuration."""
+        return SimpleNamespace(
+            endpoint_url=None,
+            aws_region=None,
+            aws_access_key_id=None,
+            aws_secret_access_key=None,
+            aws_session_token=None,
         )
-        cfgfile = str(Path(getenv("AWS_CONFIG_FILE", "~/.aws/config")).expanduser())
-
-        cfg = {
-            "endpoint_url": None,
-            "aws_region": "us-east-1",
-            "aws_access_key_id": None,
-            "aws_secret_access_key": None,
-            "aws_session_token": None,
-        }
-
-        # Shared credentials/config files (lower precedence).
-        cp = ConfigParser()
-        if cp.read(filenames=credsfile):
-            if profile in cp:
-                cfg.update(cp[profile])
-        if cp.read(filenames=cfgfile):
-            section = profile if profile == "default" else f"profile {profile}"
-            if section in cp:
-                cfg.update(cp[section])
-
-        # Environment variables override the profile files.
-        env = {
-            "endpoint_url": getenv("AWS_ENDPOINT_URL"),
-            "aws_region": getenv("AWS_REGION"),
-            "aws_access_key_id": getenv("AWS_ACCESS_KEY_ID"),
-            "aws_secret_access_key": getenv("AWS_SECRET_ACCESS_KEY"),
-            "aws_session_token": getenv("AWS_SESSION_TOKEN"),
-        }
-        cfg.update({k: v for k, v in env.items() if v is not None})
-        cfg["endpoint_url"] = cfg["endpoint_url"] or _default_s3_endpoint(cfg["aws_region"])
-
-        return SimpleNamespace(**cfg)
 
     # ------------------------------------------------------------------
     # CloudPathMixin hooks
@@ -145,7 +126,10 @@ class S3Path(CloudPathMixin):
 
     @property
     def _item_path(self) -> str:
-        return self._path.path.strip("/")
+        return cast(URL, self._path).path.strip("/")
+
+    def _bind_path_attrs(self) -> None:
+        self._bucket = cast(URL, self._path)._netloc
 
     @property
     def _native_kwargs(self) -> dict:
@@ -158,33 +142,58 @@ class S3Path(CloudPathMixin):
             "session_token": self._session_token or None,
         }
 
+    async def _get_native_kwargs(self) -> dict:
+        if (
+            self._access_key
+            and self._secret_key
+            and self._region_override
+            and self._endpoint_override
+        ):
+            return self._native_kwargs
+        access_key, secret_key, session_token, region, aws_endpoint = await s3_get_credentials(
+            region_override=self._region_override,
+            access_key=self._access_key,
+            secret_key=self._secret_key,
+            session_token=self._session_token,
+        )
+        self._region = region
+        self._endpoint_url = self._endpoint_override or aws_endpoint or _default_s3_endpoint(region)
+        return {
+            **self._native_kwargs,
+            "access_key": access_key,
+            "secret_key": secret_key,
+            "session_token": session_token,
+        }
+
     # ------------------------------------------------------------------
     # Backend-specific operations
     # ------------------------------------------------------------------
 
     async def is_dir(self) -> bool:
         """Check if path is a directorish."""
-        return await s3_is_dir(prefix=self._item_path, **self._native_kwargs)
+        return await s3_is_dir(prefix=self._item_path, **(await self._get_native_kwargs()))
 
     async def _list_containers(self) -> list[str] | None:
         """List buckets when at the service root (``s3://``); else None."""
         if self._bucket:
             return None
+        native_kwargs = await self._get_native_kwargs()
         names = await s3_list_buckets(
             endpoint=self._endpoint_url,
             region=self._region,
-            access_key=self._access_key,
-            secret_key=self._secret_key,
-            session_token=self._session_token or None,
+            access_key=native_kwargs["access_key"],
+            secret_key=native_kwargs["secret_key"],
+            session_token=native_kwargs["session_token"],
             use_h2=False,
         )
         return [f"s3://{name}" for name in names]
 
     async def stat(self, *, follow_symlinks: bool = True):
         """Return file metadata from a HEAD request."""
+        native_kwargs = await self._get_native_kwargs()
         headers = await self._get_batcher().head(
             item=self._item_path,
-            **self._native_kwargs,
+            **native_kwargs,
         )
         size = int(headers.get("Content-Length", headers.get("content-length", 0)))
         last_modified = headers.get("Last-Modified", headers.get("last-modified"))
@@ -199,9 +208,10 @@ class S3Path(CloudPathMixin):
 
     async def checksums(self) -> dict[str, str]:
         """Return MD5 checksum from the S3 ETag header."""
+        native_kwargs = await self._get_native_kwargs()
         headers = await self._get_batcher().head(
             item=self._item_path,
-            **self._native_kwargs,
+            **native_kwargs,
         )
         etag = headers.get("ETag", headers.get("etag", "")).strip('"')
         return {"md5": etag}
@@ -214,7 +224,7 @@ class S3Path(CloudPathMixin):
         S3 ACL permissions beyond read/write remain available in ``provider``
         because they do not have portable POSIX equivalents.
         """
-        data = await s3_get_acl(key=self._item_path, **self._native_kwargs)
+        data = await s3_get_acl(key=self._item_path, **(await self._get_native_kwargs()))
         if isinstance(data, str):
             data = msgspec.json.decode(data)
         if not isinstance(data, Mapping):
@@ -227,13 +237,16 @@ class S3Path(CloudPathMixin):
             principal = grant.get("principal")
             if not isinstance(principal, str):
                 continue
-            actions = frozenset(
-                action
-                for action, allowed in (
-                    ("read", permission in {"READ", "FULL_CONTROL"}),
-                    ("write", permission in {"WRITE", "FULL_CONTROL"}),
-                )
-                if allowed
+            actions = cast(
+                frozenset[AccessAction],
+                frozenset(
+                    action
+                    for action, allowed in (
+                        ("read", permission in {"READ", "FULL_CONTROL"}),
+                        ("write", permission in {"WRITE", "FULL_CONTROL"}),
+                    )
+                    if allowed
+                ),
             )
             if actions:
                 grants.append(AccessGrant(principal, actions))
@@ -254,7 +267,7 @@ class S3Path(CloudPathMixin):
         await s3_put_acl(
             key=self._item_path,
             acl_json=msgspec.json.encode(acl).decode(),
-            **self._native_kwargs,
+            **(await self._get_native_kwargs()),
         )
 
     async def presign(self, *, expires: int = 3600, method: str = "GET") -> str:
@@ -272,14 +285,15 @@ class S3Path(CloudPathMixin):
         if expires < 1 or expires > 604800:
             raise ValueError("expires must be between 1 and 604800 seconds")
 
+        native_kwargs = await self._get_native_kwargs()
         return s3_presign(
             endpoint=self._endpoint_url,
             bucket=self._bucket,
             key=self._item_path,
             region=self._region,
-            access_key=self._access_key,
-            secret_key=self._secret_key,
-            session_token=self._session_token,
+            access_key=native_kwargs["access_key"],
+            secret_key=native_kwargs["secret_key"],
+            session_token=native_kwargs["session_token"],
             method=method,
             expires=expires,
         )
