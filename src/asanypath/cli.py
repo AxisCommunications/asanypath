@@ -504,7 +504,7 @@ def _maybe_rewrite_scp_style(value: str, check_config: bool = True) -> str:
             return value
         if not _discover_ssh_config():
             return value
-        resolved_host, _, _ = _resolve_alias(host, None, None)
+        resolved_host, _, _, _ = _resolve_alias(host, None, None)
         if resolved_host == host:
             # No Host block matched — leave alone (don't probe DNS).
             return value

@@ -155,6 +155,19 @@ class CloudPathMixin(CommonPurePathMixin):
         Subclasses that store path-derived attributes override this.
         """
 
+    def _child(self, uri: str, **attrs: object) -> Self:
+        """Spawn an ``iterdir``/listing child from a canonical URI and attach
+        attributes already known from the listing (cached stat, folder hint,
+        trailing-slash hint) so the child needn't re-fetch them.
+
+        One fast path for every backend: no per-child ``__init__`` (scheme
+        re-parse, env read, ssh_config resolution) and no re-stat.
+        """
+        child = self._spawn(uri)
+        for name, value in attrs.items():
+            setattr(child, name, value)
+        return child
+
     @property
     def _native_kwargs(self) -> dict:
         """Auth / endpoint kwargs forwarded to batcher and native calls."""
@@ -397,7 +410,7 @@ class CloudPathMixin(CommonPurePathMixin):
                 ts, uris = entry
                 if (time.monotonic() - ts) < self.listing_cache_ttl:
                     for uri in uris:
-                        yield self._spawn(uri)
+                        yield self._child(uri)
                     return
 
         uris = await self._fetch_listing()
@@ -406,7 +419,7 @@ class CloudPathMixin(CommonPurePathMixin):
             cache[cache_key] = (time.monotonic(), uris)
 
         for uri in uris:
-            yield self._spawn(uri)
+            yield self._child(uri)
 
     def chmod(self, mode: int, *, follow_symlinks: bool = True) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support chmod")

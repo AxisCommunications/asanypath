@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,8 +15,6 @@ from click.testing import CliRunner
 
 import asanypath.cli as cli_module
 from asanypath.cli import cli
-
-_HAS_ASYNCSSH = importlib.util.find_spec("asyncssh") is not None
 
 
 @pytest.fixture
@@ -1214,11 +1211,8 @@ def test_cp_failure_is_best_effort(runner, cp_tree, monkeypatch):
 def test_protocols_lists_ssh_and_ftp(runner):
     result = runner.invoke(cli, ["protocols"])
     assert result.exit_code == 0
-    if _HAS_ASYNCSSH:
-        assert "ssh" in result.output
-        assert "~/.ssh/config" in result.output
-    else:
-        assert "ssh" not in result.output
+    assert "ssh" in result.output
+    assert "~/.ssh/config" in result.output
     assert "ftp" in result.output
     assert "ftps" in result.output
     assert "~/.netrc" in result.output
@@ -1229,15 +1223,11 @@ def test_auth_show_ssh_section_present(runner, monkeypatch):
     result = runner.invoke(cli, ["auth", "show", "ssh://h/x"])
     assert result.exit_code == 0
     assert "SSH / SFTP" in result.output
-    if _HAS_ASYNCSSH:
-        assert "SSH_USER" in result.output
-    else:
-        assert "optional dependency not installed" in result.output
+    assert "SSH_USER" in result.output
     assert "SSH_PASSWORD" not in result.output
     assert "not read from env" in result.output
 
 
-@pytest.mark.skipif(not _HAS_ASYNCSSH, reason="requires asyncssh extra")
 def test_auth_show_ssh_prints_resolved_target(runner, tmp_path, monkeypatch):
     cfg = tmp_path / "config"
     cfg.write_text("Host myalias\n  HostName real.example.com\n  Port 2222\n")
@@ -1273,7 +1263,6 @@ def test_auth_show_ftp_reports_netrc_entry(runner, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _HAS_ASYNCSSH, reason="requires asyncssh extra")
 def test_scp_style_rewrites_alias(tmp_path, monkeypatch):
     cfg = tmp_path / "config"
     cfg.write_text("Host prod-1\n  HostName 10.0.0.5\n  User deploy\n  Port 2222\n")
@@ -1309,7 +1298,6 @@ def test_scp_style_leaves_local_path_alone(monkeypatch):
     assert _maybe_rewrite_scp_style("plain.txt") == "plain.txt"
 
 
-@pytest.mark.skipif(not _HAS_ASYNCSSH, reason="requires asyncssh extra")
 def test_scp_style_unknown_host_not_rewritten(tmp_path, monkeypatch):
     cfg = tmp_path / "config"
     cfg.write_text("Host knownhost\n  HostName real.example.com\n")

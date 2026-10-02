@@ -193,7 +193,9 @@ pub fn bearer_headers(token: &str) -> Vec<(String, String)> {
 
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
+
+use crate::backend::PyBytesBuf;
 
 /// Execute a generic HTTP request, returning (body_bytes, headers_dict).
 /// Used by all verb-specific wrappers below.
@@ -202,7 +204,7 @@ async fn _http_request(
     url: &str,
     body: Option<Vec<u8>>,
     headers: Vec<(String, String)>,
-) -> Result<(Vec<u8>, HashMap<String, String>), PyErr> {
+) -> Result<(Bytes, HashMap<String, String>), PyErr> {
     let body_bytes = body.map(Bytes::from);
     let (status, resp_body, resp_headers) = do_request(method, url, &headers, body_bytes, false)
         .await
@@ -210,7 +212,7 @@ async fn _http_request(
     if !status.is_success() {
         return Err(status_to_pyerr(status, url, &resp_body));
     }
-    Ok((resp_body.to_vec(), resp_headers))
+    Ok((resp_body, resp_headers))
 }
 
 /// GET an unsigned URL, returning the response body as bytes.
@@ -223,7 +225,7 @@ pub fn http_get(
 ) -> PyResult<Bound<'_, pyo3::PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (body, _) = _http_request("GET", &url, None, headers.unwrap_or_default()).await?;
-        Ok(body)
+        Ok(PyBytesBuf(body))
     })
 }
 
@@ -260,7 +262,7 @@ pub fn http_put(
 ) -> PyResult<Bound<'_, pyo3::PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (resp_body, _) = _http_request("PUT", &url, body, headers.unwrap_or_default()).await?;
-        Ok(resp_body)
+        Ok(PyBytesBuf(resp_body))
     })
 }
 
@@ -275,7 +277,7 @@ pub fn http_post(
 ) -> PyResult<Bound<'_, pyo3::PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (resp_body, _) = _http_request("POST", &url, body, headers.unwrap_or_default()).await?;
-        Ok(resp_body)
+        Ok(PyBytesBuf(resp_body))
     })
 }
 
@@ -290,7 +292,7 @@ pub fn http_delete(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (resp_body, _) =
             _http_request("DELETE", &url, None, headers.unwrap_or_default()).await?;
-        Ok(resp_body)
+        Ok(PyBytesBuf(resp_body))
     })
 }
 
@@ -306,7 +308,7 @@ pub fn http_patch(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (resp_body, _) =
             _http_request("PATCH", &url, body, headers.unwrap_or_default()).await?;
-        Ok(resp_body)
+        Ok(PyBytesBuf(resp_body))
     })
 }
 
@@ -392,7 +394,11 @@ pub fn http_request(
             for (k, v) in &resp_headers {
                 dict.set_item(k.as_str(), v.as_str())?;
             }
-            let result = (status.as_u16(), resp_body.to_vec(), dict.into_py_any(py)?);
+            let result = (
+                status.as_u16(),
+                PyBytes::new(py, &resp_body),
+                dict.into_py_any(py)?,
+            );
             result.into_py_any(py)
         })
         .expect("Python GIL must be available")

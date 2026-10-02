@@ -246,9 +246,7 @@ class ArtifactoryPath(CloudPathMixin):
         containers = await self._list_containers()
         if containers is not None:
             for uri in containers:
-                child = type(self)(uri)
-                child._token = self._token
-                yield child
+                yield self._child(uri)
             return
         batcher = self._get_batcher()
         results = await batcher.list(
@@ -259,10 +257,7 @@ class ArtifactoryPath(CloudPathMixin):
         base = str(self).rstrip("/")
         for uri, is_folder in results:
             child_name = uri.rsplit("/", 1)[-1]
-            child_path = type(self)(f"{base}/{child_name}")
-            child_path._token = self._token
-            child_path._is_folder = is_folder
-            yield child_path
+            yield self._child(f"{base}/{child_name}", _is_folder=is_folder)
 
     async def _list_containers(self) -> list[str] | None:
         """List repositories when at the server root (``art://<host>/artifactory/``).

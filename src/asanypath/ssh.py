@@ -41,107 +41,56 @@ Call :func:`disconnect_all` to close everything (mainly for tests/shutdown).
 
 from __future__ import annotations
 
-import asyncio
-import getpass
 import stat as stat_module
-import sys
 from collections.abc import AsyncIterator
 from os import getenv
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-
-import asyncssh
-from asyncssh.config import SSHClientConfig
+from typing import TYPE_CHECKING, NoReturn
 
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath_native import (
+    ssh_disconnect_all,
+    ssh_list,
+    ssh_lstat,
+    ssh_mkdir,
+    ssh_read,
+    ssh_read_range,
+    ssh_rename,
+    ssh_resolve_config,
+    ssh_rmdir,
+    ssh_setstat,
+    ssh_stat,
+    ssh_unlink,
+    ssh_write,
+)
 
 if TYPE_CHECKING:
     from typing import Self
 
 
-_CONN_CACHE: dict[tuple, asyncssh.SSHClientConnection] = {}
-_CONN_LOCKS: dict[tuple, asyncio.Lock] = {}
-
-
 def disconnect_all() -> None:
-    """Close every cached SSH connection."""
-    for conn in list(_CONN_CACHE.values()):
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001  # pragma: no cover
-            pass  # pragma: no cover
-    _CONN_CACHE.clear()
-    _CONN_LOCKS.clear()
+    """Close and drop all pooled native SFTP sessions."""
+    ssh_disconnect_all()
 
 
 _UNSET = object()
 
-# asyncssh's ``SFTPNoSuchFile`` does not subclass ``FileNotFoundError``/``OSError``,
-# so existence checks must translate it explicitly (else exists()/is_dir() raise
-# instead of returning False, breaking copy/rename to new remote paths).
-_sftp_no_such_file = getattr(asyncssh.sftp, "SFTPNoSuchFile", None)
-_NOT_FOUND_ERRORS: tuple[type[BaseException], ...] = (
-    (FileNotFoundError, _sftp_no_such_file) if _sftp_no_such_file else (FileNotFoundError,)
-)
 
-
-def _interactive() -> bool:
-    """Whether the backend may prompt the user for credentials."""
-    if getenv("ASANYPATH_INTERACTIVE") == "0":
-        return False
-    try:
-        return sys.stdin.isatty()
-    except (AttributeError, ValueError):  # pragma: no cover
-        return False  # pragma: no cover
-
-
-class _InteractiveSSHClient(asyncssh.SSHClient):
-    """SSHClient that prompts via :mod:`getpass` for missing credentials.
-
-    Used only when stdin is a TTY and no static password was supplied.
-    The prompted password is cached on the instance so a single login
-    attempt doesn't re-ask after a failed kbdint round.
-    """
-
-    def __init__(self, label: str) -> None:
-        self._label = label
-        self._cached_password: str | None = None
-
-    async def _prompt(self, msg: str, *, hidden: bool = True) -> str:
-        loop = asyncio.get_running_loop()
-        fn = getpass.getpass if hidden else input
-        return await loop.run_in_executor(None, fn, msg)
-
-    async def password_auth_requested(self) -> str | None:
-        if self._cached_password is None:
-            self._cached_password = await self._prompt(f"Password for {self._label}: ")
-        return self._cached_password
-
-    async def kbdint_auth_requested(self) -> str:
-        return ""
-
-    async def kbdint_challenge_received(
-        self, name: str, instructions: str, lang: str, prompts
-    ) -> list[str] | None:
-        if not prompts:
-            return []
-        if name:
-            sys.stderr.write(f"{name}\n")
-        if instructions:
-            sys.stderr.write(f"{instructions}\n")
-        responses: list[str] = []
-        for prompt, echo in prompts:
-            # Reuse cached password for password-like challenges so the user
-            # isn't prompted twice when the server tries password and then
-            # keyboard-interactive with a "Password:" prompt.
-            if not echo and self._cached_password and "password" in prompt.lower():
-                responses.append(self._cached_password)
-            else:
-                responses.append(await self._prompt(prompt, hidden=not echo))
-        return responses
+def _map_native_error(exc: Exception, path: str) -> NoReturn:
+    """Translate a native russh/SFTP error into the stdlib OSError family."""
+    msg = str(exc).lower()
+    if "no such file" in msg or "not found" in msg or "does not exist" in msg:
+        raise FileNotFoundError(2, "No such file or directory", path) from exc
+    if "permission denied" in msg:
+        raise PermissionError(13, "Permission denied", path) from exc
+    if "not a directory" in msg:
+        raise NotADirectoryError(20, "Not a directory", path) from exc
+    if "already exists" in msg or "file exists" in msg:
+        raise FileExistsError(17, "File exists", path) from exc
+    raise exc
 
 
 def _discover_ssh_config() -> list[str]:
@@ -150,12 +99,12 @@ def _discover_ssh_config() -> list[str]:
     Honors ``$SSH_CONFIG`` as a single override (empty string disables
     discovery entirely). Otherwise looks for ``~/.ssh/config`` and
     ``/etc/ssh/ssh_config`` in OpenSSH order, returning paths that exist
-    or are likely to exist. asyncssh will handle missing files gracefully.
+    or are likely to exist. Missing files are skipped by the resolver.
     """
     override = getenv("SSH_CONFIG")
     if override is not None:
         return [override] if override else []
-    # Always include both paths; asyncssh handles missing files
+    # Always include both paths; the native resolver skips missing files.
     paths = [
         str(Path.home() / ".ssh" / "config"),
         "/etc/ssh/ssh_config",
@@ -167,8 +116,9 @@ def _resolve_alias(
     host: str | None,
     port: int | None,
     user: str | None,
-) -> tuple[str | None, int | None, str | None]:
-    """Expand ``(host, port, user)`` via OpenSSH config; return resolved values.
+) -> tuple[str | None, int | None, str | None, str | None]:
+    """Expand ``(host, port, user)`` via OpenSSH config; return resolved values
+    plus the configured ``IdentityFile`` (for native key auth).
 
     Falls back to the supplied values when no config is available or no
     match is found. ``port`` / ``user`` come back as ``None`` when neither
@@ -177,20 +127,15 @@ def _resolve_alias(
     """
     cfg_paths = _discover_ssh_config()
     if not host or not cfg_paths:
-        return host, port, user
+        return host, port, user, None
     try:
-        local_user = getpass.getuser()
+        cfg_host, cfg_port, cfg_user, cfg_identity = ssh_resolve_config(host, cfg_paths)
     except Exception:  # noqa: BLE001
-        local_user = ""
-    try:
-        cfg = SSHClientConfig.load(None, cfg_paths, False, False, False, local_user, (), host, ())
-    except Exception:  # noqa: BLE001
-        return host, port, user
-    resolved_host = cfg.get("Hostname") or host
-    resolved_port_raw = port or cfg.get("Port")
-    resolved_port = int(resolved_port_raw) if resolved_port_raw is not None else None
-    resolved_user = user or cfg.get("User")
-    return resolved_host, resolved_port, resolved_user
+        return host, port, user, None
+    resolved_host = cfg_host or host
+    resolved_port = port or cfg_port
+    resolved_user = user or cfg_user
+    return resolved_host, resolved_port, resolved_user, cfg_identity
 
 
 class SSHPath(CloudPathMixin):
@@ -229,10 +174,12 @@ class SSHPath(CloudPathMixin):
         # Eager alias resolution. str(self) keeps the original URL;
         # .resolved_target surfaces what we connect to; the connection
         # pool keys on the resolved tuple.
-        r_host, r_port, r_user = _resolve_alias(self._host, typed_port, typed_user)
+        r_host, r_port, r_user, r_identity = _resolve_alias(self._host, typed_port, typed_user)
         self._resolved_host = r_host
         self._resolved_port = r_port if r_port is not None else cfg.port
         self._resolved_user = r_user if r_user is not None else cfg.user
+        # ssh_config IdentityFile, used for native key auth when no explicit key.
+        self._config_identity = r_identity
         # Promote explicit params into class cache so derived instances
         # (parent, /, with_name, ...) inherit them — mirrors S3/GCS.
         if host:
@@ -303,166 +250,34 @@ class SSHPath(CloudPathMixin):
 
     @property
     def _native_kwargs(self) -> dict:
+        # Single source of connection truth for the native russh backend,
+        # spread as ``**self._native_kwargs`` like every other backend.
+        # Auth precedence mirrors ssh: explicit password, then key file
+        # (explicit kwarg/env, else ssh_config IdentityFile), else agent.
+        keys = self._client_keys or ()
+        key_path = keys[0] if keys else getattr(self, "_config_identity", None)
+        if key_path is not None:
+            key_path = str(Path(key_path).expanduser())
+        if self._password is not None:
+            use_agent = False
+            key_path = None
+        elif key_path is not None:
+            use_agent = False
+        else:
+            use_agent = True
         return {
             "host": self._resolved_host,
             "port": self._resolved_port,
             "user": self._resolved_user,
+            "password": self._password,
+            "key_path": key_path,
+            "key_passphrase": None,
+            "use_agent": use_agent,
+            # asyncssh disables host-key checking for ``None``; SSHPath also
+            # maps SSH_KNOWN_HOSTS=none -> (). Mirror both so native parity
+            # holds; any other value keeps strict verification.
+            "strict_host_key": self._known_hosts not in (None, ()),
         }
-
-    # ------------------------------------------------------------------
-    # Connection / SFTP pool
-    # ------------------------------------------------------------------
-
-    @property
-    def _conn_key(self) -> tuple:
-        # Pool by *resolved* target so two aliases pointing at the same
-        # machine share one connection.
-        return (self._resolved_host, self._resolved_port, self._resolved_user)
-
-    async def _get_conn(self) -> asyncssh.SSHClientConnection:
-        key = self._conn_key
-        lock = _CONN_LOCKS.setdefault(key, asyncio.Lock())
-        async with lock:
-            conn = _CONN_CACHE.get(key)
-            if conn is None or conn.is_closed():
-                conn = await self._connect_fresh()
-                _CONN_CACHE[key] = conn
-            return conn
-
-    def _credstore_key(self) -> str:
-        return (
-            f"ssh:{self._resolved_host or self._host or ''}"
-            f":{self._resolved_port or ''}"
-            f":{self._resolved_user or ''}"
-        )
-
-    async def _connect_fresh(self) -> asyncssh.SSHClientConnection:
-        # Pass the original (typed) host so asyncssh re-applies
-        # ssh_config (IdentityFile, ProxyJump, UserKnownHostsFile, …)
-        # using the alias as the Host pattern. Our resolved values are
-        # only used for pool keying / cache identity.
-        from asanypath import _credstore
-
-        base_kwargs: dict = {
-            "host": self._host,
-            "known_hosts": self._known_hosts,
-            "config": self.env_config.config_paths or (),
-        }
-        # Only pass typed URL/kwarg user/port. If they came from env defaults,
-        # let asyncssh apply ssh_config alias User/Port instead.
-        if self._typed_port is not None:
-            base_kwargs["port"] = self._typed_port
-        if self._typed_user is not None:
-            base_kwargs["username"] = self._typed_user
-        if self._client_keys is not None:
-            base_kwargs["client_keys"] = self._client_keys
-        if self._password is not None:
-            return await asyncssh.connect(password=self._password, **base_kwargs)
-
-        cred_key = self._credstore_key()
-        cached = _credstore.load(cred_key) if _interactive() else None
-        if cached is not None:
-            try:
-                return await asyncssh.connect(password=cached, **base_kwargs)
-            except asyncssh.PermissionDenied:
-                _credstore.forget(cred_key)
-        if not _interactive():
-            return await asyncssh.connect(**base_kwargs)
-
-        label = self._resolved_host or self._host or "ssh"
-        if self._resolved_user:
-            label = f"{self._resolved_user}@{label}"
-        captured: list[_InteractiveSSHClient] = []
-
-        def _factory() -> _InteractiveSSHClient:
-            inst = _InteractiveSSHClient(label)
-            captured.append(inst)
-            return inst
-
-        conn = await asyncssh.connect(client_factory=_factory, **base_kwargs)
-        if captured and captured[0]._cached_password:
-            _credstore.save(cred_key, captured[0]._cached_password)
-        return conn
-
-    async def _sftp(self) -> asyncssh.SFTPClient:
-        conn = await self._get_conn()
-        sftp = getattr(conn, "_asanypath_sftp", None)
-        # asyncssh.SFTPClient doesn't expose ``exit_status`` on all versions.
-        # Reuse cached client unless an explicit non-None ``exit_status``
-        # attribute exists (e.g. from test doubles / alternate implementations).
-        sftp_exit_status = getattr(sftp, "exit_status", None) if sftp is not None else None
-        if sftp is None or sftp_exit_status is not None:
-            sftp = await conn.start_sftp_client()
-            conn._asanypath_sftp = sftp  # type: ignore[attr-defined]
-        return sftp
-
-    async def _run_remote(self, cmd: str, *, timeout: float | None = 15.0) -> tuple[str, int]:
-        """Run a shell command on the remote host via OpenSSH subprocess.
-
-        Uses the original typed host alias so that OpenSSH applies the full
-        ``~/.ssh/config`` — including ControlMaster, ProxyJump, and
-        IdentityFile — exactly as the user configured it.  This means a
-        pre-existing ControlMaster socket makes this call near-instant.
-
-        Returns ``(stdout_text, returncode)``.  Never raises.
-        """
-        import shutil
-
-        ssh_bin = shutil.which("ssh")
-        if ssh_bin is None:
-            return "", -1
-        args: list[str] = [ssh_bin, "-o", "BatchMode=yes"]
-        # Pass only URL/kwarg-typed user and port; let OpenSSH apply the
-        # Host block for everything else so ControlMaster matching works.
-        if self._typed_user is not None:
-            args += ["-l", self._typed_user]
-        if self._typed_port is not None:
-            args += ["-p", str(self._typed_port)]
-        args.append(self._host or self._resolved_host or "")
-        args.append(cmd)
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            coro = proc.communicate()
-            stdout_b, _ = (
-                await asyncio.wait_for(coro, timeout=timeout) if timeout is not None else await coro
-            )
-            return stdout_b.decode("utf-8", errors="replace"), proc.returncode or 0
-        except Exception:
-            if proc is not None:
-                try:
-                    proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
-            return "", -1
-
-    async def _list_dir_remote(self) -> list[tuple[str, bool]] | None:
-        """List immediate children via OpenSSH subprocess (1 SSH call).
-
-        Returned as ``[(name, is_dir), ...]`` or ``None`` when the subprocess
-        approach is unavailable (no ``ssh`` binary) or the remote doesn't
-        support GNU find ``-printf``.
-        """
-        import shlex
-
-        path_q = shlex.quote(self._item_path)
-        cmd = f"find {path_q} -maxdepth 1 -mindepth 1 -printf '%y\\t%f\\n' 2>/dev/null"
-        output, rc = await self._run_remote(cmd, timeout=5.0)
-        if rc != 0 or "\t" not in output:
-            return None
-        result: list[tuple[str, bool]] = []
-        for line in output.splitlines():
-            if "\t" not in line:
-                continue
-            type_char, name = line.split("\t", 1)
-            if not name:
-                continue
-            result.append((name, type_char == "d"))
-        return result
 
     # ------------------------------------------------------------------
     # Stat / type checks
@@ -474,13 +289,17 @@ class SSHPath(CloudPathMixin):
         cached = getattr(self, "_cached_attrs", None)
         if cached is not None and follow_symlinks:
             return cached
-        sftp = await self._sftp()
+        # ssh_stat follows symlinks; ssh_lstat does not (for is_symlink()).
+        stat_fn = ssh_stat if follow_symlinks else ssh_lstat
         try:
-            if follow_symlinks:
-                return await sftp.stat(self._item_path)
-            return await sftp.lstat(self._item_path)
-        except _NOT_FOUND_ERRORS as e:
-            raise FileNotFoundError(2, "No such file or directory", str(self)) from e
+            size, mtime, atime, uid, gid, permissions = await stat_fn(
+                path=self._item_path, **self._native_kwargs
+            )
+        except Exception as e:  # noqa: BLE001
+            _map_native_error(e, str(self))
+        return SimpleNamespace(
+            size=size, mtime=mtime, atime=atime, uid=uid, gid=gid, permissions=permissions
+        )
 
     async def exists(self) -> bool:
         try:
@@ -549,15 +368,22 @@ class SSHPath(CloudPathMixin):
     async def update_access_policy(
         self, policy_patch: AccessPolicyPatch, *, backend_options: BackendOptions | None = None
     ) -> None:
-        """Apply POSIX ownership and mode grants through SFTP."""
-        sftp = await self._sftp()
+        """Apply POSIX ownership and mode grants through SFTP setstat."""
         if policy_patch.owner is not None or policy_patch.group is not None:
             try:
-                uid = -1 if policy_patch.owner is None else int(policy_patch.owner)
-                gid = -1 if policy_patch.group is None else int(policy_patch.group)
+                uid = None if policy_patch.owner is None else int(policy_patch.owner)
+                gid = None if policy_patch.group is None else int(policy_patch.group)
             except ValueError as error:
                 raise ValueError("SSH ownership must use numeric uid and gid strings") from error
-            await sftp.chown(self._item_path, uid, gid)
+            await ssh_setstat(
+                path=self._item_path,
+                permissions=None,
+                uid=uid,
+                gid=gid,
+                atime=None,
+                mtime=None,
+                **self._native_kwargs,
+            )
         if policy_patch.grants:
             attrs = await self._attrs()
             mode = attrs.permissions or 0
@@ -570,7 +396,15 @@ class SSHPath(CloudPathMixin):
                 )
                 shift = shifts[grant.principal]
                 mode = mode & ~(0o7 << shift) | (bits << shift)
-            await sftp.chmod(self._item_path, mode)
+            await ssh_setstat(
+                path=self._item_path,
+                permissions=mode,
+                uid=None,
+                gid=None,
+                atime=None,
+                mtime=None,
+                **self._native_kwargs,
+            )
 
     async def checksums(self) -> dict[str, str]:
         from hashlib import md5, sha1, sha256
@@ -587,51 +421,65 @@ class SSHPath(CloudPathMixin):
     # ------------------------------------------------------------------
 
     async def read_bytes(self) -> bytes:
-        sftp = await self._sftp()
-        async with sftp.open(self._item_path, "rb") as f:
-            return await f.read()
+        try:
+            return bytes(await ssh_read(path=self._item_path, **self._native_kwargs))
+        except Exception as e:  # noqa: BLE001
+            _map_native_error(e, str(self))
 
     async def write_bytes(self, data: bytes) -> int:
-        sftp = await self._sftp()
-        async with sftp.open(self._item_path, "wb") as f:
-            await f.write(data)
-        return len(data)
+        try:
+            return await ssh_write(path=self._item_path, data=data, **self._native_kwargs)
+        except Exception as e:  # noqa: BLE001
+            _map_native_error(e, str(self))
 
     async def _range_read(self, start: int, end: int) -> bytes:
-        sftp = await self._sftp()
-        async with sftp.open(self._item_path, "rb") as f:
-            await f.seek(start)
-            return await f.read(end - start + 1)
+        try:
+            return bytes(
+                await ssh_read_range(
+                    path=self._item_path, start=start, end=end, **self._native_kwargs
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            _map_native_error(e, str(self))
 
     # ------------------------------------------------------------------
     # Directory / unlink / rename
     # ------------------------------------------------------------------
 
     async def unlink(self, missing_ok: bool = False) -> None:
-        sftp = await self._sftp()
         try:
-            await sftp.remove(self._item_path)
-        except _NOT_FOUND_ERRORS:
-            if not missing_ok:
-                raise FileNotFoundError(2, "No such file or directory", str(self)) from None
+            await ssh_unlink(path=self._item_path, **self._native_kwargs)
+        except Exception as e:  # noqa: BLE001
+            try:
+                _map_native_error(e, str(self))
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
 
     async def mkdir(self, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
-        sftp = await self._sftp()
+        if not (parents or exist_ok) and await self.exists():
+            raise FileExistsError(17, "File exists", str(self))
         try:
-            if parents:
-                await sftp.makedirs(self._item_path, exist_ok=exist_ok)
-            else:
-                await sftp.mkdir(self._item_path)
-        except FileExistsError:
-            if not exist_ok:
-                raise
+            await ssh_mkdir(path=self._item_path, parents=parents, **self._native_kwargs)
+        except Exception as e:  # noqa: BLE001
+            try:
+                _map_native_error(e, str(self))
+            except FileExistsError:
+                if not exist_ok:
+                    raise
 
     async def rmdir(self, *, recursive: bool = False) -> None:
-        sftp = await self._sftp()
         if recursive:
-            await sftp.rmtree(self._item_path)
-            return
-        await sftp.rmdir(self._item_path)
+            # No native recursive remove; delete children depth-first.
+            async for child in self.iterdir():
+                if await child.is_dir():
+                    await child.rmdir(recursive=True)
+                else:
+                    await child.unlink()
+        try:
+            await ssh_rmdir(path=self._item_path, **self._native_kwargs)
+        except Exception as e:  # noqa: BLE001
+            _map_native_error(e, str(self))
 
     async def rename(self, target: str | Self, *, force: bool = False) -> Self:
         target_path = target if isinstance(target, type(self)) else type(self)(str(target))
@@ -648,17 +496,27 @@ class SSHPath(CloudPathMixin):
                 require_force(force, target_path)
             return await super().rename(str(target), force=True)
         if (target_path._host, target_path._port) == (self._host, self._port):
-            sftp = await self._sftp()
-            await sftp.rename(self._item_path, target_path._item_path)
+            try:
+                await ssh_rename(
+                    src=self._item_path, dst=target_path._item_path, **self._native_kwargs
+                )
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
             return target_path
         return await super().rename(str(target))
 
     async def replace(self, target: str | Self) -> Self:
         target_path = target if isinstance(target, type(self)) else type(self)(str(target))
         if (target_path._host, target_path._port) == (self._host, self._port):
-            sftp = await self._sftp()
-            # posix_rename atomically replaces dest if it exists.
-            await sftp.posix_rename(self._item_path, target_path._item_path)
+            # russh-sftp has no posix_rename; emulate atomic-ish replace
+            # by removing an existing destination first.
+            await target_path.unlink(missing_ok=True)
+            try:
+                await ssh_rename(
+                    src=self._item_path, dst=target_path._item_path, **self._native_kwargs
+                )
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
             return target_path
         return await super().replace(str(target))
 
@@ -666,26 +524,36 @@ class SSHPath(CloudPathMixin):
         if await self.exists():
             if not exist_ok:
                 raise FileExistsError(17, f"File exists: '{self}'")
-            sftp = await self._sftp()
-            now = time()
-            await sftp.utime(self._item_path, (now, now))
+            now = int(time())
+            await ssh_setstat(
+                path=self._item_path,
+                permissions=None,
+                uid=None,
+                gid=None,
+                atime=now,
+                mtime=now,
+                **self._native_kwargs,
+            )
             return
         await self.write_bytes(b"")
 
     async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
-        sftp = await self._sftp()
         try:
-            names = await sftp.readdir(self._item_path)
-        except (FileNotFoundError, NotADirectoryError) as e:
-            raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
-        for entry in names:
-            if entry.filename in (".", ".."):
+            entries = await ssh_list(path=self._item_path, **self._native_kwargs)
+        except Exception as e:  # noqa: BLE001
+            try:
+                _map_native_error(e, str(self))
+            except FileNotFoundError as fe:
+                raise NotADirectoryError(20, f"Not a directory: '{self}'") from fe
+        for name, size, mtime, atime, uid, gid, permissions in entries:
+            if name in (".", ".."):
                 continue
-            child = self / entry.filename
-            # ``readdir`` already returned attrs for every entry; cache
-            # them so ``stat()``/``is_dir()`` don't issue another LSTAT.
-            child._cached_attrs = entry.attrs  # type: ignore[attr-defined]
-            yield child
+            # ``read_dir`` already returned attrs for every entry; cache
+            # them so ``stat()``/``is_dir()`` don't issue another stat.
+            attrs = SimpleNamespace(
+                size=size, mtime=mtime, atime=atime, uid=uid, gid=gid, permissions=permissions
+            )
+            yield self._child(str(self._path / name), _cached_attrs=attrs)
 
     async def walk(
         self,
@@ -693,57 +561,13 @@ class SSHPath(CloudPathMixin):
         on_error=None,
         follow_symlinks: bool = False,
     ) -> AsyncIterator[tuple[Self, list[str], list[str]]]:
-        """Walk directory tree.
+        """Walk the directory tree via native SFTP (recursive ``readdir``).
 
-        Tries a single remote ``find`` call first (benefits from OpenSSH
-        ControlMaster — effectively free when a master socket exists).
-        Falls back to sequential SFTP ``readdir`` when ``ssh`` is absent or
-        the remote find doesn't support GNU ``-printf``.
+        Children reuse the attrs cached by ``iterdir`` so ``is_dir()`` costs
+        no extra round trip.
         """
-        import shlex
-        from collections import defaultdict
-
-        path_q = shlex.quote(self._item_path)
-        follow_flag = "-L " if follow_symlinks else ""
-        find_cmd = f"find {follow_flag}{path_q} -mindepth 1 -printf '%y\\t%P\\n' 2>/dev/null"
-        output, rc = await self._run_remote(find_cmd, timeout=30.0)
-
-        if rc == 0 and "\t" in output:
-            # Fast path: reconstruct the tree from a flat find listing.
-            children_map: dict[str, list[tuple[str, bool]]] = defaultdict(list)
-            for line in output.splitlines():
-                if "\t" not in line:
-                    continue
-                type_char, rel_path = line.split("\t", 1)
-                if not rel_path:
-                    continue
-                parts = rel_path.split("/")
-                parent_rel = "/".join(parts[:-1])
-                name = parts[-1]
-                children_map[parent_rel].append((name, type_char == "d"))
-
-            async def _emit(rel_parent: str, base: SSHPath):  # type: ignore[name-defined]
-                entry_list = children_map.get(rel_parent, [])
-                dirs = [n for n, is_d in entry_list if is_d]
-                files = [n for n, is_d in entry_list if not is_d]
-                if top_down:
-                    yield base, dirs, files
-                for n, is_d in entry_list:
-                    if is_d:
-                        child_rel = f"{rel_parent}/{n}" if rel_parent else n
-                        async for triple in _emit(child_rel, base / n):
-                            yield triple
-                if not top_down:
-                    yield base, dirs, files
-
-            async for triple in _emit("", self):
-                yield triple
-            return
-
-        # SFTP fallback: one readdir round trip per directory.
-        sftp = await self._sftp()
         try:
-            entries = await sftp.readdir(self._item_path)
+            children = [child async for child in self.iterdir()]
         except (FileNotFoundError, NotADirectoryError) as e:
             if on_error is not None:
                 on_error(e)
@@ -751,11 +575,8 @@ class SSHPath(CloudPathMixin):
             raise
         dirs: list[Self] = []
         files: list[Self] = []
-        for entry in entries:
-            if entry.filename in (".", ".."):
-                continue
-            child = self / entry.filename
-            if stat_module.S_ISDIR(entry.attrs.permissions or 0):
+        for child in children:
+            if await child.is_dir():
                 dirs.append(child)
             else:
                 files.append(child)
