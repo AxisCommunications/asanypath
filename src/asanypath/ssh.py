@@ -4,39 +4,37 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
-"""SSH/SFTP path implementation using asyncssh.
+"""SSH/SFTP path implementation backed by a native russh client.
+
+SFTP runs off-GIL in Rust (``asanypath-native``); no Python SSH library is
+required at runtime.
 
 URL format::
 
     ssh://[user@]host[:port]/path/to/file
 
 Recommended: define hosts in ``~/.ssh/config`` and use ``ssh://alias/path``.
-Aliases are resolved eagerly via the OpenSSH client config parser; see
+Aliases are resolved eagerly via the native OpenSSH config parser; see
 :attr:`SSHPath.resolved_target`. Two aliases that resolve to the same
 ``(host, port, user)`` share one pooled connection.
 
-Password env vars are deliberately **not** supported -- use key-based auth
-(agent or ``IdentityFile`` in ``~/.ssh/config``), or pass ``password=`` as a
-kwarg for programmatic use.
-
-When stdin is a TTY and no ``password=`` was supplied, the backend prompts
-lazily via :mod:`getpass` for password / keyboard-interactive challenges
-(PAM, OTP, 2FA). Set ``ASANYPATH_INTERACTIVE=0`` to force non-interactive
-behavior in scripts.
+Authentication uses, in order: an explicit ``password=`` kwarg (also answers
+PAM/keyboard-interactive password prompts), a key file (``IdentityFile`` from
+``~/.ssh/config``, ``SSH_KEY_FILE``, or the ``client_keys`` kwarg), then the
+SSH agent. Password env vars are deliberately **not** supported.
 
 Non-secret env defaults (used only when the URL and ssh_config don't supply):
 
     SSH_USER         (default: $USER)
     SSH_KEY_FILE     single path; pass a list via kwarg for several
     SSH_KNOWN_HOSTS  "none" to disable host-key check; otherwise a file path.
-                     Default: asyncssh's default (~/.ssh/known_hosts)
+                     Default: ~/.ssh/known_hosts (strict verification).
     SSH_CONFIG       OpenSSH client config path; "" disables; otherwise
                      ~/.ssh/config and /etc/ssh/ssh_config are consulted
                      when present.
 
-Connections are pooled per resolved ``(host, port, user)`` at module level;
-one cached ``SFTPClient`` is reused for the lifetime of each connection.
-Call :func:`disconnect_all` to close everything (mainly for tests/shutdown).
+Connections are pooled per resolved ``(host, port, user)`` in the native
+layer. Call :func:`disconnect_all` to close everything (tests/shutdown).
 """
 
 from __future__ import annotations
@@ -139,7 +137,7 @@ def _resolve_alias(
 
 
 class SSHPath(CloudPathMixin):
-    """Async SFTP path backed by :mod:`asyncssh`."""
+    """Async SFTP path backed by a native russh client."""
 
     protocol: str = "ssh"
     _supports_range_read: bool = True
@@ -216,11 +214,11 @@ class SSHPath(CloudPathMixin):
         key_file = getenv("SSH_KEY_FILE")
         known = getenv("SSH_KNOWN_HOSTS")
         if known and known.lower() == "none":
-            known_hosts: object = ()  # asyncssh: empty tuple disables checking
+            known_hosts: object = ()  # disables host-key checking
         elif known:
             known_hosts = known
         else:
-            known_hosts = None  # asyncssh default (~/.ssh/known_hosts)
+            known_hosts = None  # default: ~/.ssh/known_hosts (strict)
         port = getenv("SSH_PORT")
         config_paths = _discover_ssh_config()
         return SimpleNamespace(
@@ -273,9 +271,8 @@ class SSHPath(CloudPathMixin):
             "key_path": key_path,
             "key_passphrase": None,
             "use_agent": use_agent,
-            # asyncssh disables host-key checking for ``None``; SSHPath also
-            # maps SSH_KNOWN_HOSTS=none -> (). Mirror both so native parity
-            # holds; any other value keeps strict verification.
+            # Host-key checking is disabled for ``None`` (and SSH_KNOWN_HOSTS=
+            # none -> ()); any other value keeps strict verification.
             "strict_host_key": self._known_hosts not in (None, ()),
         }
 
