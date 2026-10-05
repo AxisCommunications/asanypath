@@ -127,8 +127,8 @@ uv sync
 # With CLI
 uv sync --extra cli
 
-# With SSH, FTP backend support
-uv sync --extra ssh --extra ftp
+# With FTP backend support (SSH/SFTP is built in — no extra needed)
+uv sync --extra ftp
 
 # With OS keyring-backed credential cache
 uv sync --extra credstore
@@ -288,64 +288,64 @@ uv run --extra bench python scripts/bench.py --backend art --rounds 3 --concurre
 
 | Operation | asanypath | s3fs | aiobotocore | cloudpathlib |
 |-----------|-----------|------|-------------|--------------|
-| write | **8.47 ms** | 9.52 ms | 43.39 ms | 48.02 ms |
-| read | **4.03 ms** | 9.43 ms | 20.16 ms | 13.30 ms |
-| exists | **3.58 ms** | 4.54 ms | 20.49 ms | 4.48 ms |
-| iterdir | **38.91 ms** | 39.33 ms | 57.76 ms | 41.95 ms |
+| write | **8.80 ms** | 12.67 ms | 28.07 ms | 41.75 ms |
+| read | **3.78 ms** | 9.10 ms | 23.15 ms | 12.83 ms |
+| exists | **3.57 ms** | 4.25 ms | 21.92 ms | 4.02 ms |
+| iterdir | 40.55 ms | 39.16 ms | 56.49 ms | **39.07 ms** |
 
 ### Azure — Azurite emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | azure-sdk | adlfs | cloudpathlib |
 |-----------|-----------|-----------|-------|--------------|
-| write | **1.77 ms** | 1.86 ms | 1.93 ms | 8.29 ms |
-| read | **0.68 ms** | 1.15 ms | 2.50 ms | 3.46 ms |
-| exists | **0.56 ms** | 0.83 ms | 1.04 ms | 1.02 ms |
-| iterdir | **1.34 ms** | 2.21 ms | 4.37 ms | 2.59 ms |
+| write | **1.24 ms** | 1.79 ms | 2.34 ms | 7.88 ms |
+| read | **0.51 ms** | 1.15 ms | 2.44 ms | 3.19 ms |
+| exists | **0.35 ms** | 0.95 ms | 0.98 ms | 1.04 ms |
+| iterdir | **0.88 ms** | 2.40 ms | 4.11 ms | 2.72 ms |
 
 ### GCS — fake-gcs-server emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | gcloud-aio | cloudpathlib | gcsfs |
 |-----------|-----------|------------|--------------|-------|
-| write | **0.22 ms** | 0.24 ms | 2.88 ms | 0.33 ms |
-| read | **0.12 ms** | 0.14 ms | 1.34 ms | 0.19 ms |
-| exists | **0.12 ms** | 0.14 ms | 0.44 ms | 0.41 ms |
-| iterdir | 0.20 ms | **0.16 ms** | 0.55 ms | 0.24 ms |
+| write | **0.45 ms** | 0.51 ms | 3.53 ms | 0.58 ms |
+| read | 0.22 ms | **0.18 ms** | 1.48 ms | 0.30 ms |
+| exists | **0.15 ms** | 0.18 ms | 0.50 ms | 0.46 ms |
+| iterdir | **0.19 ms** | 0.25 ms | 0.69 ms | 0.33 ms |
 
 ### Artifactory — live server (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | aiohttp | requests |
 |-----------|-----------|---------|----------|
-| write | 39.77 ms | 38.00 ms | **36.67 ms** |
-| read | **4.29 ms** | 4.75 ms | 5.43 ms |
-| exists | **2.97 ms** | 3.02 ms | 4.52 ms |
-| iterdir | 4.59 ms | **4.18 ms** | 6.26 ms |
+| write | **54.49 ms** | 54.75 ms | 57.57 ms |
+| read | **2.83 ms** | 3.09 ms | 12.01 ms |
+| exists | 2.33 ms | **2.18 ms** | 4.61 ms |
+| iterdir | **2.85 ms** | 3.07 ms | 7.88 ms |
 
 ### SSH / SFTP — localhost emulator (median of 20 rounds, 10 objects, c=1)
 
-Using the opt-in native russh backend (`ASANYPATH_SSH_NATIVE=1`); the default
-asyncssh transport ties asyncssh.
+asanypath uses a built-in native russh SFTP transport (off-GIL); `asyncssh` is
+shown only as a benchmark baseline.
 
 | Operation | asanypath | asyncssh |
 |-----------|-----------|----------|
-| write | **0.18 ms** | 0.32 ms |
-| read | **0.20 ms** | 0.47 ms |
-| exists | **0.06 ms** | 0.10 ms |
-| iterdir | **0.23 ms** | 0.47 ms |
+| write | **0.16 ms** | 0.33 ms |
+| read | **0.21 ms** | 0.36 ms |
+| exists | **0.07 ms** | 0.11 ms |
+| iterdir | **0.23 ms** | 0.44 ms |
 
 ### FTP — localhost emulator (median of 20 rounds, 10 objects, c=1)
 
 | Operation | asanypath | aioftp |
 |-----------|-----------|--------|
-| write | 0.40 ms | **0.34 ms** |
-| read | 0.36 ms | **0.32 ms** |
-| exists | 1.12 ms | **0.92 ms** |
-| iterdir | 1.10 ms | **0.92 ms** |
+| write | **0.35 ms** | 0.41 ms |
+| read | **0.35 ms** | 0.40 ms |
+| exists | **1.00 ms** | 1.13 ms |
+| iterdir | 1.09 ms | **1.04 ms** |
 
 Latencies are per-operation medians over 20 rounds. S3 and Artifactory ran
 against live services; Azure, GCS, SSH/SFTP, and FTP against local emulators
 (Azurite, fake-gcs-server, and localhost sftp/ftp), so those figures reflect
-client-library overhead, not WAN latency. The SSH/SFTP figures use the opt-in
-native russh backend, which runs SFTP off-GIL and beats asyncssh on every
+client-library overhead, not WAN latency. The SSH/SFTP transport is a built-in
+native russh backend that runs SFTP off-GIL and beats asyncssh on every
 operation. asanypath matches or beats dedicated client libraries on most
 operations while providing a single unified API across all backends.
 
@@ -361,18 +361,17 @@ operations while providing a single unified API across all backends.
 | `az://`, `azure://` | `AzurePath` | reqwest + SharedKey |
 | `art://` | `ArtifactoryPath` | reqwest + Bearer |
 | `http://`, `https://` | `HTTPPath` / `HTTPSPath` | reqwest |
-| `ssh://` | `SSHPath` | `asyncssh` (SFTP), or native russh (opt-in) |
+| `ssh://` | `SSHPath` | native russh (SFTP) |
 | `ftp://` | `FTPPath` | `aioftp` |
 | `ftps://` | `FTPSPath` | `aioftp` + TLS |
 | any other scheme | `UnsupportedProtocolPath` | none — pure-path only |
 
 Cloud and HTTP network I/O is handled by `asanypath-native` (Rust/PyO3 + reqwest)
-with jittered exponential backoff retry for transient errors; SSH/SFTP and
-FTP/FTPS use `asyncssh` and `aioftp` respectively. Setting `ASANYPATH_SSH_NATIVE=1`
-switches `SSHPath` to an off-GIL native russh SFTP transport (faster; the default
-asyncssh path is kept for full ssh_config alias resolution). Unknown schemes
-construct an `UnsupportedProtocolPath`: pure-path operations (`.name`, `.parent`,
-joins) work, while any backend operation raises `UnsupportedProtocolError`.
+with jittered exponential backoff retry for transient errors. SSH/SFTP uses a
+built-in off-GIL native russh transport (no Python SSH dependency); FTP/FTPS use
+`aioftp`. Unknown schemes construct an `UnsupportedProtocolPath`: pure-path
+operations (`.name`, `.parent`, joins) work, while any backend operation raises
+`UnsupportedProtocolError`.
 
 ## API Reference
 
