@@ -17,6 +17,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use russh::client::{self, Handle};
+#[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, check_known_hosts, load_secret_key};
 use russh_sftp::client::SftpSession;
@@ -134,30 +135,39 @@ async fn authenticate(
     auth: &AuthSpec,
 ) -> Result<(), String> {
     if auth.use_agent {
-        let sock = std::env::var("SSH_AUTH_SOCK")
-            .map_err(|_| "SSH_AUTH_SOCK not set for agent auth".to_string())?;
-        let stream = tokio::net::UnixStream::connect(&sock)
-            .await
-            .map_err(|e| format!("agent connect: {e}"))?;
-        let mut agent = AgentClient::connect(stream);
-        let identities = agent
-            .request_identities()
-            .await
-            .map_err(|e| format!("agent identities: {e}"))?;
-        for identity in identities {
-            let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = identity else {
-                continue;
-            };
-            let authed = handle
-                .authenticate_publickey_with(user, key, None, &mut agent)
+        #[cfg(unix)]
+        {
+            let sock = std::env::var("SSH_AUTH_SOCK")
+                .map_err(|_| "SSH_AUTH_SOCK not set for agent auth".to_string())?;
+            let stream = tokio::net::UnixStream::connect(&sock)
                 .await
-                .map_err(|e| format!("agent auth: {e}"))?
-                .success();
-            if authed {
-                return Ok(());
+                .map_err(|e| format!("agent connect: {e}"))?;
+            let mut agent = AgentClient::connect(stream);
+            let identities = agent
+                .request_identities()
+                .await
+                .map_err(|e| format!("agent identities: {e}"))?;
+            for identity in identities {
+                let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = identity else {
+                    continue;
+                };
+                let authed = handle
+                    .authenticate_publickey_with(user, key, None, &mut agent)
+                    .await
+                    .map_err(|e| format!("agent auth: {e}"))?
+                    .success();
+                if authed {
+                    return Ok(());
+                }
             }
+            return Err("agent auth: no identity accepted".to_string());
         }
-        return Err("agent auth: no identity accepted".to_string());
+        #[cfg(not(unix))]
+        {
+            return Err(
+                "SSH agent auth (SSH_AUTH_SOCK) is not supported on this platform".to_string(),
+            );
+        }
     }
 
     if let Some(path) = &auth.key_path {
