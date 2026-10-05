@@ -322,12 +322,15 @@ uv run --extra bench python scripts/bench.py --backend art --rounds 3 --concurre
 
 ### SSH / SFTP — localhost emulator (median of 20 rounds, 10 objects, c=1)
 
+Using the opt-in native russh backend (`ASANYPATH_SSH_NATIVE=1`); the default
+asyncssh transport ties asyncssh.
+
 | Operation | asanypath | asyncssh |
 |-----------|-----------|----------|
-| write | 0.32 ms | **0.27 ms** |
-| read | 0.34 ms | **0.33 ms** |
-| exists | **0.11 ms** | **0.11 ms** |
-| iterdir | 0.52 ms | **0.40 ms** |
+| write | **0.18 ms** | 0.32 ms |
+| read | **0.20 ms** | 0.47 ms |
+| exists | **0.06 ms** | 0.10 ms |
+| iterdir | **0.23 ms** | 0.47 ms |
 
 ### FTP — localhost emulator (median of 20 rounds, 10 objects, c=1)
 
@@ -341,10 +344,10 @@ uv run --extra bench python scripts/bench.py --backend art --rounds 3 --concurre
 Latencies are per-operation medians over 20 rounds. S3 and Artifactory ran
 against live services; Azure, GCS, SSH/SFTP, and FTP against local emulators
 (Azurite, fake-gcs-server, and localhost sftp/ftp), so those figures reflect
-client-library overhead, not WAN latency. (A direct live-remote SSH run confirms
-the tie — asanypath vs asyncssh within noise.) asanypath matches or beats
-dedicated client libraries on most operations while providing a single unified
-API across all backends.
+client-library overhead, not WAN latency. The SSH/SFTP figures use the opt-in
+native russh backend, which runs SFTP off-GIL and beats asyncssh on every
+operation. asanypath matches or beats dedicated client libraries on most
+operations while providing a single unified API across all backends.
 
 ## How It Works
 
@@ -358,16 +361,18 @@ API across all backends.
 | `az://`, `azure://` | `AzurePath` | reqwest + SharedKey |
 | `art://` | `ArtifactoryPath` | reqwest + Bearer |
 | `http://`, `https://` | `HTTPPath` / `HTTPSPath` | reqwest |
-| `ssh://` | `SSHPath` | `asyncssh` (SFTP) |
+| `ssh://` | `SSHPath` | `asyncssh` (SFTP), or native russh (opt-in) |
 | `ftp://` | `FTPPath` | `aioftp` |
 | `ftps://` | `FTPSPath` | `aioftp` + TLS |
 | any other scheme | `UnsupportedProtocolPath` | none — pure-path only |
 
 Cloud and HTTP network I/O is handled by `asanypath-native` (Rust/PyO3 + reqwest)
 with jittered exponential backoff retry for transient errors; SSH/SFTP and
-FTP/FTPS use `asyncssh` and `aioftp` respectively. Unknown schemes construct an
-`UnsupportedProtocolPath`: pure-path operations (`.name`, `.parent`, joins) work,
-while any backend operation raises `UnsupportedProtocolError`.
+FTP/FTPS use `asyncssh` and `aioftp` respectively. Setting `ASANYPATH_SSH_NATIVE=1`
+switches `SSHPath` to an off-GIL native russh SFTP transport (faster; the default
+asyncssh path is kept for full ssh_config alias resolution). Unknown schemes
+construct an `UnsupportedProtocolPath`: pure-path operations (`.name`, `.parent`,
+joins) work, while any backend operation raises `UnsupportedProtocolError`.
 
 ## API Reference
 

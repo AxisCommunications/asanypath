@@ -57,9 +57,9 @@ dev = [
 ]
 cli = ["rich-click>=1.9.7"]
 ftp = ["aioftp>=0.21"]
-ssh = ["asyncssh>=2.14"]
 credstore = ["keyring>=24"]
 bench = [
+    "asyncssh>=2.14",
     "fsspec",
     "s3fs",
     "adlfs",
@@ -71,7 +71,7 @@ bench = [
     "aiofiles",
     "requests",
 ]
-all = ["asanypath[ssh,credstore,ftp]"]
+all = ["asanypath[credstore,ftp]"]
 [project.scripts]
 asanypath = "asanypath.cli:main"
 

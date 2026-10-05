@@ -16,11 +16,27 @@ use bytes::Bytes;
 use pyo3::PyErr;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::PyBytes;
+use pyo3::{Bound, IntoPyObject, Python};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::http::status_to_pyerr;
+
+/// Bytes payload bridged to Python with a single copy: wraps reqwest `Bytes`
+/// and materializes `bytes` directly (no intermediate `Vec<u8>` copy).
+pub struct PyBytesBuf(pub Bytes);
+
+impl<'py> IntoPyObject<'py> for PyBytesBuf {
+    type Target = PyBytes;
+    type Output = Bound<'py, PyBytes>;
+    type Error = std::convert::Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(PyBytes::new(py, &self.0))
+    }
+}
 
 /// Per-upload options received from Python as JSON.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -134,7 +150,7 @@ pub trait CloudBackend {
         &self,
         path: &str,
         use_h2: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, PyErr>> {
+    ) -> impl std::future::Future<Output = Result<PyBytesBuf, PyErr>> {
         async move {
             let (status, body) = self
                 .do_request("GET", path, None, use_h2, &[])
@@ -143,7 +159,7 @@ pub trait CloudBackend {
             if !status.is_success() {
                 return Err(status_to_pyerr(status, &self.error_path(path), &body));
             }
-            Ok(body.to_vec())
+            Ok(PyBytesBuf(body))
         }
     }
 
@@ -154,7 +170,7 @@ pub trait CloudBackend {
         start: u64,
         end: u64,
         use_h2: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, PyErr>> {
+    ) -> impl std::future::Future<Output = Result<PyBytesBuf, PyErr>> {
         async move {
             let range_header = ("range".to_string(), format!("bytes={}-{}", start, end));
             let (status, body) = self
@@ -164,12 +180,12 @@ pub trait CloudBackend {
             // A range entirely past end-of-object yields 416; treat as empty (EOF)
             // so sequential readers can stop without knowing the size in advance.
             if status.as_u16() == 416 {
-                return Ok(Vec::new());
+                return Ok(PyBytesBuf(Bytes::new()));
             }
             if !status.is_success() {
                 return Err(status_to_pyerr(status, &self.error_path(path), &body));
             }
-            Ok(body.to_vec())
+            Ok(PyBytesBuf(body))
         }
     }
 

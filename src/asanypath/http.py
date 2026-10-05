@@ -334,11 +334,8 @@ class HTTPPath(CloudPathMixin):
             headers=self._merge_headers(None),
         )
         for link in urls:
-            yield type(self)(
-                link,
-                listing=self._listing,
-                listing_attr=self._listing_attr,
-            )
+            # children keep the parent's listing config; _spawn copies it.
+            yield self._child(link.rstrip("/") or link, _trailing_slash=link.endswith("/"))
 
     async def walk(
         self,

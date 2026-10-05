@@ -485,7 +485,7 @@ class FTPPath(CloudPathMixin):
         except aioftp.StatusCodeError as e:
             raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
         for entry_path, _info in entries:
-            yield self / entry_path.name
+            yield self._child(str(self._path / entry_path.name))
 
     async def walk(
         self,
