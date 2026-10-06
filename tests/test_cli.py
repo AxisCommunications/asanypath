@@ -391,7 +391,7 @@ def _make_nested_tree():
 @pytest.mark.parametrize(
     "setup,args,expected_exit,expected_in,not_in,call_with",
     [
-        pytest.param(_ls_empty, ["ls", "s3://bucket/"], 0, ["empty"], [], None, id="empty"),
+        pytest.param(_ls_empty, ["ls", "s3://bucket/"], 1, [], ["empty"], None, id="empty"),
         pytest.param(
             _ls_items, ["ls", "s3://bucket/"], 0, ["file1.txt", "file2.txt"], [], None, id="items"
         ),
@@ -410,7 +410,7 @@ def _make_nested_tree():
         pytest.param(
             _ls_nested, ["ls", "-r", "s3://bucket/"], 0, ["deep.txt"], [], None, id="unbounded"
         ),
-        pytest.param(_ls_empty, ["ls"], 0, [], [], ".", id="no_arg_default"),
+        pytest.param(_ls_empty, ["ls"], 1, [], [], ".", id="no_arg_default"),
         pytest.param(
             _ls_items,
             ["ls", "-1", "s3://bucket/"],

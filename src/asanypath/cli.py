@@ -1383,8 +1383,8 @@ def ls(
             found_any = bool(rows)
 
             if not found_any:
-                console.print("[dim](empty)[/dim]")
-                return 0
+                # No results is a non-match: exit non-zero like grep/aws s3 ls.
+                return 1
 
             if simple:
                 for row in rows:
