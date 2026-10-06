@@ -88,6 +88,9 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+# asanypath_native.pyi lives in rust/ (its canonical home, shipped in the native
+# wheel by maturin); keep it resolvable for dev type-checking.
+mypy_path = ["src", "rust"]
 
 [[tool.mypy.overrides]]
 module = "asanypath.cli"
