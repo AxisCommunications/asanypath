@@ -872,8 +872,10 @@ class CloudPathMixin(CommonPurePathMixin):
             is_dir_results = await asyncio.gather(*(e.is_dir() for e in entries))
         else:
             is_dir_results = []
-        dirs = [e for e, d in zip(entries, is_dir_results) if d]
-        files = [e for e, d in zip(entries, is_dir_results) if not d]
+        dirs: list[Self] = []
+        files: list[Self] = []
+        for entry, is_directory in zip(entries, is_dir_results):
+            (dirs if is_directory else files).append(entry)
         if top_down:
             yield self, [d.name for d in dirs], [f.name for f in files]
         for d in dirs:
