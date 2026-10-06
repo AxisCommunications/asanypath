@@ -630,6 +630,20 @@ class TestCloudFileOpen:
         written = mock_write.call_args[0][0]
         assert b"text data" in written
 
+    async def test_open_write_spills_to_disk(self, cloud_path):
+        # Writes past the spool threshold roll onto disk (bounded memory) yet
+        # still upload the full payload intact on close.
+        from asanypath.cloud import _CloudFile
+
+        payload = b"x" * (_CloudFile._SPOOL_MAX_SIZE + 4096)
+        mock_write = AsyncMock()
+        with patch.object(type(cloud_path), "write_bytes", new=mock_write):
+            async with cloud_path.open("wb") as f:
+                f.write(payload)
+                assert f._rolled  # SpooledTemporaryFile spilled to a real file
+        mock_write.assert_awaited_once_with(payload)
+        assert f.closed  # temp file released on exit
+
     async def test_iter_bytes_uses_range_reads(self, cloud_path):
         with (
             patch.object(type(cloud_path), "_supports_range_read", True),

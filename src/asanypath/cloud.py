@@ -10,12 +10,13 @@ import asyncio
 import fnmatch
 import inspect
 import io
+import tempfile
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from os import PathLike
 from os.path import expanduser
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal
 
 import msgspec
 
@@ -938,6 +939,24 @@ class _CloudRawIO(io.RawIOBase):
         return self._pos
 
 
+class _SpooledWriteBuffer(tempfile.SpooledTemporaryFile):
+    """Spooled write buffer exposing the IOBase probes ``TextIOWrapper`` needs.
+
+    Python 3.10's ``SpooledTemporaryFile`` omits ``readable``/``writable``/
+    ``seekable`` (added in 3.11); the buffer is always opened ``w+b`` so all
+    three are unconditionally true.
+    """
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+
 class _CloudFile:
     """File handle backed by cloud read/write with lazy range-read support.
 
@@ -954,6 +973,9 @@ class _CloudFile:
     """
 
     _DEFAULT_CHUNK = 8 * 1024 * 1024  # 8 MiB — good default for cloud latency
+    # Write buffer spills to disk past this size so many concurrently-open write
+    # handles (e.g. sharded writers) can't accumulate whole objects in memory.
+    _SPOOL_MAX_SIZE = 16 * 1024 * 1024  # 16 MiB resident per open write handle
 
     def __init__(self, path, mode, buffering, encoding, errors, newline, backend_options=None):
         self._path = path
@@ -963,7 +985,7 @@ class _CloudFile:
         self._errors = errors
         self._newline = newline
         self._backend_options = backend_options
-        self._buf: io.BytesIO | None = None
+        self._buf: IO[bytes] | None = None
         self._text_wrapper: io.TextIOWrapper | None = None
         self._reader: io.BufferedReader | None = None
         self._closed = False
@@ -977,11 +999,11 @@ class _CloudFile:
         return self._buffering
 
     def _make_buffer(self, data: bytes | None = None) -> io.IOBase:
-        """Create an in-memory buffer (for small files or write mode)."""
+        """Create the backing buffer: in-memory for reads, disk-spilling for writes."""
         if "r" in self._mode:
             self._buf = io.BytesIO(data or b"")
         else:
-            self._buf = io.BytesIO()
+            self._buf = _SpooledWriteBuffer(max_size=self._SPOOL_MAX_SIZE, mode="w+b")
         if "b" not in self._mode:
             self._text_wrapper = io.TextIOWrapper(
                 self._buf,
@@ -990,7 +1012,7 @@ class _CloudFile:
                 newline=self._newline,
             )
             return self._text_wrapper
-        return self._buf
+        return self._buf  # type: ignore[return-value]
 
     def _make_reader(self, size: int) -> io.IOBase:
         """Create a lazily-filled reader backed by range reads."""
@@ -1015,7 +1037,12 @@ class _CloudFile:
         """Extract buffered write data."""
         if self._text_wrapper is not None:
             self._text_wrapper.flush()
-        return self._buf.getvalue()
+        buf = self._buf
+        assert buf is not None
+        if isinstance(buf, io.BytesIO):
+            return buf.getvalue()
+        buf.seek(0)
+        return buf.read()
 
     def _get_size(self, headers: dict) -> int | None:
         """Extract content-length from HEAD response headers."""
@@ -1066,6 +1093,8 @@ class _CloudFile:
                 )
         if self._reader is not None:
             self._reader.close()
+        if self._buf is not None:
+            self._buf.close()
         self._closed = True
         return False  # pragma: no cover
 
@@ -1101,5 +1130,7 @@ class _CloudFile:
                 await self._path.write_bytes(data, backend_options=self._backend_options)
         if self._reader is not None:
             self._reader.close()
+        if self._buf is not None:
+            self._buf.close()
         self._closed = True
         return False  # pragma: no cover
