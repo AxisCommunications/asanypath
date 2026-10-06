@@ -334,8 +334,11 @@ class HTTPPath(CloudPathMixin):
             headers=self._merge_headers(None),
         )
         for link in urls:
-            # children keep the parent's listing config; _spawn copies it.
-            yield self._child(link.rstrip("/") or link, _trailing_slash=link.endswith("/"))
+            yield type(self)(
+                link,
+                listing=self._listing,
+                listing_attr=self._listing_attr,
+            )
 
     async def walk(
         self,
@@ -439,7 +442,7 @@ class HTTPPath(CloudPathMixin):
         async for entry in self.glob(pattern, case_sensitive=case_sensitive):
             yield entry
 
-    async def rmdir(self) -> None:
+    async def rmdir(self, *, recursive: bool = False) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support rmdir")
 
     async def stat(self, *, follow_symlinks: bool = True):
