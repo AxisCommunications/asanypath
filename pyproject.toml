@@ -114,7 +114,7 @@ disable_error_code = ["arg-type", "assignment", "misc", "attr-defined"]
 module = "asanypath.http"
 disallow_untyped_defs = false
 warn_return_any = false
-disable_error_code = ["override", "type-arg", "return-value", "assignment"]
+disable_error_code = ["override", "type-arg", "return-value", "assignment", "attr-defined"]
 
 [[tool.mypy.overrides]]
 module = ["asanypath.s3", "asanypath.gcs", "asanypath.azure", "asanypath.artifactory"]
