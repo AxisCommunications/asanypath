@@ -45,7 +45,7 @@ from os import getenv
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NoReturn, overload
 
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
@@ -77,18 +77,38 @@ def disconnect_all() -> None:
 _UNSET = object()
 
 
-def _map_native_error(exc: Exception, path: str) -> NoReturn:
-    """Translate a native russh/SFTP error into the stdlib OSError family."""
+@overload
+def _map_native_error(exc: Exception, path: str) -> NoReturn: ...
+@overload
+def _map_native_error(
+    exc: Exception, path: str, *, ignore: type[BaseException] | tuple[type[BaseException], ...]
+) -> None: ...
+def _map_native_error(
+    exc: Exception,
+    path: str,
+    *,
+    ignore: type[BaseException] | tuple[type[BaseException], ...] = (),
+) -> None:
+    """Translate a native russh/SFTP error into the stdlib OSError family.
+
+    Errors whose mapped type matches *ignore* are swallowed (return) instead of
+    raised, so callers can express ``missing_ok``/``exist_ok`` without re-catching.
+    """
     msg = str(exc).lower()
+    mapped: Exception
     if "no such file" in msg or "not found" in msg or "does not exist" in msg:
-        raise FileNotFoundError(2, "No such file or directory", path) from exc
-    if "permission denied" in msg:
-        raise PermissionError(13, "Permission denied", path) from exc
-    if "not a directory" in msg:
-        raise NotADirectoryError(20, "Not a directory", path) from exc
-    if "already exists" in msg or "file exists" in msg:
-        raise FileExistsError(17, "File exists", path) from exc
-    raise exc
+        mapped = FileNotFoundError(2, "No such file or directory", path)
+    elif "permission denied" in msg:
+        mapped = PermissionError(13, "Permission denied", path)
+    elif "not a directory" in msg:
+        mapped = NotADirectoryError(20, "Not a directory", path)
+    elif "already exists" in msg or "file exists" in msg:
+        mapped = FileExistsError(17, "File exists", path)
+    else:
+        raise exc
+    if ignore and isinstance(mapped, ignore):
+        return
+    raise mapped from exc
 
 
 def _discover_ssh_config() -> list[str]:
@@ -447,11 +467,7 @@ class SSHPath(CloudPathMixin):
         try:
             await ssh_unlink(path=self._item_path, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
-            try:
-                _map_native_error(e, str(self))
-            except FileNotFoundError:
-                if not missing_ok:
-                    raise
+            _map_native_error(e, str(self), ignore=FileNotFoundError if missing_ok else ())
 
     async def mkdir(self, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
         if not (parents or exist_ok) and await self.exists():
@@ -459,11 +475,7 @@ class SSHPath(CloudPathMixin):
         try:
             await ssh_mkdir(path=self._item_path, parents=parents, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
-            try:
-                _map_native_error(e, str(self))
-            except FileExistsError:
-                if not exist_ok:
-                    raise
+            _map_native_error(e, str(self), ignore=FileExistsError if exist_ok else ())
 
     async def rmdir(self, *, recursive: bool = False) -> None:
         if recursive:
@@ -473,6 +485,11 @@ class SSHPath(CloudPathMixin):
                     await child.rmdir(recursive=True)
                 else:
                     await child.unlink()
+        else:
+            # ssh_list yields nothing for an empty dir; a clean ENOTEMPTY beats
+            # the raw server error that _map_native_error can't classify.
+            async for _ in self.iterdir():
+                raise OSError(39, f"Directory not empty: '{self}'")
         try:
             await ssh_rmdir(path=self._item_path, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
@@ -538,10 +555,10 @@ class SSHPath(CloudPathMixin):
         try:
             entries = await ssh_list(path=self._item_path, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
-            try:
-                _map_native_error(e, str(self))
-            except FileNotFoundError as fe:
-                raise NotADirectoryError(20, f"Not a directory: '{self}'") from fe
+            # A missing path / non-dir surfaces as "not a directory" for iterdir;
+            # other failures keep their mapped type.
+            _map_native_error(e, str(self), ignore=FileNotFoundError)
+            raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
         for name, size, mtime, atime, uid, gid, permissions in entries:
             if name in (".", ".."):
                 continue
