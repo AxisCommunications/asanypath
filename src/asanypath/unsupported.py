@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from os import PathLike
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import urlsplit
 
 from anyio import Path as AioPath
@@ -32,14 +34,10 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
     ) -> None:
         raw = str(part)
         parsed = urlsplit(raw)
-        self._protocol = (parsed.scheme or "unsupported").lower()
+        self.protocol = (parsed.scheme or "unsupported").lower()
         super().__init__(part, *parts)
 
-    @property
-    def protocol(self) -> str:
-        return self._protocol
-
-    def _raise_unsupported(self, operation: str) -> None:
+    def _raise_unsupported(self, operation: str) -> NoReturn:
         raise UnsupportedProtocolError(
             f"Unsupported protocol: {self.protocol} (operation: {operation}, path: {self})"
         )
@@ -54,26 +52,26 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
         self._raise_unsupported("chmod")
 
     @classmethod
-    def cwd(cls):
+    def cwd(cls) -> NoReturn:
         raise UnsupportedProtocolError("Unsupported protocol operation: cwd")
 
     def exists(self) -> bool:
         self._raise_unsupported("exists")
 
-    def expanduser(self):
+    def expanduser(self) -> NoReturn:
         self._raise_unsupported("expanduser")
 
-    def glob(self, pattern: str, *, case_sensitive: bool | None = None):
+    def glob(self, pattern: str, *, case_sensitive: bool | None = None) -> NoReturn:
         self._raise_unsupported("glob")
 
     def group(self) -> str:
         self._raise_unsupported("group")
 
-    def hardlink_to(self, target: str | bytes | PathLike[str | bytes]) -> None:
+    def hardlink_to(self, target: str | bytes | PathLike[str] | PathLike[bytes]) -> None:
         self._raise_unsupported("hardlink_to")
 
     @classmethod
-    def home(cls):
+    def home(cls) -> NoReturn:
         raise UnsupportedProtocolError("Unsupported protocol operation: home")
 
     def is_block_device(self) -> bool:
@@ -103,16 +101,16 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
     def is_symlink(self) -> bool:
         self._raise_unsupported("is_symlink")
 
-    def iter_bytes(self, chunk_size: int | None = None):
+    def iter_bytes(self, chunk_size: int | None = None) -> NoReturn:
         self._raise_unsupported("iter_bytes")
 
-    def iterdir(self):
+    def iterdir(self) -> NoReturn:
         self._raise_unsupported("iterdir")
 
     def lchmod(self, mode: int) -> None:
         self._raise_unsupported("lchmod")
 
-    def lstat(self):
+    def lstat(self) -> NoReturn:
         self._raise_unsupported("lstat")
 
     def mkdir(self, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
@@ -125,7 +123,7 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
-    ):
+    ) -> NoReturn:
         self._raise_unsupported("open")
 
     def owner(self) -> str:
@@ -141,19 +139,19 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
     ) -> str:
         self._raise_unsupported("read_text")
 
-    def readlink(self):
+    def readlink(self) -> NoReturn:
         self._raise_unsupported("readlink")
 
-    def rename(self, target: str | Path | CommonPurePathMixin):
+    def rename(self, target: str | Path | CommonPurePathMixin) -> NoReturn:
         self._raise_unsupported("rename")
 
-    def replace(self, target: str | Path | CommonPurePathMixin):
+    def replace(self, target: str | Path | CommonPurePathMixin) -> NoReturn:
         self._raise_unsupported("replace")
 
-    def resolve(self, strict: bool = False):
+    def resolve(self, strict: bool = False) -> NoReturn:
         self._raise_unsupported("resolve")
 
-    def rglob(self, pattern: str, *, case_sensitive: bool | None = None):
+    def rglob(self, pattern: str, *, case_sensitive: bool | None = None) -> NoReturn:
         self._raise_unsupported("rglob")
 
     def rmdir(self) -> None:
@@ -162,12 +160,12 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
     def samefile(self, other_path: str | PathLike[str]) -> bool:
         self._raise_unsupported("samefile")
 
-    def stat(self, *, follow_symlinks: bool = True):
+    def stat(self, *, follow_symlinks: bool = True) -> NoReturn:
         self._raise_unsupported("stat")
 
     def symlink_to(
         self,
-        target: str | bytes | PathLike[str | bytes] | CommonPurePathMixin,
+        target: str | bytes | PathLike[str] | PathLike[bytes] | CommonPurePathMixin,
         target_is_directory: bool = False,
     ) -> None:
         self._raise_unsupported("symlink_to")
@@ -181,9 +179,9 @@ class UnsupportedProtocolPath(CommonPurePathMixin):
     def walk(
         self,
         top_down: bool = True,
-        on_error=None,
+        on_error: Callable[[OSError], object] | None = None,
         follow_symlinks: bool = False,
-    ):
+    ) -> NoReturn:
         self._raise_unsupported("walk")
 
     def write_bytes(self, data: bytes) -> int:
