@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import inspect
 import io
@@ -611,16 +612,31 @@ class CloudPathMixin(CommonPurePathMixin):
         With ``recursive=True``, deletes all objects under this prefix.
         Without it, only succeeds if the prefix is empty (no children).
         """
-        self_iter = self.iterdir(fresh=True)
         if not recursive:
-            async for _ in self_iter:
+            async for _ in self.iterdir(fresh=True):
                 raise OSError(39, f"Directory not empty: '{self}'")
             return
-        async for child in self_iter:
+        await self._rmtree()
+
+    async def _rmtree(self) -> None:
+        """Recursively delete this prefix's contents with concurrency.
+
+        Children are deleted concurrently so the :class:`MicroBatcher` can
+        coalesce the in-flight object deletes into batch API calls; no
+        Python-side semaphore is used because a small bound would only cap
+        the batch size and defeat that coalescing.
+        """
+
+        async def _remove(child: Self) -> None:
             if await child.is_dir():
-                await child.rmdir(recursive=True)
+                await child._rmtree()
             else:
                 await child.unlink()
+
+        children = [_remove(child) async for child in self.iterdir(fresh=True)]
+        for result in await asyncio.gather(*children, return_exceptions=True):
+            if isinstance(result, BaseException):
+                raise result
         type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def copy(
@@ -853,8 +869,6 @@ class CloudPathMixin(CommonPurePathMixin):
                 **(await self._get_native_kwargs()),
             )
         elif entries:
-            import asyncio
-
             is_dir_results = await asyncio.gather(*(e.is_dir() for e in entries))
         else:
             is_dir_results = []

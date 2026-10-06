@@ -494,7 +494,7 @@ class SSHPath(CloudPathMixin):
                 raise OSError(39, f"Directory not empty: '{self}'")
             await self._native_rmdir()
             return
-        await self._rmtree(asyncio.Semaphore(_RMDIR_CONCURRENCY))
+        await self._rmtree()
 
     async def _native_rmdir(self) -> None:
         try:
@@ -502,27 +502,28 @@ class SSHPath(CloudPathMixin):
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
 
-    async def _rmtree(self, sem: asyncio.Semaphore) -> None:
+    async def _rmtree(self) -> None:
+        await self._rmtree_bounded(asyncio.Semaphore(_RMDIR_CONCURRENCY))
+
+    async def _rmtree_bounded(self, sem: asyncio.Semaphore) -> None:
         """Delete this directory and its contents with bounded concurrency.
 
         SFTP has no recursive remove; children are removed concurrently (the
         semaphore bounds in-flight deletes) and the semaphore is only held around
         a single network op — never across recursion — so it cannot deadlock.
         """
-        children = [child async for child in self.iterdir()]
 
         async def _remove(child: Self) -> None:
             if await child.is_dir():  # cached from iterdir — no round-trip
-                await child._rmtree(sem)
+                await child._rmtree_bounded(sem)
             else:
                 async with sem:
                     await child.unlink()
 
-        if children:
-            results = await asyncio.gather(*map(_remove, children), return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
+        children = [_remove(child) async for child in self.iterdir()]
+        for result in await asyncio.gather(*children, return_exceptions=True):
+            if isinstance(result, BaseException):
+                raise result
         async with sem:
             await self._native_rmdir()
 
