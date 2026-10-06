@@ -329,6 +329,7 @@ class CloudPathMixin(CommonPurePathMixin):
             ),
             **native_kwargs,
         )
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
         return len(data)
 
     async def write_text(
@@ -358,6 +359,7 @@ class CloudPathMixin(CommonPurePathMixin):
                 item=self._item_path,
                 **native_kwargs,
             )
+            type(self)._listing_cache.pop(self._listing_cache_key(), None)
         except FileNotFoundError:  # pragma: no cover
             if not missing_ok:  # pragma: no cover
                 raise
@@ -609,20 +611,17 @@ class CloudPathMixin(CommonPurePathMixin):
         With ``recursive=True``, deletes all objects under this prefix.
         Without it, only succeeds if the prefix is empty (no children).
         """
+        self_iter = self.iterdir(fresh=True)
         if not recursive:
-            children = [c async for c in self.iterdir()]
-            if children:
+            async for _ in self_iter:
                 raise OSError(39, f"Directory not empty: '{self}'")
             return
-        # Recursive: collect all files, then unlink
-        files = []
-        async for child in self.iterdir():
+        async for child in self_iter:
             if await child.is_dir():
                 await child.rmdir(recursive=True)
             else:
-                files.append(child)
-        for f in files:
-            await f.unlink()
+                await child.unlink()
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def copy(
         self,
