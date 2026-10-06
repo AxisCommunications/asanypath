@@ -341,6 +341,20 @@ class TestSSHPath(testbase):
         ssh.mkdir.side_effect = RuntimeError("already exists")
         await _ssh().mkdir(exist_ok=True)  # must not raise
 
+    async def test_mkdir_exist_ok_swallows_generic_failure(self, ssh):
+        # Some servers (e.g. atmoz/sftp) return an unclassifiable error for an
+        # existing dir; exist_ok must stay idempotent via an is_dir re-check.
+        ssh.mkdir.side_effect = RuntimeError("Failure")
+        ssh.stat.return_value = _stat(permissions=DIR_MODE)  # path is an existing dir
+        await _ssh().mkdir(exist_ok=True)  # must not raise
+
+    async def test_mkdir_generic_failure_reraises_when_not_dir(self, ssh):
+        # Generic failure with no existing dir behind it must still propagate.
+        ssh.mkdir.side_effect = RuntimeError("Failure")
+        ssh.stat.side_effect = RuntimeError("No such file")  # not a dir
+        with pytest.raises(RuntimeError):
+            await _ssh().mkdir(exist_ok=True)
+
     async def test_mkdir_raises_when_exists(self, ssh):
         ssh.stat.return_value = _stat()  # exists → pre-check raises
         with pytest.raises(FileExistsError):

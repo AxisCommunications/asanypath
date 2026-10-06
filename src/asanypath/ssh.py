@@ -484,7 +484,14 @@ class SSHPath(CloudPathMixin):
         try:
             await ssh_mkdir(path=self._item_path, parents=parents, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
-            _map_native_error(e, str(self), ignore=FileExistsError if exist_ok else ())
+            try:
+                _map_native_error(e, str(self), ignore=FileExistsError if exist_ok else ())
+            except Exception:
+                # Some servers (e.g. atmoz/sftp) return a generic, unclassifiable
+                # error for an existing dir; re-check so exist_ok stays idempotent.
+                if exist_ok and await self.is_dir():
+                    return
+                raise
 
     async def rmdir(self, *, recursive: bool = False) -> None:
         if not recursive:
