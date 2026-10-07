@@ -1065,6 +1065,194 @@ pub fn s3_put_batch<'py>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Multipart upload primitives (sequencing/concurrency orchestrated from Python)
+// ---------------------------------------------------------------------------
+
+/// Extract the `<UploadId>` text from an InitiateMultipartUpload response.
+fn parse_upload_id(body: &[u8]) -> Result<String, PyErr> {
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_id = false;
+    let mut text = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                if local_name(name.as_ref()) == "UploadId" {
+                    in_id = true;
+                    text.clear();
+                }
+            }
+            Ok(Event::Text(e)) if in_id => text.push_str(&e.xml10_content()),
+            Ok(Event::End(_)) if in_id => return Ok(text.clone()),
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Err(PyRuntimeError::new_err(
+        "S3 CreateMultipartUpload: no UploadId in response",
+    ))
+}
+
+/// Initiate a multipart upload; returns the UploadId.
+#[pyfunction]
+#[pyo3(signature = (endpoint, bucket, key, region, access_key, secret_key, session_token=None, options_json=None, use_h2=None))]
+pub fn s3_create_multipart<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    key: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    options_json: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let options: crate::backend::UploadOptions =
+            sonic_rs::from_str(&options_json.unwrap_or_else(|| "{}".to_string()))
+                .map_err(|e| PyValueError::new_err(format!("invalid backend_options: {e}")))?;
+        crate::backend::require_empty_provider(&options)?;
+        let mut extra = crate::backend::user_headers(&options)?;
+        extra.push(("content-length".to_string(), "0".to_string()));
+        let s3_path = format!("/{key}");
+        let query = vec![("uploads".to_string(), String::new())];
+        let (status, body, _h) = do_s3_request(&creds, "POST", &s3_path, &query, None, h2, &extra)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&key), &body));
+        }
+        parse_upload_id(&body)
+    })
+}
+
+/// Upload one part; returns its ETag (used to complete the upload).
+#[pyfunction]
+#[pyo3(signature = (endpoint, bucket, key, upload_id, part_number, data, region, access_key, secret_key, session_token=None, use_h2=None))]
+pub fn s3_upload_part<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    data: Vec<u8>,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let s3_path = format!("/{key}");
+        let query = vec![
+            ("partNumber".to_string(), part_number.to_string()),
+            ("uploadId".to_string(), upload_id),
+        ];
+        let (status, body, headers) =
+            do_s3_request(&creds, "PUT", &s3_path, &query, Some(Bytes::from(data)), h2, &[])
+                .await
+                .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&key), &body));
+        }
+        Ok(headers.get("etag").cloned().unwrap_or_default())
+    })
+}
+
+/// Complete a multipart upload from the collected `(part_number, etag)` pairs.
+#[pyfunction]
+#[pyo3(signature = (endpoint, bucket, key, upload_id, parts, region, access_key, secret_key, session_token=None, use_h2=None))]
+pub fn s3_complete_multipart<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    parts: Vec<(u32, String)>,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in &parts {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let s3_path = format!("/{key}");
+        let query = vec![("uploadId".to_string(), upload_id)];
+        let extra = vec![("content-type".to_string(), "application/xml".to_string())];
+        let (status, body, _h) = do_s3_request(
+            &creds,
+            "POST",
+            &s3_path,
+            &query,
+            Some(Bytes::from(xml.into_bytes())),
+            h2,
+            &extra,
+        )
+        .await
+        .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&key), &body));
+        }
+        // S3 may return 200 OK with an <Error> body when completion fails.
+        if body.windows(7).any(|w| w == b"<Error>") {
+            return Err(PyRuntimeError::new_err(format!(
+                "S3 CompleteMultipartUpload failed: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Abort a multipart upload, discarding any uploaded parts.
+#[pyfunction]
+#[pyo3(signature = (endpoint, bucket, key, upload_id, region, access_key, secret_key, session_token=None, use_h2=None))]
+pub fn s3_abort_multipart<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let s3_path = format!("/{key}");
+        let query = vec![("uploadId".to_string(), upload_id)];
+        let (status, body, _h) = do_s3_request(&creds, "DELETE", &s3_path, &query, None, h2, &[])
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&key), &body));
+        }
+        Ok(())
+    })
+}
+
 /// Copy multiple objects concurrently (server-side). Pairs are `(src_key, dst_key)`.
 #[pyfunction]
 pub fn s3_copy_batch<'py>(
