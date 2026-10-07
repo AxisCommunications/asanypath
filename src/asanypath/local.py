@@ -292,9 +292,10 @@ class SyncPath(CommonPurePathMixin):
                 if destination_exists and not force:
                     require_force(force, remote_dst)
                 run_sync_maybe(remote_dst.parent.mkdir(parents=True, exist_ok=True))
-                data = self._path.read_bytes()
-                written = run_sync_maybe(remote_dst.write_bytes(data))
-                return written if isinstance(written, int) else len(data)
+                size = self._path.stat().st_size
+                with self._path.open("rb") as src_file:
+                    run_sync_maybe(remote_dst._upload_buffer(src_file, size))
+                return size
 
             def _copy_remote_tree() -> int:
                 total = 0
@@ -312,9 +313,10 @@ class SyncPath(CommonPurePathMixin):
                         if destination_exists and not force:
                             require_force(force, destination_file)
                         run_sync_maybe(destination_file.parent.mkdir(parents=True, exist_ok=True))
-                        data = source_file._path.read_bytes()
-                        written = run_sync_maybe(destination_file.write_bytes(data))
-                        total += written if isinstance(written, int) else len(data)
+                        size = source_file._path.stat().st_size
+                        with source_file._path.open("rb") as src_file:
+                            run_sync_maybe(destination_file._upload_buffer(src_file, size))
+                        total += size
                 return total
 
             if self._path.is_dir():
