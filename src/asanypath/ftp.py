@@ -59,9 +59,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from os import getenv
 from types import SimpleNamespace
-from typing import IO, TYPE_CHECKING, TypeVar
+from typing import IO, TYPE_CHECKING, TypeVar, cast
 
 import aioftp
+from yarl import URL
 
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
@@ -171,10 +172,11 @@ class FTPPath(CloudPathMixin):
     ) -> None:
         super().__init__(*parts)
         cfg = self.env_config
-        self._host = host or self._path.host or cfg.host
-        self._port = port or self._path.port or cfg.port
-        url_pw = self._path.password
-        url_user = self._path.user
+        url = cast(URL, self._path)
+        self._host = host or url.host or cfg.host
+        self._port = port or url.port or cfg.port
+        url_pw = url.password
+        url_user = url.user
         # Username precedence: kwarg > URL > netrc > env default.
         # Password precedence: kwarg > URL > netrc > anonymous default.
         netrc_user, netrc_pw, netrc_account = _netrc_lookup(self._host)
@@ -218,7 +220,7 @@ class FTPPath(CloudPathMixin):
 
     @property
     def _item_path(self) -> str:
-        return self._path.path or "/"
+        return cast(URL, self._path).path or "/"
 
     @property
     def _native_kwargs(self) -> dict:

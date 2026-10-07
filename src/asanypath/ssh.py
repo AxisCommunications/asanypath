@@ -46,7 +46,7 @@ from os import getenv
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
-from typing import IO, TYPE_CHECKING, NoReturn, overload
+from typing import IO, TYPE_CHECKING, NoReturn, cast, overload
 
 from asanypath_native import (
     ssh_disconnect_all,
@@ -64,6 +64,7 @@ from asanypath_native import (
     ssh_write,
     ssh_write_chunk,
 )
+from yarl import URL
 
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
@@ -191,9 +192,10 @@ class SSHPath(CloudPathMixin):
         # Distinguish "typed" values (kwarg/URL) from env defaults so
         # ssh_config gets a chance to fill in port/user before we fall
         # back to SSH_PORT/SSH_USER.
-        typed_host = host or self._path.host
-        typed_port = port or self._path.port
-        typed_user = username or self._path.user
+        url = cast(URL, self._path)
+        typed_host = host or url.host
+        typed_port = port or url.port
+        typed_user = username or url.user
         self._typed_port = typed_port
         self._typed_user = typed_user
         self._host = typed_host or cfg.host
@@ -273,7 +275,7 @@ class SSHPath(CloudPathMixin):
     def _item_path(self) -> str:
         # ``/~`` / ``/~/foo`` encode "remote home" (scp-style) -- translate
         # to SFTP cwd (= user's home after login).
-        p = self._path.path or "/"
+        p = cast(URL, self._path).path or "/"
         if p == "/~":
             return "."
         if p.startswith("/~/"):
