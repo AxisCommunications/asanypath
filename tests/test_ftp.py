@@ -234,6 +234,28 @@ class TestFTPPath(testbase):
         await _ftp().write_text("world")
         s.write.assert_awaited_once_with(b"world")
 
+    async def test_upload_buffer_small_single_write(self, client):
+        from io import BytesIO
+
+        s = _stream()
+        client.upload_stream.return_value = s
+        await _ftp()._upload_buffer(BytesIO(b"small"), 5)
+        s.write.assert_awaited_once_with(b"small")
+
+    async def test_upload_buffer_streams_chunks(self, client):
+        from io import BytesIO
+
+        s = _stream()
+        client.upload_stream.return_value = s
+        with (
+            patch.object(FTPPath, "_STREAM_THRESHOLD", 4),
+            patch.object(FTPPath, "_STREAM_CHUNK", 4),
+        ):
+            await _ftp()._upload_buffer(BytesIO(b"abcdefghij"), 10)
+        written = b"".join(c.args[0] for c in s.write.await_args_list)
+        assert written == b"abcdefghij"  # streamed in chunks, reassembled intact
+        assert len(s.write.await_args_list) == 3  # 4 + 4 + 2
+
     async def test_range_read_raises(self, client):
         with pytest.raises(NotImplementedError):
             await _ftp()._range_read(0, 10)

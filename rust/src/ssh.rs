@@ -426,6 +426,50 @@ pub fn ssh_write<'py>(
     })
 }
 
+/// Write one chunk of a streamed upload. The first chunk (`truncate=true`)
+/// resets the file; later chunks open with APPEND so no offset tracking is
+/// needed. Returns the byte count written.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn ssh_write_chunk<'py>(
+    py: Python<'py>,
+    path: String,
+    data: Vec<u8>,
+    truncate: bool,
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    key_passphrase: Option<String>,
+    use_agent: bool,
+    strict_host_key: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conn = conn!(
+        host,
+        port,
+        user,
+        password,
+        key_path,
+        key_passphrase,
+        use_agent,
+        strict_host_key
+    );
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
+        let n = data.len();
+        let flags = if truncate {
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
+        } else {
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::APPEND
+        };
+        let mut file = session.sftp.open_with_flags(&path, flags).await.map_err(err)?;
+        file.write_all(&data).await.map_err(err)?;
+        file.shutdown().await.map_err(err)?;
+        Ok(n)
+    })
+}
+
 /// Check whether a remote path exists.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]

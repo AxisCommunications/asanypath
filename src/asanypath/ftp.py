@@ -59,7 +59,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from os import getenv
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, TypeVar
+from typing import IO, TYPE_CHECKING, TypeVar
 
 import aioftp
 
@@ -155,6 +155,10 @@ class FTPPath(CloudPathMixin):
     _tls: bool = False
     _default_port: int = 21
     _supports_range_read: bool = False
+    # Large objects stream to the data connection in chunks instead of buffering
+    # the whole payload in memory.
+    _STREAM_THRESHOLD = 8 * 1024 * 1024
+    _STREAM_CHUNK = 1024 * 1024
 
     def __init__(
         self,
@@ -398,6 +402,26 @@ class FTPPath(CloudPathMixin):
             return len(data)
 
         return await self._op(_write)
+
+    async def _upload_buffer(
+        self, fileobj: IO[bytes], size: int, *, backend_options: BackendOptions | None = None
+    ) -> None:
+        """Stream large objects to the FTP data connection (bounded memory)."""
+        if size < self._STREAM_THRESHOLD:
+            await self.write_bytes(fileobj.read())
+            return
+        path = self._item_path
+
+        async def _stream(client: aioftp.Client) -> int:
+            async with client.upload_stream(path) as stream:
+                while True:
+                    chunk = fileobj.read(self._STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    await stream.write(chunk)
+            return size
+
+        await self._op(_stream)
 
     async def _range_read(self, start: int, end: int) -> bytes:
         raise NotImplementedError(
