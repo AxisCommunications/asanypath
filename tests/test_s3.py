@@ -624,7 +624,7 @@ async def test_open_write_large_uses_multipart():
 @pytest.mark.asyncio
 async def test_multipart_aborts_on_error():
     p = _make_s3path("s3://mybucket/big.bin")
-    payload = b"A" * (S3Path._MULTIPART_THRESHOLD + 10)
+    payload = b"A" * (S3Path._MULTIPART_PART_SIZE + 10)
 
     async def create(**kwargs):
         return "UPID"
@@ -679,3 +679,57 @@ async def test_local_to_s3_copy_streams_multipart(tmp_path):
         await AsAnyPath(str(src)).copy(dst)
 
     assert b"".join(d for _, d in received) == payload  # streamed as parts, intact
+
+
+@pytest.mark.asyncio
+async def test_chunk_size_clamped_to_s3_minimum():
+    from io import BytesIO
+
+    from asanypath.options import S3_MIN_PART_SIZE
+
+    p = _make_s3path("s3://mybucket/big.bin")
+    payload = b"x" * (S3_MIN_PART_SIZE * 2 + 10)
+    sizes: list[int] = []
+
+    async def create(**kwargs):
+        return "U"
+
+    async def upload_part(*, data, part_number, **kwargs):
+        sizes.append(len(data))
+        return f'"e{part_number}"'
+
+    with (
+        patch("asanypath.s3.s3_create_multipart", new=create),
+        patch("asanypath.s3.s3_upload_part", new=upload_part),
+        patch("asanypath.s3.s3_complete_multipart", new=AsyncMock()),
+        patch("asanypath.s3.s3_abort_multipart", new=AsyncMock()),
+    ):
+        # Request 1 MiB parts; S3 clamps up to its 5 MiB minimum.
+        await p._upload_buffer(BytesIO(payload), len(payload), chunk_size=1024 * 1024)
+    assert sizes[0] == S3_MIN_PART_SIZE
+
+
+@pytest.mark.asyncio
+async def test_chunk_size_honors_larger_request():
+    from io import BytesIO
+
+    p = _make_s3path("s3://mybucket/big.bin")
+    chunk = 12 * 1024 * 1024
+    payload = b"y" * (chunk + 1000)
+    sizes: list[int] = []
+
+    async def create(**kwargs):
+        return "U"
+
+    async def upload_part(*, data, part_number, **kwargs):
+        sizes.append(len(data))
+        return f'"e{part_number}"'
+
+    with (
+        patch("asanypath.s3.s3_create_multipart", new=create),
+        patch("asanypath.s3.s3_upload_part", new=upload_part),
+        patch("asanypath.s3.s3_complete_multipart", new=AsyncMock()),
+        patch("asanypath.s3.s3_abort_multipart", new=AsyncMock()),
+    ):
+        await p._upload_buffer(BytesIO(payload), len(payload), chunk_size=chunk)
+    assert sizes == [chunk, 1000]  # honors the requested part size

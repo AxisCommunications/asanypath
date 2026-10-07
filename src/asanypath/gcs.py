@@ -44,7 +44,14 @@ from asanypath_native import (
 )
 
 from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import (
+    GCS_CHUNK_ALIGN,
+    UPLOAD_CHUNK_SIZE,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
+)
 
 GCS_API_BASE = "https://storage.googleapis.com"
 
@@ -65,9 +72,8 @@ class GCSPath(CloudPathMixin):
 
     protocol: str = "gs"
     _supports_range_read: bool = True
-    # Single PUT below the threshold, else resumable upload in 256 KiB-aligned chunks.
-    _MULTIPART_THRESHOLD = 8 * 1024 * 1024
-    _MULTIPART_PART_SIZE = 8 * 1024 * 1024
+    # Bytes per resumable chunk; objects below one chunk upload in a single PUT.
+    _MULTIPART_PART_SIZE = UPLOAD_CHUNK_SIZE
     _is_dir_batch_fn = staticmethod(gcs_is_dir_batch)
     _copy_batch_fn = staticmethod(gcs_copy_batch)
 
@@ -150,24 +156,29 @@ class GCSPath(CloudPathMixin):
     # Backend-specific operations
     # ------------------------------------------------------------------
 
-    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+    async def _upload_buffer(
+        self, fileobj, size: int, *, backend_options=None, chunk_size: int | None = None
+    ) -> None:
         """Upload a spooled write buffer, using a resumable session for large objects."""
-        if size < self._MULTIPART_THRESHOLD:
+        # GCS resumable chunks must be 256 KiB-aligned (except the last).
+        raw = chunk_size or self._MULTIPART_PART_SIZE
+        part = max(raw - raw % GCS_CHUNK_ALIGN, GCS_CHUNK_ALIGN)
+        if size < part:
             data = fileobj.read()
             if backend_options is None:
                 await self.write_bytes(data)
             else:
                 await self.write_bytes(data, backend_options=backend_options)
             return
-        await self._resumable_upload(fileobj, size)
+        await self._resumable_upload(fileobj, size, part)
 
-    async def _resumable_upload(self, fileobj, size: int) -> None:
+    async def _resumable_upload(self, fileobj, size: int, part_size: int) -> None:
         """Stream the buffer via a GCS resumable session (memory bounded to one chunk)."""
         native_kwargs = await self._get_native_kwargs()
         session_uri = await gcs_start_resumable(object=self._item_path, total=size, **native_kwargs)
         offset = 0
         while True:
-            chunk = fileobj.read(self._MULTIPART_PART_SIZE)
+            chunk = fileobj.read(part_size)
             if not chunk:
                 break
             await gcs_upload_chunk(session_uri=session_uri, data=chunk, offset=offset, total=size)

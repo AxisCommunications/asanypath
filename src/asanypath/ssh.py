@@ -67,7 +67,13 @@ from asanypath_native import (
 from yarl import URL
 
 from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import (
+    UPLOAD_CHUNK_SIZE,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
+)
 
 if TYPE_CHECKING:
     from typing import Self
@@ -172,10 +178,9 @@ class SSHPath(CloudPathMixin):
 
     protocol: str = "ssh"
     _supports_range_read: bool = True
-    # Large objects stream to the remote file in chunks (first truncates, rest
-    # append) instead of buffering the whole payload in memory.
-    _STREAM_THRESHOLD = 8 * 1024 * 1024
-    _STREAM_CHUNK = 8 * 1024 * 1024
+    # Bytes per streamed chunk; objects below one chunk write in a single call.
+    # First chunk truncates, the rest append, so no offset tracking is needed.
+    _STREAM_CHUNK = UPLOAD_CHUNK_SIZE
 
     def __init__(
         self,
@@ -466,15 +471,21 @@ class SSHPath(CloudPathMixin):
             _map_native_error(e, str(self))
 
     async def _upload_buffer(
-        self, fileobj: IO[bytes], size: int, *, backend_options: BackendOptions | None = None
+        self,
+        fileobj: IO[bytes],
+        size: int,
+        *,
+        backend_options: BackendOptions | None = None,
+        chunk_size: int | None = None,
     ) -> None:
         """Stream large objects chunk-by-chunk (bounded memory) via APPEND writes."""
-        if size < self._STREAM_THRESHOLD:
+        chunk_bytes = chunk_size or self._STREAM_CHUNK
+        if size < chunk_bytes:
             await self.write_bytes(fileobj.read())
             return
         truncate = True
         while True:
-            chunk = fileobj.read(self._STREAM_CHUNK)
+            chunk = fileobj.read(chunk_bytes)
             if not chunk:
                 break
             try:

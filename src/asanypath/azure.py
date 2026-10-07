@@ -38,7 +38,13 @@ from asanypath_native import (
 )
 
 from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import (
+    UPLOAD_CHUNK_SIZE,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
+)
 
 AZURE_API_VERSION = "2023-11-03"
 
@@ -85,9 +91,8 @@ class AzurePath(CloudPathMixin):
 
     protocol: str = "az"
     _supports_range_read: bool = True
-    # Single PUT below the threshold, else staged block-blob parts.
-    _MULTIPART_THRESHOLD = 8 * 1024 * 1024
-    _MULTIPART_PART_SIZE = 8 * 1024 * 1024
+    # Bytes per staged block; objects below one block upload in a single PUT.
+    _MULTIPART_PART_SIZE = UPLOAD_CHUNK_SIZE
     _is_dir_batch_fn = staticmethod(az_is_dir_batch)
     _copy_batch_fn = staticmethod(az_copy_batch)
 
@@ -186,18 +191,21 @@ class AzurePath(CloudPathMixin):
     # Backend-specific operations
     # ------------------------------------------------------------------
 
-    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+    async def _upload_buffer(
+        self, fileobj, size: int, *, backend_options=None, chunk_size: int | None = None
+    ) -> None:
         """Upload a spooled write buffer, using block blobs for large objects."""
-        if size < self._MULTIPART_THRESHOLD:
+        part = chunk_size or self._MULTIPART_PART_SIZE
+        if size < part:
             data = fileobj.read()
             if backend_options is None:
                 await self.write_bytes(data)
             else:
                 await self.write_bytes(data, backend_options=backend_options)
             return
-        await self._block_upload(fileobj, backend_options=backend_options)
+        await self._block_upload(fileobj, part, backend_options=backend_options)
 
-    async def _block_upload(self, fileobj, *, backend_options=None) -> None:
+    async def _block_upload(self, fileobj, part_size: int, *, backend_options=None) -> None:
         """Stage fixed-size blocks then commit the list (memory bounded to one block)."""
         options_json = (
             msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
@@ -205,7 +213,7 @@ class AzurePath(CloudPathMixin):
         block_ids: list[str] = []
         index = 0
         while True:
-            chunk = fileobj.read(self._MULTIPART_PART_SIZE)
+            chunk = fileobj.read(part_size)
             if not chunk:
                 break
             # Block ids must be equal-length base64 strings.

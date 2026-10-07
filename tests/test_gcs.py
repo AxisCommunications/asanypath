@@ -439,3 +439,29 @@ async def test_open_write_large_uses_resumable():
     # Contiguous, ascending offsets that reassemble the payload intact.
     assert [off for off, _ in chunks] == [0, part, 2 * part]
     assert b"".join(d for _, d in chunks) == payload
+
+
+@pytest.mark.asyncio
+async def test_chunk_size_aligned_to_256kib():
+    from io import BytesIO
+
+    from asanypath.options import GCS_CHUNK_ALIGN
+
+    p = _make_gcs_path("gs://bucket/big.bin")
+    requested = GCS_CHUNK_ALIGN * 3 + 100  # not 256 KiB-aligned
+    payload = b"z" * (requested * 2)
+    sizes: list[int] = []
+
+    async def start(*, total, **kwargs):
+        return "http://session/uri"
+
+    async def upload_chunk(*, data, **kwargs):
+        sizes.append(len(data))
+
+    with (
+        patch("asanypath.gcs.gcs_start_resumable", new=start),
+        patch("asanypath.gcs.gcs_upload_chunk", new=upload_chunk),
+    ):
+        await p._upload_buffer(BytesIO(payload), len(payload), chunk_size=requested)
+    assert sizes[0] % GCS_CHUNK_ALIGN == 0  # floored to a 256 KiB multiple
+    assert sizes[0] == GCS_CHUNK_ALIGN * 3

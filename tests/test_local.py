@@ -98,7 +98,7 @@ class _AsyncRemoteDestination:
     def __truediv__(self, other):
         return self.children.setdefault(str(other), _AsyncRemoteDestination())
 
-    async def _upload_buffer(self, fileobj, size, *, backend_options=None):
+    async def _upload_buffer(self, fileobj, size, *, backend_options=None, chunk_size=None):
         await self.write_bytes(fileobj.read())
 
 
@@ -120,7 +120,7 @@ class _SyncRemoteDestination:
     def __truediv__(self, other):
         return self.children.setdefault(str(other), _SyncRemoteDestination())
 
-    async def _upload_buffer(self, fileobj, size, *, backend_options=None):
+    async def _upload_buffer(self, fileobj, size, *, backend_options=None, chunk_size=None):
         self.write_bytes(fileobj.read())
 
 

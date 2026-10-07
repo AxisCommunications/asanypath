@@ -377,7 +377,6 @@ class TestSSHPath(testbase):
             return len(data)
 
         with (
-            patch.object(SSHPath, "_STREAM_THRESHOLD", 4),
             patch.object(SSHPath, "_STREAM_CHUNK", 4),
             patch("asanypath.ssh.ssh_write_chunk", new=write_chunk),
         ):
