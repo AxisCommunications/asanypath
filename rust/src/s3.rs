@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
+use aws_config::environment::region::EnvironmentVariableRegionProvider;
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::profile::region::ProfileFileRegionProvider;
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -66,20 +69,54 @@ async fn s3_aws_config(region_override: Option<String>) -> Result<S3AwsConfig, S
         return Ok(config.clone());
     }
 
-    let mut loader = aws_config::defaults(BehaviorVersion::latest());
-    if let Some(profile) = profile {
+    // Resolve region WITHOUT IMDS: explicit override > AWS_REGION env > profile.
+    // The loader must then receive a *concrete* region: an unset region makes the
+    // credentials chain probe EC2 IMDS during load() (a ~3s timeout off-EC2), which
+    // is pointless when a custom endpoint_url is configured (S3-compatible stores).
+    let region_no_imds: Option<Region> = match &region_override {
+        Some(region) => Some(Region::new(region.clone())),
+        None => {
+            RegionProviderChain::first_try(EnvironmentVariableRegionProvider::new())
+                .or_else(ProfileFileRegionProvider::default())
+                .region()
+                .await
+        }
+    };
+
+    // First load with a concrete placeholder region (no IMDS) to read endpoint_url.
+    let probe_region = region_no_imds
+        .clone()
+        .unwrap_or_else(|| Region::new("us-east-1"));
+    let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(probe_region);
+    if let Some(profile) = &profile {
         loader = loader.profile_name(profile);
     }
-    if let Some(region) = region_override {
-        loader = loader.region(Region::new(region));
-    }
     let sdk_config = loader.load().await;
+    let endpoint_url = sdk_config.endpoint_url().map(str::to_string);
+
+    // Preserve IMDS: only a genuine real-AWS target (no endpoint, no configured
+    // region) consults the IMDS region provider; then reload so the credentials
+    // chain is built against the IMDS-resolved region.
+    let (region, sdk_config) = if let Some(region) = region_no_imds {
+        (region.as_ref().to_string(), sdk_config)
+    } else if endpoint_url.is_some() {
+        ("us-east-1".to_string(), sdk_config)
+    } else {
+        match RegionProviderChain::default_provider().region().await {
+            Some(imds_region) => {
+                let mut loader =
+                    aws_config::defaults(BehaviorVersion::latest()).region(imds_region.clone());
+                if let Some(profile) = &profile {
+                    loader = loader.profile_name(profile);
+                }
+                (imds_region.as_ref().to_string(), loader.load().await)
+            }
+            None => ("us-east-1".to_string(), sdk_config),
+        }
+    };
     let config = S3AwsConfig {
-        region: sdk_config
-            .region()
-            .map(|region| region.as_ref().to_string())
-            .unwrap_or_else(|| "us-east-1".to_string()),
-        endpoint_url: sdk_config.endpoint_url().map(str::to_string),
+        region,
+        endpoint_url,
         credentials_provider: sdk_config
             .credentials_provider()
             .ok_or_else(|| "AWS credential provider chain is unavailable".to_string())?,
