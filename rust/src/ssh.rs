@@ -463,7 +463,11 @@ pub fn ssh_write_chunk<'py>(
         } else {
             OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::APPEND
         };
-        let mut file = session.sftp.open_with_flags(&path, flags).await.map_err(err)?;
+        let mut file = session
+            .sftp
+            .open_with_flags(&path, flags)
+            .await
+            .map_err(err)?;
         file.write_all(&data).await.map_err(err)?;
         file.shutdown().await.map_err(err)?;
         Ok(n)
