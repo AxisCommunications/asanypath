@@ -35,7 +35,7 @@ from asanypath._transfer import (
 )
 from asanypath.batcher import H2_BATCH_THRESHOLD, MicroBatcher, make_batcher
 from asanypath.common import SCHEME_SEP, CommonPurePathMixin
-from asanypath.options import AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import SPOOL_MAX_SIZE, AccessPolicy, AccessPolicyPatch, BackendOptions
 
 
 class CloudPathMixin(CommonPurePathMixin):
@@ -354,12 +354,18 @@ class CloudPathMixin(CommonPurePathMixin):
         return await self.write_bytes(encoded, backend_options=backend_options)
 
     async def _upload_buffer(
-        self, fileobj: IO[bytes], size: int, *, backend_options: BackendOptions | None = None
+        self,
+        fileobj: IO[bytes],
+        size: int,
+        *,
+        backend_options: BackendOptions | None = None,
+        chunk_size: int | None = None,
     ) -> None:
         """Upload a spooled write buffer (default: a single PUT of the whole buffer).
 
         Backends with native multipart override this to bound memory for large
         objects; ``size`` is the byte length and ``fileobj`` is positioned at 0.
+        ``chunk_size`` tunes the part size for those backends (ignored here).
         """
         data = fileobj.read()
         if backend_options is None:
@@ -989,7 +995,7 @@ class _CloudFile:
     _DEFAULT_CHUNK = 8 * 1024 * 1024  # 8 MiB — good default for cloud latency
     # Write buffer spills to disk past this size so many concurrently-open write
     # handles (e.g. sharded writers) can't accumulate whole objects in memory.
-    _SPOOL_MAX_SIZE = 16 * 1024 * 1024  # 16 MiB resident per open write handle
+    _SPOOL_MAX_SIZE = SPOOL_MAX_SIZE  # resident bytes per open write handle before spilling
 
     def __init__(self, path, mode, buffering, encoding, errors, newline, backend_options=None):
         self._path = path
@@ -1011,6 +1017,11 @@ class _CloudFile:
         if self._buffering <= 0:
             return self._DEFAULT_CHUNK
         return self._buffering
+
+    @property
+    def _write_chunk_size(self) -> int | None:
+        """Write-mode: a positive ``buffering`` sets the upload part size."""
+        return self._buffering if self._buffering and self._buffering > 0 else None
 
     def _make_buffer(self, data: bytes | None = None) -> io.IOBase:
         """Create the backing buffer: in-memory for reads, disk-spilling for writes."""
@@ -1100,7 +1111,12 @@ class _CloudFile:
             if ("w" in self._mode or "a" in self._mode) and exc_type is None:
                 buf, size = self._spool_for_upload()
                 _SyncRunner.get().run(
-                    self._path._upload_buffer(buf, size, backend_options=self._backend_options)
+                    self._path._upload_buffer(
+                        buf,
+                        size,
+                        backend_options=self._backend_options,
+                        chunk_size=self._write_chunk_size,
+                    )
                 )
         finally:
             if self._reader is not None:
@@ -1137,7 +1153,12 @@ class _CloudFile:
         try:
             if ("w" in self._mode or "a" in self._mode) and exc_type is None:
                 buf, size = self._spool_for_upload()
-                await self._path._upload_buffer(buf, size, backend_options=self._backend_options)
+                await self._path._upload_buffer(
+                    buf,
+                    size,
+                    backend_options=self._backend_options,
+                    chunk_size=self._write_chunk_size,
+                )
         finally:
             if self._reader is not None:
                 self._reader.close()

@@ -37,6 +37,8 @@ from yarl import URL
 
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import (
+    S3_MIN_PART_SIZE,
+    UPLOAD_CHUNK_SIZE,
     AccessAction,
     AccessGrant,
     AccessPolicy,
@@ -55,9 +57,9 @@ def _default_s3_endpoint(region: str) -> str:
 class S3Path(CloudPathMixin):
     protocol: str = "s3"
     _supports_range_read: bool = True
-    # AWS CLI defaults: single PUT below the threshold, else fixed-size parts.
-    _MULTIPART_THRESHOLD = 8 * 1024 * 1024
-    _MULTIPART_PART_SIZE = 8 * 1024 * 1024
+    # Bytes per part; objects below one part upload in a single PUT. Shared
+    # default, overridable per class or per call (copy/open).
+    _MULTIPART_PART_SIZE = UPLOAD_CHUNK_SIZE
 
     @staticmethod
     def _batcher_key_fn(
@@ -177,18 +179,22 @@ class S3Path(CloudPathMixin):
     # Backend-specific operations
     # ------------------------------------------------------------------
 
-    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+    async def _upload_buffer(
+        self, fileobj, size: int, *, backend_options=None, chunk_size: int | None = None
+    ) -> None:
         """Upload a spooled write buffer, using multipart for large objects."""
-        if size < self._MULTIPART_THRESHOLD:
+        # S3 requires >= 5 MiB parts (except the last), so clamp the request.
+        part = max(chunk_size or self._MULTIPART_PART_SIZE, S3_MIN_PART_SIZE)
+        if size < part:
             data = fileobj.read()
             if backend_options is None:
                 await self.write_bytes(data)
             else:
                 await self.write_bytes(data, backend_options=backend_options)
             return
-        await self._multipart_upload(fileobj, backend_options=backend_options)
+        await self._multipart_upload(fileobj, part, backend_options=backend_options)
 
-    async def _multipart_upload(self, fileobj, *, backend_options=None) -> None:
+    async def _multipart_upload(self, fileobj, part_size: int, *, backend_options=None) -> None:
         """Stream the buffer to S3 as multipart parts (memory bounded to one part)."""
         options_json = (
             msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
@@ -201,7 +207,7 @@ class S3Path(CloudPathMixin):
         try:
             part_number = 1
             while True:
-                chunk = fileobj.read(self._MULTIPART_PART_SIZE)
+                chunk = fileobj.read(part_size)
                 if not chunk:
                     break
                 etag = await s3_upload_part(
