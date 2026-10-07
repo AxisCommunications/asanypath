@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::http::{bearer_headers, do_request_light, status_to_pyerr};
+use crate::http::{bearer_headers, do_request, do_request_light, status_to_pyerr};
 
 // ---------------------------------------------------------------------------
 // Typed JSON response structs (avoids Value allocations)
@@ -927,6 +927,84 @@ pub fn gcs_put_batch<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let creds = gcs_creds!(endpoint, bucket, access_token);
         batch_put!(creds, items, h2)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Resumable upload (orchestrated from Python): init a session, then PUT ranges
+// ---------------------------------------------------------------------------
+
+/// Begin a resumable upload session; returns the session URI (Location header).
+#[pyfunction]
+#[pyo3(signature = (endpoint, bucket, object, total, access_token=None, use_h2=None))]
+pub fn gcs_start_resumable<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    object: String,
+    total: u64,
+    access_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = gcs_creds!(endpoint, bucket, access_token);
+        let url = append_params(
+            &creds.upload_base(),
+            &[("uploadType", "resumable"), ("name", &object)],
+        );
+        let mut headers = creds.auth_headers().await;
+        headers.push(("content-length".to_string(), "0".to_string()));
+        headers.push((
+            "x-upload-content-type".to_string(),
+            "application/octet-stream".to_string(),
+        ));
+        headers.push(("x-upload-content-length".to_string(), total.to_string()));
+        let (status, body, resp_headers) = do_request("POST", &url, &headers, None, h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&object), &body));
+        }
+        resp_headers
+            .get("location")
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("GCS resumable init: no Location header"))
+    })
+}
+
+/// Upload one chunk to a resumable session. GCS completes when offset+len == total.
+#[pyfunction]
+#[pyo3(signature = (session_uri, data, offset, total, use_h2=None))]
+pub fn gcs_upload_chunk<'py>(
+    py: Python<'py>,
+    session_uri: String,
+    data: Vec<u8>,
+    offset: u64,
+    total: u64,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let len = data.len() as u64;
+        let end = offset + len - 1;
+        let headers = vec![
+            ("content-length".to_string(), len.to_string()),
+            (
+                "content-range".to_string(),
+                format!("bytes {offset}-{end}/{total}"),
+            ),
+        ];
+        let (status, body, _h) =
+            do_request("PUT", &session_uri, &headers, Some(Bytes::from(data)), h2)
+                .await
+                .map_err(PyRuntimeError::new_err)?;
+        // 308 Resume Incomplete = intermediate chunk accepted; 2xx = final chunk done.
+        if status.as_u16() == 308 || status.is_success() {
+            Ok(())
+        } else {
+            Err(status_to_pyerr(status, "gs://resumable-chunk", &body))
+        }
     })
 }
 

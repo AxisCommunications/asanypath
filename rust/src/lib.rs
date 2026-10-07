@@ -60,6 +60,8 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gcs::gcs_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_head_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs::gcs_start_resumable, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs::gcs_upload_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_is_dir_batch, m)?)?;
@@ -75,6 +77,8 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(azure::az_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_head_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(azure::az_put_block, m)?)?;
+    m.add_function(wrap_pyfunction!(azure::az_put_block_list, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_is_dir_batch, m)?)?;
@@ -87,6 +91,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Artifactory batch
     m.add_function(wrap_pyfunction!(artifactory::art_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(artifactory::art_put_stream, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_list_batch, m)?)?;
@@ -107,6 +112,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ssh::ssh_read, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_read_range, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_write, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_write_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_exists, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_stat, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_lstat, m)?)?;
