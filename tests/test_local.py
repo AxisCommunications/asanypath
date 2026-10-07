@@ -98,6 +98,9 @@ class _AsyncRemoteDestination:
     def __truediv__(self, other):
         return self.children.setdefault(str(other), _AsyncRemoteDestination())
 
+    async def _upload_buffer(self, fileobj, size, *, backend_options=None):
+        await self.write_bytes(fileobj.read())
+
 
 class _SyncRemoteDestination:
     protocol = "s3"
