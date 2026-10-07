@@ -396,3 +396,46 @@ def test_project_id_from_env():
 def test_endpoint_url_stored():
     p = _make_gcs_path(endpoint_url="http://localhost:4443")
     assert p._endpoint_url == "http://localhost:4443"
+
+
+@pytest.mark.asyncio
+async def test_open_write_small_uses_single_put():
+    p = _make_gcs_path("gs://bucket/small.bin")
+    mock_write = AsyncMock()
+    start = AsyncMock()
+    with (
+        patch.object(type(p), "write_bytes", new=mock_write),
+        patch("asanypath.gcs.gcs_start_resumable", new=start),
+    ):
+        async with p.open("wb") as f:
+            f.write(b"small gcs payload")
+    mock_write.assert_awaited_once_with(b"small gcs payload")
+    start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_write_large_uses_resumable():
+    p = _make_gcs_path("gs://bucket/big.bin")
+    part = GCSPath._MULTIPART_PART_SIZE
+    payload = b"A" * part + b"B" * part + b"C" * 321
+    chunks: list[tuple[int, bytes]] = []
+
+    async def start(*, total, **kwargs):
+        assert total == len(payload)
+        return "http://session/uri"
+
+    async def upload_chunk(*, session_uri, data, offset, total, **kwargs):
+        assert session_uri == "http://session/uri"
+        assert total == len(payload)
+        chunks.append((offset, data))
+
+    with (
+        patch("asanypath.gcs.gcs_start_resumable", new=start),
+        patch("asanypath.gcs.gcs_upload_chunk", new=upload_chunk),
+    ):
+        async with p.open("wb") as f:
+            f.write(payload)
+
+    # Contiguous, ascending offsets that reassemble the payload intact.
+    assert [off for off, _ in chunks] == [0, part, 2 * part]
+    assert b"".join(d for _, d in chunks) == payload
