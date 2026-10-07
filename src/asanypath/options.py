@@ -8,10 +8,40 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any, Literal
 
 import msgspec
+
+
+def _env_bytes(name: str, default: int) -> int:
+    """Read a positive integer byte count from *name*, else return *default*."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Bytes held in memory per in-flight upload part/chunk. Objects smaller than this
+# upload in a single request; larger ones stream in parts of this size — so this
+# is the peak resident memory per upload (parts upload sequentially, no fan-out).
+# Tunable via ``ASANYPATH_UPLOAD_CHUNK_SIZE``; also overridable per call through
+# ``copy(chunk_size=...)`` and, for writes, ``open(..., buffering=...)``.
+UPLOAD_CHUNK_SIZE: int = _env_bytes("ASANYPATH_UPLOAD_CHUNK_SIZE", 8 * 1024 * 1024)
+
+# Bytes an open write handle keeps in memory before spilling to a temp file.
+# Tunable via ``ASANYPATH_SPOOL_MAX_SIZE``.
+SPOOL_MAX_SIZE: int = _env_bytes("ASANYPATH_SPOOL_MAX_SIZE", 16 * 1024 * 1024)
+
+# S3 rejects multipart parts smaller than 5 MiB (except the last); GCS resumable
+# chunks must be 256 KiB-aligned. Backends clamp the effective size accordingly.
+S3_MIN_PART_SIZE: int = 5 * 1024 * 1024
+GCS_CHUNK_ALIGN: int = 256 * 1024
 
 
 class BackendOptions(msgspec.Struct, frozen=True, kw_only=True):

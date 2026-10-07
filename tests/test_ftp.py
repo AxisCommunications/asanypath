@@ -247,10 +247,7 @@ class TestFTPPath(testbase):
 
         s = _stream()
         client.upload_stream.return_value = s
-        with (
-            patch.object(FTPPath, "_STREAM_THRESHOLD", 4),
-            patch.object(FTPPath, "_STREAM_CHUNK", 4),
-        ):
+        with patch.object(FTPPath, "_STREAM_CHUNK", 4):
             await _ftp()._upload_buffer(BytesIO(b"abcdefghij"), 10)
         written = b"".join(c.args[0] for c in s.write.await_args_list)
         assert written == b"abcdefghij"  # streamed in chunks, reassembled intact

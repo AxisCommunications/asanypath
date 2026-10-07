@@ -106,6 +106,49 @@ for child in p.parent.iterdir():  # yields synchronously
 Local paths (`file://` or bare `/path`) bypass the proxy entirely and use
 `pathlib.Path` directly — zero threading overhead.
 
+### Large uploads stream automatically
+
+Writing or copying a large object never buffers the whole thing in memory — it
+streams in bounded-size parts using each backend's native mechanism (S3
+multipart, Azure block blobs, GCS resumable, SSH chunked writes, FTP data
+connection, Artifactory streamed `PUT`). This is the **default** behaviour — no
+flag, no API change:
+
+```python
+# open("wb") spills to disk past 16 MiB and uploads in parts on close
+async with AsAnyPath("s3://bucket/huge.bin").open("wb") as f:
+    f.write(data)
+
+# local -> cloud copy streams straight from the source file (async and sync)
+await AsAnyPath("/data/movie.mp4").copy("s3://bucket/movie.mp4")
+```
+
+Peak memory per upload is one part — **8 MiB by default**. Objects smaller than
+one part upload in a single request. (`write_bytes(data)` / `write_text(...)`
+take the whole payload in memory by definition — use `open("wb")` or `copy()`
+for large data.)
+
+**Tuning the memory footprint.** The part size *is* the max RAM held per
+in-flight chunk (parts upload sequentially, so there is no concurrency
+multiplier). Set it globally via env, or per call:
+
+```bash
+export ASANYPATH_UPLOAD_CHUNK_SIZE=33554432   # 32 MiB parts (bytes)
+export ASANYPATH_SPOOL_MAX_SIZE=67108864      # 64 MiB before open("wb") spills to disk
+```
+
+```python
+# per call: copy(chunk_size=...) or, for writes, open(..., buffering=...)
+await src.copy("s3://bucket/huge.bin", chunk_size=32 * 1024 * 1024)
+async with dst.open("wb", buffering=32 * 1024 * 1024) as f:
+    f.write(data)
+```
+
+Bigger parts mean fewer requests and a larger single-object ceiling (S3 allows
+10,000 parts, so 8 MiB parts cap an object at ~80 GB). Backend minimums are
+applied automatically: **S3** clamps to ≥ 5 MiB parts, **GCS** rounds down to a
+256 KiB multiple.
+
 Unknown URI schemes now construct as `UnsupportedProtocolPath` placeholders.
 Pure path operations (e.g. `.name`, `.parent`, joins) still work, while backend
 operations (e.g. `.exists()`, `.read_bytes()`, `.open()`) raise
@@ -383,8 +426,8 @@ Factory that returns the appropriate path instance based on the URI scheme.
 
 All path implementations support:
 
-- `open(mode, buffering)` — file-like streaming with lazy range reads
-- `copy(dst, recursive)` — copy file or tree (cross-backend)
+- `open(mode, buffering)` — file-like streaming with lazy range reads; for writes, `buffering` sets the upload part size
+- `copy(dst, recursive, chunk_size)` — copy file or tree (cross-backend); `chunk_size` tunes the upload part size
 - `read_bytes()` / `write_bytes(data)`
 - `read_text(encoding)` / `write_text(data, encoding)`
 - `exists()` / `is_file()` / `is_dir()`
