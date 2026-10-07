@@ -39,16 +39,15 @@ layer. Call :func:`disconnect_all` to close everything (tests/shutdown).
 
 from __future__ import annotations
 
+import asyncio
 import stat as stat_module
 from collections.abc import AsyncIterator
 from os import getenv
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NoReturn, overload
 
-from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
 from asanypath_native import (
     ssh_disconnect_all,
     ssh_list,
@@ -65,6 +64,9 @@ from asanypath_native import (
     ssh_write,
 )
 
+from asanypath.cloud import CloudPathMixin
+from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+
 if TYPE_CHECKING:
     from typing import Self
 
@@ -76,19 +78,46 @@ def disconnect_all() -> None:
 
 _UNSET = object()
 
+# Max concurrent in-flight SFTP delete ops during recursive rmdir. Deletes
+# pipeline safely over the pooled session (unlike concurrent writes); bounded so
+# we don't flood the connection/server.
+_RMDIR_CONCURRENCY = 16
 
-def _map_native_error(exc: Exception, path: str) -> NoReturn:
-    """Translate a native russh/SFTP error into the stdlib OSError family."""
+
+@overload
+def _map_native_error(exc: Exception, path: str) -> NoReturn: ...
+@overload
+def _map_native_error(
+    exc: Exception, path: str, *, ignore: type[BaseException] | tuple[type[BaseException], ...]
+) -> None: ...
+def _map_native_error(
+    exc: Exception,
+    path: str,
+    *,
+    ignore: type[BaseException] | tuple[type[BaseException], ...] = (),
+) -> None:
+    """Translate a native russh/SFTP error into the stdlib OSError family.
+
+    Errors whose mapped type matches *ignore* are swallowed (return) instead of
+    raised, so callers can express ``missing_ok``/``exist_ok`` without re-catching.
+    """
     msg = str(exc).lower()
+    mapped: Exception
     if "no such file" in msg or "not found" in msg or "does not exist" in msg:
-        raise FileNotFoundError(2, "No such file or directory", path) from exc
-    if "permission denied" in msg:
-        raise PermissionError(13, "Permission denied", path) from exc
-    if "not a directory" in msg:
-        raise NotADirectoryError(20, "Not a directory", path) from exc
-    if "already exists" in msg or "file exists" in msg:
-        raise FileExistsError(17, "File exists", path) from exc
-    raise exc
+        mapped = FileNotFoundError(2, "No such file or directory", path)
+    elif "permission denied" in msg:
+        mapped = PermissionError(13, "Permission denied", path)
+    elif "not a directory" in msg:
+        mapped = NotADirectoryError(20, "Not a directory", path)
+    elif "not empty" in msg:
+        mapped = OSError(39, "Directory not empty", path)
+    elif "already exists" in msg or "file exists" in msg:
+        mapped = FileExistsError(17, "File exists", path)
+    else:
+        raise exc
+    if ignore and isinstance(mapped, ignore):
+        return
+    raise mapped from exc
 
 
 def _discover_ssh_config() -> list[str]:
@@ -447,11 +476,7 @@ class SSHPath(CloudPathMixin):
         try:
             await ssh_unlink(path=self._item_path, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
-            try:
-                _map_native_error(e, str(self))
-            except FileNotFoundError:
-                if not missing_ok:
-                    raise
+            _map_native_error(e, str(self), ignore=FileNotFoundError if missing_ok else ())
 
     async def mkdir(self, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
         if not (parents or exist_ok) and await self.exists():
@@ -460,23 +485,54 @@ class SSHPath(CloudPathMixin):
             await ssh_mkdir(path=self._item_path, parents=parents, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
             try:
-                _map_native_error(e, str(self))
-            except FileExistsError:
-                if not exist_ok:
-                    raise
+                _map_native_error(e, str(self), ignore=FileExistsError if exist_ok else ())
+            except Exception:
+                # Some servers (e.g. atmoz/sftp) return a generic, unclassifiable
+                # error for an existing dir; re-check so exist_ok stays idempotent.
+                if exist_ok and await self.is_dir():
+                    return
+                raise
 
     async def rmdir(self, *, recursive: bool = False) -> None:
-        if recursive:
-            # No native recursive remove; delete children depth-first.
-            async for child in self.iterdir():
-                if await child.is_dir():
-                    await child.rmdir(recursive=True)
-                else:
-                    await child.unlink()
+        if not recursive:
+            # ssh_list yields nothing for an empty dir; a clean ENOTEMPTY beats
+            # the raw server error _map_native_error would otherwise classify.
+            async for _ in self.iterdir():
+                raise OSError(39, f"Directory not empty: '{self}'")
+            await self._native_rmdir()
+            return
+        await self._rmtree()
+
+    async def _native_rmdir(self) -> None:
         try:
             await ssh_rmdir(path=self._item_path, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
+
+    async def _rmtree(self) -> None:
+        await self._rmtree_bounded(asyncio.Semaphore(_RMDIR_CONCURRENCY))
+
+    async def _rmtree_bounded(self, sem: asyncio.Semaphore) -> None:
+        """Delete this directory and its contents with bounded concurrency.
+
+        SFTP has no recursive remove; children are removed concurrently (the
+        semaphore bounds in-flight deletes) and the semaphore is only held around
+        a single network op — never across recursion — so it cannot deadlock.
+        """
+
+        async def _remove(child: Self) -> None:
+            if await child.is_dir():  # cached from iterdir — no round-trip
+                await child._rmtree_bounded(sem)
+            else:
+                async with sem:
+                    await child.unlink()
+
+        children = [_remove(child) async for child in self.iterdir()]
+        for result in await asyncio.gather(*children, return_exceptions=True):
+            if isinstance(result, BaseException):
+                raise result
+        async with sem:
+            await self._native_rmdir()
 
     async def rename(self, target: str | Self, *, force: bool = False) -> Self:
         target_path = target if isinstance(target, type(self)) else type(self)(str(target))
@@ -538,10 +594,10 @@ class SSHPath(CloudPathMixin):
         try:
             entries = await ssh_list(path=self._item_path, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
-            try:
-                _map_native_error(e, str(self))
-            except FileNotFoundError as fe:
-                raise NotADirectoryError(20, f"Not a directory: '{self}'") from fe
+            # A missing path / non-dir surfaces as "not a directory" for iterdir;
+            # other failures keep their mapped type.
+            _map_native_error(e, str(self), ignore=FileNotFoundError)
+            raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
         for name, size, mtime, atime, uid, gid, permissions in entries:
             if name in (".", ".."):
                 continue

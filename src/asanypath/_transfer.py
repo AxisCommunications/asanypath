@@ -15,6 +15,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from asanypath.exceptions import UnsupportedProtocolError
+
 _CHECKSUM_PREFERENCE = ("sha256", "sha1", "md5")
 
 # Default streaming chunk size for chunk_size=None ("auto").
@@ -79,19 +81,25 @@ def _normalized_checksums(checksums: dict[str, str]) -> dict[str, str]:
 def is_remote_destination(dst: Any) -> bool:
     protocol = getattr(dst, "protocol", None)
     if protocol is not None:
-        return protocol != "file"
+        return bool(protocol != "file")
     value = str(dst)
     return "://" in value and not value.startswith("file:")
 
 
 def has_async_transfer_api(dst: Any) -> bool:
-    return inspect.iscoroutinefunction(
-        getattr(dst, "exists", None)
-    ) and inspect.iscoroutinefunction(getattr(dst, "write_bytes", None))
+    try:
+        exists = getattr(dst, "exists", None)
+        write_bytes = getattr(dst, "write_bytes", None)
+    except UnsupportedProtocolError:
+        return False
+    return inspect.iscoroutinefunction(exists) and inspect.iscoroutinefunction(write_bytes)
 
 
 def has_write_api(dst: Any) -> bool:
-    return callable(getattr(dst, "write_bytes", None))
+    try:
+        return callable(getattr(dst, "write_bytes", None))
+    except UnsupportedProtocolError:
+        return False
 
 
 def run_sync_maybe(value: Any) -> Any:

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import inspect
 import io
@@ -329,6 +330,7 @@ class CloudPathMixin(CommonPurePathMixin):
             ),
             **native_kwargs,
         )
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
         return len(data)
 
     async def write_text(
@@ -358,6 +360,7 @@ class CloudPathMixin(CommonPurePathMixin):
                 item=self._item_path,
                 **native_kwargs,
             )
+            type(self)._listing_cache.pop(self._listing_cache_key(), None)
         except FileNotFoundError:  # pragma: no cover
             if not missing_ok:  # pragma: no cover
                 raise
@@ -610,19 +613,31 @@ class CloudPathMixin(CommonPurePathMixin):
         Without it, only succeeds if the prefix is empty (no children).
         """
         if not recursive:
-            children = [c async for c in self.iterdir()]
-            if children:
+            async for _ in self.iterdir(fresh=True):
                 raise OSError(39, f"Directory not empty: '{self}'")
             return
-        # Recursive: collect all files, then unlink
-        files = []
-        async for child in self.iterdir():
+        await self._rmtree()
+
+    async def _rmtree(self) -> None:
+        """Recursively delete this prefix's contents with concurrency.
+
+        Children are deleted concurrently so the :class:`MicroBatcher` can
+        coalesce the in-flight object deletes into batch API calls; no
+        Python-side semaphore is used because a small bound would only cap
+        the batch size and defeat that coalescing.
+        """
+
+        async def _remove(child: Self) -> None:
             if await child.is_dir():
-                await child.rmdir(recursive=True)
+                await child._rmtree()
             else:
-                files.append(child)
-        for f in files:
-            await f.unlink()
+                await child.unlink()
+
+        children = [_remove(child) async for child in self.iterdir(fresh=True)]
+        for result in await asyncio.gather(*children, return_exceptions=True):
+            if isinstance(result, BaseException):
+                raise result
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def copy(
         self,
@@ -854,13 +869,13 @@ class CloudPathMixin(CommonPurePathMixin):
                 **(await self._get_native_kwargs()),
             )
         elif entries:
-            import asyncio
-
             is_dir_results = await asyncio.gather(*(e.is_dir() for e in entries))
         else:
             is_dir_results = []
-        dirs = [e for e, d in zip(entries, is_dir_results) if d]
-        files = [e for e, d in zip(entries, is_dir_results) if not d]
+        dirs: list[Self] = []
+        files: list[Self] = []
+        for entry, is_directory in zip(entries, is_dir_results):
+            (dirs if is_directory else files).append(entry)
         if top_down:
             yield self, [d.name for d in dirs], [f.name for f in files]
         for d in dirs:

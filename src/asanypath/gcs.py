@@ -24,9 +24,6 @@ from os import getenv
 from types import SimpleNamespace
 
 import msgspec
-
-from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
 from asanypath_native import (
     gcs_copy_batch,
     gcs_delete_batch,
@@ -43,6 +40,9 @@ from asanypath_native import (
     gcs_put_acl,
     gcs_put_batch,
 )
+
+from asanypath.cloud import CloudPathMixin
+from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
 
 GCS_API_BASE = "https://storage.googleapis.com"
 

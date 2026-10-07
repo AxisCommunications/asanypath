@@ -9,12 +9,10 @@ from __future__ import annotations
 from base64 import b64encode
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from os import getenv, linesep
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal
 from xml.etree.ElementTree import XMLParser
 
 import msgspec
-
-from asanypath.cloud import CloudPathMixin
 from asanypath_native import (
     http_delete,
     http_exists,
@@ -27,12 +25,15 @@ from asanypath_native import (
     http_scrape_links,
 )
 
+from asanypath.cloud import CloudPathMixin
+
 try:
     from asanypath_native import http_request
 except ImportError:  # pragma: no cover
     http_request = None  # type: ignore[assignment]
 
-T = TypeVar("T", bound="HTTPPath")
+if TYPE_CHECKING:
+    from typing import Self
 
 
 class _TagCollector:
@@ -306,7 +307,7 @@ class HTTPPath(CloudPathMixin):
             return False  # pragma: no cover
         return await self.exists()  # pragma: no cover
 
-    async def iterdir(self) -> AsyncIterator[T]:
+    async def iterdir(self) -> AsyncIterator[Self]:
         """Yield child paths by scraping links from this URL.
 
         Uses the path's ``listing`` configuration (default ``"auto"``).
@@ -334,23 +335,26 @@ class HTTPPath(CloudPathMixin):
             headers=self._merge_headers(None),
         )
         for link in urls:
-            # children keep the parent's listing config; _spawn copies it.
-            yield self._child(link.rstrip("/") or link, _trailing_slash=link.endswith("/"))
+            yield type(self)(
+                link,
+                listing=self._listing,
+                listing_attr=self._listing_attr,
+            )
 
     async def walk(
         self,
         top_down: bool = True,
         on_error: Callable[[OSError], object] | None = None,
         follow_symlinks: bool = False,
-    ) -> AsyncIterator[tuple[T, list[str], list[str]]]:
+    ) -> AsyncIterator[tuple[Self, list[str], list[str]]]:
         """Recursively walk the listing tree, yielding (root, dirs, files).
 
         ``follow_symlinks`` is accepted for API parity; HTTP listings have no symlinks.
         """
         if self._resolve_listing() is None:
             raise ValueError("HTTPPath.walk() called with listing=None")
-        dirs: list[T] = []
-        files: list[T] = []
+        dirs: list[Self] = []
+        files: list[Self] = []
         try:
             async for child in self.iterdir():
                 if child._trailing_slash:
@@ -372,7 +376,9 @@ class HTTPPath(CloudPathMixin):
         if not top_down:
             yield self, [d.name for d in dirs], [f.name for f in files]
 
-    async def glob(self, pattern: str, *, case_sensitive: bool | None = None) -> AsyncIterator[T]:
+    async def glob(
+        self, pattern: str, *, case_sensitive: bool | None = None
+    ) -> AsyncIterator[Self]:
         """Match descendants against a glob pattern (uses ``listing``)."""
         if self._resolve_listing() is None:
             raise ValueError("HTTPPath.glob() called with listing=None")
@@ -409,10 +415,10 @@ class HTTPPath(CloudPathMixin):
             case _:
                 return text.replace(newline, "\n")
 
-    async def rename(self, target: str, *, force: bool = False) -> T:
+    async def rename(self, target: str, *, force: bool = False) -> Self:
         return await super().rename(target, force=force)
 
-    async def replace(self, target: str) -> T:
+    async def replace(self, target: str) -> Self:
         return await self.rename(target, force=True)
 
     async def touch(self, mode: int = 0o666, exist_ok: bool = True) -> None:
@@ -433,13 +439,15 @@ class HTTPPath(CloudPathMixin):
         except Exception as e:
             raise OSError(f"Failed to delete {self}: {e}") from None
 
-    async def rglob(self, pattern: str, *, case_sensitive: bool | None = None) -> AsyncIterator[T]:
+    async def rglob(
+        self, pattern: str, *, case_sensitive: bool | None = None
+    ) -> AsyncIterator[Self]:
         if self._resolve_listing() is None:
             raise ValueError("HTTPPath.rglob() called with listing=None")
         async for entry in self.glob(pattern, case_sensitive=case_sensitive):
             yield entry
 
-    async def rmdir(self) -> None:
+    async def rmdir(self, *, recursive: bool = False) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support rmdir")
 
     async def stat(self, *, follow_symlinks: bool = True):
