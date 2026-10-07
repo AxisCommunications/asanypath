@@ -46,7 +46,7 @@ from os import getenv
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NoReturn, overload
+from typing import IO, TYPE_CHECKING, NoReturn, overload
 
 from asanypath_native import (
     ssh_disconnect_all,
@@ -62,6 +62,7 @@ from asanypath_native import (
     ssh_stat,
     ssh_unlink,
     ssh_write,
+    ssh_write_chunk,
 )
 
 from asanypath.cloud import CloudPathMixin
@@ -170,6 +171,10 @@ class SSHPath(CloudPathMixin):
 
     protocol: str = "ssh"
     _supports_range_read: bool = True
+    # Large objects stream to the remote file in chunks (first truncates, rest
+    # append) instead of buffering the whole payload in memory.
+    _STREAM_THRESHOLD = 8 * 1024 * 1024
+    _STREAM_CHUNK = 8 * 1024 * 1024
 
     def __init__(
         self,
@@ -457,6 +462,29 @@ class SSHPath(CloudPathMixin):
             return await ssh_write(path=self._item_path, data=data, **self._native_kwargs)
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
+
+    async def _upload_buffer(
+        self, fileobj: IO[bytes], size: int, *, backend_options: BackendOptions | None = None
+    ) -> None:
+        """Stream large objects chunk-by-chunk (bounded memory) via APPEND writes."""
+        if size < self._STREAM_THRESHOLD:
+            await self.write_bytes(fileobj.read())
+            return
+        truncate = True
+        while True:
+            chunk = fileobj.read(self._STREAM_CHUNK)
+            if not chunk:
+                break
+            try:
+                await ssh_write_chunk(
+                    path=self._item_path,
+                    data=chunk,
+                    truncate=truncate,
+                    **self._native_kwargs,
+                )
+            except Exception as e:  # noqa: BLE001
+                _map_native_error(e, str(self))
+            truncate = False
 
     async def _range_read(self, start: int, end: int) -> bytes:
         try:

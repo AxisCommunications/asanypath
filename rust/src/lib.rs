@@ -112,6 +112,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ssh::ssh_read, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_read_range, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_write, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_write_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_exists, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_stat, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_lstat, m)?)?;
