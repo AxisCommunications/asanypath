@@ -417,3 +417,40 @@ def test_artifactory_loads_token_from_jfrog_cli_conf(tmp_path, monkeypatch):
             assert p._token == "CONFTOKEN"
         finally:
             ArtifactoryPath._env_config = None
+
+
+@pytest.mark.asyncio
+async def test_open_write_small_uses_single_put():
+    p = _make_artifactory_path()
+    mock_write = AsyncMock()
+    stream = AsyncMock()
+    with (
+        patch.object(type(p), "write_bytes", new=mock_write),
+        patch("asanypath.artifactory.art_put_stream", new=stream),
+    ):
+        async with p.open("wb") as f:
+            f.write(b"small artifactory payload")
+    mock_write.assert_awaited_once_with(b"small artifactory payload")
+    stream.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_write_large_streams_from_disk():
+    p = _make_artifactory_path()
+    payload = b"Z" * (ArtifactoryPath._STREAM_THRESHOLD + 4096)
+    captured = {}
+
+    async def put_stream(*, file_path, size, key, **kwargs):
+        with open(file_path, "rb") as fh:
+            captured["data"] = fh.read()
+        captured["size"] = size
+        captured["key"] = key
+
+    with patch("asanypath.artifactory.art_put_stream", new=put_stream):
+        async with p.open("wb") as f:
+            f.write(payload)
+
+    # Streamed from a real on-disk file whose contents match the payload.
+    assert captured["size"] == len(payload)
+    assert captured["data"] == payload
+    assert captured["key"] == p._item_path
