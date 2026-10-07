@@ -75,6 +75,8 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(azure::az_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_head_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(azure::az_put_block, m)?)?;
+    m.add_function(wrap_pyfunction!(azure::az_put_block_list, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_is_dir_batch, m)?)?;

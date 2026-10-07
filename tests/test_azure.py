@@ -478,3 +478,44 @@ async def test_presign_no_credentials_raises(monkeypatch):
     p = _make_azure_path("az://container/blob/file.txt", account_key=None)
     with pytest.raises(ValueError, match="presign requires"):
         await p.presign()
+
+
+@pytest.mark.asyncio
+async def test_open_write_small_uses_single_put():
+    p = _make_azure_path("az://container/small.bin")
+    mock_write = AsyncMock()
+    block = AsyncMock()
+    with (
+        patch.object(type(p), "write_bytes", new=mock_write),
+        patch("asanypath.azure.az_put_block", new=block),
+    ):
+        async with p.open("wb") as f:
+            f.write(b"small azure payload")
+    mock_write.assert_awaited_once_with(b"small azure payload")
+    block.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_write_large_uses_block_blob():
+    p = _make_azure_path("az://container/big.bin")
+    part = AzurePath._MULTIPART_PART_SIZE
+    payload = b"A" * part + b"B" * part + b"C" * 55
+    staged: list[tuple[str, bytes]] = []
+    committed: dict = {}
+
+    async def put_block(*, block_id, data, **kwargs):
+        staged.append((block_id, data))
+
+    async def put_block_list(*, block_ids, **kwargs):
+        committed["ids"] = block_ids
+
+    with (
+        patch("asanypath.azure.az_put_block", new=put_block),
+        patch("asanypath.azure.az_put_block_list", new=put_block_list),
+    ):
+        async with p.open("wb") as f:
+            f.write(payload)
+
+    assert b"".join(d for _, d in staged) == payload  # blocks reassemble intact
+    assert committed["ids"] == [bid for bid, _ in staged]  # committed in order
+    assert len(set(len(bid) for bid in committed["ids"])) == 1  # equal-length ids
