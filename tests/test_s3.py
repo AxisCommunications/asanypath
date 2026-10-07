@@ -567,3 +567,79 @@ async def test_presign_invalid_expires():
         await p.presign(expires=0)
     with pytest.raises(ValueError, match="between 1 and 604800"):
         await p.presign(expires=700000)
+
+
+@pytest.mark.asyncio
+async def test_open_write_small_uses_single_put():
+    p = _make_s3path("s3://mybucket/small.bin")
+    payload = b"small payload"
+    mock_write = AsyncMock()
+    create = AsyncMock()
+    with (
+        patch.object(type(p), "write_bytes", new=mock_write),
+        patch("asanypath.s3.s3_create_multipart", new=create),
+    ):
+        async with p.open("wb") as f:
+            f.write(payload)
+    mock_write.assert_awaited_once_with(payload)
+    create.assert_not_awaited()  # below threshold → no multipart
+
+
+@pytest.mark.asyncio
+async def test_open_write_large_uses_multipart():
+    p = _make_s3path("s3://mybucket/big.bin")
+    part = S3Path._MULTIPART_PART_SIZE
+    payload = b"A" * part + b"B" * part + b"C" * 100  # two full parts + remainder
+    received: list[tuple[int, bytes]] = []
+    completed: dict = {}
+
+    async def create(**kwargs):
+        return "UPID"
+
+    async def upload_part(*, part_number, data, **kwargs):
+        received.append((part_number, data))
+        return f'"etag{part_number}"'
+
+    async def complete(*, upload_id, parts, **kwargs):
+        completed["upload_id"] = upload_id
+        completed["parts"] = parts
+
+    abort = AsyncMock()
+    with (
+        patch("asanypath.s3.s3_create_multipart", new=create),
+        patch("asanypath.s3.s3_upload_part", new=upload_part),
+        patch("asanypath.s3.s3_complete_multipart", new=complete),
+        patch("asanypath.s3.s3_abort_multipart", new=abort),
+    ):
+        async with p.open("wb") as f:
+            f.write(payload)
+
+    assert [n for n, _ in received] == [1, 2, 3]
+    assert b"".join(d for _, d in received) == payload  # parts reassemble intact
+    assert completed["upload_id"] == "UPID"
+    assert completed["parts"] == [(1, '"etag1"'), (2, '"etag2"'), (3, '"etag3"')]
+    abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multipart_aborts_on_error():
+    p = _make_s3path("s3://mybucket/big.bin")
+    payload = b"A" * (S3Path._MULTIPART_THRESHOLD + 10)
+
+    async def create(**kwargs):
+        return "UPID"
+
+    async def upload_part(**kwargs):
+        raise RuntimeError("part failed")
+
+    abort = AsyncMock()
+    with (
+        patch("asanypath.s3.s3_create_multipart", new=create),
+        patch("asanypath.s3.s3_upload_part", new=upload_part),
+        patch("asanypath.s3.s3_complete_multipart", new=AsyncMock()),
+        patch("asanypath.s3.s3_abort_multipart", new=abort),
+        pytest.raises(RuntimeError, match="part failed"),
+    ):
+        async with p.open("wb") as f:
+            f.write(payload)
+    abort.assert_awaited_once()

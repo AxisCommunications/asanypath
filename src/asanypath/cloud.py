@@ -353,6 +353,20 @@ class CloudPathMixin(CommonPurePathMixin):
             return await self.write_bytes(encoded)
         return await self.write_bytes(encoded, backend_options=backend_options)
 
+    async def _upload_buffer(
+        self, fileobj: IO[bytes], size: int, *, backend_options: BackendOptions | None = None
+    ) -> None:
+        """Upload a spooled write buffer (default: a single PUT of the whole buffer).
+
+        Backends with native multipart override this to bound memory for large
+        objects; ``size`` is the byte length and ``fileobj`` is positioned at 0.
+        """
+        data = fileobj.read()
+        if backend_options is None:
+            await self.write_bytes(data)
+        else:
+            await self.write_bytes(data, backend_options=backend_options)
+
     async def unlink(self, missing_ok: bool = False) -> None:
         """Delete object."""
         try:
@@ -1033,16 +1047,15 @@ class _CloudFile:
             )
         return reader
 
-    def _flush_write(self) -> bytes:
-        """Extract buffered write data."""
+    def _spool_for_upload(self) -> tuple[IO[bytes], int]:
+        """Flush any text layer and rewind the spool; return ``(buffer, size)``."""
         if self._text_wrapper is not None:
             self._text_wrapper.flush()
         buf = self._buf
         assert buf is not None
-        if isinstance(buf, io.BytesIO):
-            return buf.getvalue()
+        size = buf.seek(0, io.SEEK_END)
         buf.seek(0)
-        return buf.read()
+        return buf, size
 
     def _get_size(self, headers: dict) -> int | None:
         """Extract content-length from HEAD response headers."""
@@ -1083,19 +1096,18 @@ class _CloudFile:
     def __exit__(self, exc_type, exc_val, exc_tb):
         from asanypath.sync import _SyncRunner
 
-        if ("w" in self._mode or "a" in self._mode) and exc_type is None:
-            data = self._flush_write()
-            if self._backend_options is None:
-                _SyncRunner.get().run(self._path.write_bytes(data))
-            else:
+        try:
+            if ("w" in self._mode or "a" in self._mode) and exc_type is None:
+                buf, size = self._spool_for_upload()
                 _SyncRunner.get().run(
-                    self._path.write_bytes(data, backend_options=self._backend_options)
+                    self._path._upload_buffer(buf, size, backend_options=self._backend_options)
                 )
-        if self._reader is not None:
-            self._reader.close()
-        if self._buf is not None:
-            self._buf.close()
-        self._closed = True
+        finally:
+            if self._reader is not None:
+                self._reader.close()
+            if self._buf is not None:
+                self._buf.close()
+            self._closed = True
         return False  # pragma: no cover
 
     # ------------------------------------------------------------------
@@ -1122,15 +1134,14 @@ class _CloudFile:
         return self._make_buffer()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if ("w" in self._mode or "a" in self._mode) and exc_type is None:
-            data = self._flush_write()
-            if self._backend_options is None:
-                await self._path.write_bytes(data)
-            else:
-                await self._path.write_bytes(data, backend_options=self._backend_options)
-        if self._reader is not None:
-            self._reader.close()
-        if self._buf is not None:
-            self._buf.close()
-        self._closed = True
+        try:
+            if ("w" in self._mode or "a" in self._mode) and exc_type is None:
+                buf, size = self._spool_for_upload()
+                await self._path._upload_buffer(buf, size, backend_options=self._backend_options)
+        finally:
+            if self._reader is not None:
+                self._reader.close()
+            if self._buf is not None:
+                self._buf.close()
+            self._closed = True
         return False  # pragma: no cover

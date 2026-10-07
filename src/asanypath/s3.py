@@ -7,13 +7,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import cast
 
 import msgspec
 from asanypath_native import (
+    s3_abort_multipart,
+    s3_complete_multipart,
     s3_copy_batch,
+    s3_create_multipart,
     s3_delete_batch,
     s3_exists_batch,
     s3_get_acl,
@@ -27,6 +31,17 @@ from asanypath_native import (
     s3_presign,
     s3_put_acl,
     s3_put_batch,
+    s3_upload_part,
+)
+from yarl import URL
+
+from asanypath.cloud import CloudPathMixin
+from asanypath.options import (
+    AccessAction,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
 )
 from yarl import URL
 
@@ -50,6 +65,9 @@ def _default_s3_endpoint(region: str) -> str:
 class S3Path(CloudPathMixin):
     protocol: str = "s3"
     _supports_range_read: bool = True
+    # AWS CLI defaults: single PUT below the threshold, else fixed-size parts.
+    _MULTIPART_THRESHOLD = 8 * 1024 * 1024
+    _MULTIPART_PART_SIZE = 8 * 1024 * 1024
 
     @staticmethod
     def _batcher_key_fn(
@@ -168,6 +186,51 @@ class S3Path(CloudPathMixin):
     # ------------------------------------------------------------------
     # Backend-specific operations
     # ------------------------------------------------------------------
+
+    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+        """Upload a spooled write buffer, using multipart for large objects."""
+        if size < self._MULTIPART_THRESHOLD:
+            data = fileobj.read()
+            if backend_options is None:
+                await self.write_bytes(data)
+            else:
+                await self.write_bytes(data, backend_options=backend_options)
+            return
+        await self._multipart_upload(fileobj, backend_options=backend_options)
+
+    async def _multipart_upload(self, fileobj, *, backend_options=None) -> None:
+        """Stream the buffer to S3 as multipart parts (memory bounded to one part)."""
+        options_json = (
+            msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
+        )
+        native_kwargs = await self._get_native_kwargs()
+        upload_id = await s3_create_multipart(
+            key=self._item_path, options_json=options_json, **native_kwargs
+        )
+        parts: list[tuple[int, str]] = []
+        try:
+            part_number = 1
+            while True:
+                chunk = fileobj.read(self._MULTIPART_PART_SIZE)
+                if not chunk:
+                    break
+                etag = await s3_upload_part(
+                    key=self._item_path,
+                    upload_id=upload_id,
+                    part_number=part_number,
+                    data=chunk,
+                    **native_kwargs,
+                )
+                parts.append((part_number, etag))
+                part_number += 1
+            await s3_complete_multipart(
+                key=self._item_path, upload_id=upload_id, parts=parts, **native_kwargs
+            )
+        except BaseException:
+            with suppress(Exception):
+                await s3_abort_multipart(key=self._item_path, upload_id=upload_id, **native_kwargs)
+            raise
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def is_dir(self) -> bool:
         """Check if path is a directorish."""
