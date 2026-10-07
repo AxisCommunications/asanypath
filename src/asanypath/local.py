@@ -592,11 +592,10 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
                 maybe_mkdir = remote_dst.parent.mkdir(parents=True, exist_ok=True)
                 if inspect.isawaitable(maybe_mkdir):
                     await maybe_mkdir
-                data = await self.read_bytes()
-                written = remote_dst.write_bytes(data)
-                if inspect.isawaitable(written):
-                    written = await written
-                return written if isinstance(written, int) else len(data)
+                size = self._path.stat().st_size
+                with self._path.open("rb") as src_file:
+                    await remote_dst._upload_buffer(src_file, size)
+                return size
 
             async def _copy_remote_tree() -> int:
                 total = 0
@@ -616,11 +615,10 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
                         maybe_mkdir = destination_file.parent.mkdir(parents=True, exist_ok=True)
                         if inspect.isawaitable(maybe_mkdir):
                             await maybe_mkdir
-                        data = await source_file.read_bytes()
-                        written = destination_file.write_bytes(data)
-                        if inspect.isawaitable(written):
-                            written = await written
-                        total += written if isinstance(written, int) else len(data)
+                        size = source_file._path.stat().st_size
+                        with source_file._path.open("rb") as src_file:
+                            await destination_file._upload_buffer(src_file, size)
+                        total += size
                 return total
 
             async def _remove_tree() -> None:

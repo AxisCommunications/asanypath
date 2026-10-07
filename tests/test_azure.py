@@ -474,6 +474,7 @@ async def test_presign_no_credentials_raises(monkeypatch):
     monkeypatch.delenv("AZURE_STORAGE_ACCOUNT", raising=False)
     monkeypatch.delenv("AZURE_STORAGE_KEY", raising=False)
     monkeypatch.delenv("AZURE_STORAGE_SAS_TOKEN", raising=False)
+    monkeypatch.delenv("AZURE_STORAGE_CONNECTION_STRING", raising=False)
     p = _make_azure_path("az://container/blob/file.txt", account_key=None)
     with pytest.raises(ValueError, match="presign requires"):
         await p.presign()
