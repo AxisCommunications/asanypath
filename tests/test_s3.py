@@ -643,3 +643,39 @@ async def test_multipart_aborts_on_error():
         async with p.open("wb") as f:
             f.write(payload)
     abort.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_local_to_s3_copy_streams_multipart(tmp_path):
+    # Review regression: local->cloud copy must stream (multipart for S3), not
+    # read the whole file into memory.
+    from asanypath import AsAnyPath
+
+    part = S3Path._MULTIPART_PART_SIZE
+    payload = b"A" * part + b"B" * 777
+    src = tmp_path / "big.bin"
+    src.write_bytes(payload)
+    dst = _make_s3path("s3://mybucket/dest.bin")
+
+    received: list[tuple[int, bytes]] = []
+
+    async def create(**kwargs):
+        return "UPID"
+
+    async def upload_part(*, part_number, data, **kwargs):
+        received.append((part_number, data))
+        return f'"etag{part_number}"'
+
+    with (
+        patch(
+            "asanypath.local.async_destination_state",
+            new=AsyncMock(return_value=(True, False, False)),
+        ),
+        patch("asanypath.s3.s3_create_multipart", new=create),
+        patch("asanypath.s3.s3_upload_part", new=upload_part),
+        patch("asanypath.s3.s3_complete_multipart", new=AsyncMock()),
+        patch("asanypath.s3.s3_abort_multipart", new=AsyncMock()),
+    ):
+        await AsAnyPath(str(src)).copy(dst)
+
+    assert b"".join(d for _, d in received) == payload  # streamed as parts, intact
