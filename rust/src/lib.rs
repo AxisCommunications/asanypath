@@ -60,6 +60,8 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gcs::gcs_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_head_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs::gcs_start_resumable, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs::gcs_upload_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_is_dir_batch, m)?)?;
