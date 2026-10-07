@@ -15,6 +15,6 @@ class PinNativeHook(MetadataHookInterface):
         metadata["dependencies"] = [
             "anyio>=4",
             f"asanypath-native~={major}.{minor}.0",
-            "msgspec>=0.21.1",
+            "msgspec>=0.22.0",
             "yarl>=1.2",
         ]
