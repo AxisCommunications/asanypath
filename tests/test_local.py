@@ -120,6 +120,9 @@ class _SyncRemoteDestination:
     def __truediv__(self, other):
         return self.children.setdefault(str(other), _SyncRemoteDestination())
 
+    async def _upload_buffer(self, fileobj, size, *, backend_options=None):
+        self.write_bytes(fileobj.read())
+
 
 async def test_async_copy_requires_force_for_different_existing_file(tmp_path):
     src = AsyncPath(tmp_path / "src.txt")
