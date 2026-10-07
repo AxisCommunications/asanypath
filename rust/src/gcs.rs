@@ -995,9 +995,10 @@ pub fn gcs_upload_chunk<'py>(
                 format!("bytes {offset}-{end}/{total}"),
             ),
         ];
-        let (status, body, _h) = do_request("PUT", &session_uri, &headers, Some(Bytes::from(data)), h2)
-            .await
-            .map_err(PyRuntimeError::new_err)?;
+        let (status, body, _h) =
+            do_request("PUT", &session_uri, &headers, Some(Bytes::from(data)), h2)
+                .await
+                .map_err(PyRuntimeError::new_err)?;
         // 308 Resume Incomplete = intermediate chunk accepted; 2xx = final chunk done.
         if status.as_u16() == 308 || status.is_success() {
             Ok(())
