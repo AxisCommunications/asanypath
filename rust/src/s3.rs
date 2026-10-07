@@ -1114,7 +1114,14 @@ pub fn s3_create_multipart<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let h2 = use_h2.unwrap_or(false);
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let creds = s3_creds!(
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token
+        );
         let options: crate::backend::UploadOptions =
             sonic_rs::from_str(&options_json.unwrap_or_else(|| "{}".to_string()))
                 .map_err(|e| PyValueError::new_err(format!("invalid backend_options: {e}")))?;
@@ -1152,16 +1159,30 @@ pub fn s3_upload_part<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let h2 = use_h2.unwrap_or(false);
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let creds = s3_creds!(
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token
+        );
         let s3_path = format!("/{key}");
         let query = vec![
             ("partNumber".to_string(), part_number.to_string()),
             ("uploadId".to_string(), upload_id),
         ];
-        let (status, body, headers) =
-            do_s3_request(&creds, "PUT", &s3_path, &query, Some(Bytes::from(data)), h2, &[])
-                .await
-                .map_err(PyRuntimeError::new_err)?;
+        let (status, body, headers) = do_s3_request(
+            &creds,
+            "PUT",
+            &s3_path,
+            &query,
+            Some(Bytes::from(data)),
+            h2,
+            &[],
+        )
+        .await
+        .map_err(PyRuntimeError::new_err)?;
         if !status.is_success() {
             return Err(status_to_pyerr(status, &creds.error_path(&key), &body));
         }
@@ -1187,7 +1208,14 @@ pub fn s3_complete_multipart<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let h2 = use_h2.unwrap_or(false);
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let creds = s3_creds!(
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token
+        );
         let mut xml = String::from("<CompleteMultipartUpload>");
         for (n, etag) in &parts {
             xml.push_str(&format!(
@@ -1240,7 +1268,14 @@ pub fn s3_abort_multipart<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let h2 = use_h2.unwrap_or(false);
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = s3_creds!(endpoint, bucket, region, access_key, secret_key, session_token);
+        let creds = s3_creds!(
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token
+        );
         let s3_path = format!("/{key}");
         let query = vec![("uploadId".to_string(), upload_id)];
         let (status, body, _h) = do_s3_request(&creds, "DELETE", &s3_path, &query, None, h2, &[])

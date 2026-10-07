@@ -43,16 +43,6 @@ from asanypath.options import (
     AccessPolicyPatch,
     BackendOptions,
 )
-from yarl import URL
-
-from asanypath.cloud import CloudPathMixin
-from asanypath.options import (
-    AccessAction,
-    AccessGrant,
-    AccessPolicy,
-    AccessPolicyPatch,
-    BackendOptions,
-)
 
 
 def _default_s3_endpoint(region: str) -> str:
