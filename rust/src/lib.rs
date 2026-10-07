@@ -91,6 +91,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Artifactory batch
     m.add_function(wrap_pyfunction!(artifactory::art_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(artifactory::art_put_stream, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(artifactory::art_list_batch, m)?)?;

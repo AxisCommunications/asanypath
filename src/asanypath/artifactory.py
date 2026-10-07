@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from os import getenv
@@ -31,6 +34,7 @@ from asanypath_native import (
     art_list_repos,
     art_put_batch,
     art_put_permission_target,
+    art_put_stream,
     art_storage_info,
 )
 
@@ -95,6 +99,9 @@ class ArtifactoryPath(CloudPathMixin):
 
     protocol: str = "art"
     _supports_range_read: bool = True
+    # Artifactory has no multipart API: large objects stream a single PUT body
+    # from disk (bounded memory) instead of buffering the whole object.
+    _STREAM_THRESHOLD = 8 * 1024 * 1024
     _copy_batch_fn = staticmethod(art_copy_batch)
 
     @staticmethod
@@ -193,6 +200,42 @@ class ArtifactoryPath(CloudPathMixin):
     # ------------------------------------------------------------------
     # Backend-specific operations
     # ------------------------------------------------------------------
+
+    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+        """Upload a spooled write buffer; large objects stream a single PUT from disk."""
+        if size < self._STREAM_THRESHOLD:
+            data = fileobj.read()
+            if backend_options is None:
+                await self.write_bytes(data)
+            else:
+                await self.write_bytes(data, backend_options=backend_options)
+            return
+        # Stream from a real file path when we have one (e.g. a local copy
+        # source); otherwise spill the anonymous buffer to a named temp file.
+        name = getattr(fileobj, "name", None)
+        if isinstance(name, str) and os.path.exists(name):
+            await self._stream_upload(name, size, backend_options=backend_options)
+            return
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            shutil.copyfileobj(fileobj, tmp, 1024 * 1024)
+            tmp_path = tmp.name
+        try:
+            await self._stream_upload(tmp_path, size, backend_options=backend_options)
+        finally:
+            os.unlink(tmp_path)
+
+    async def _stream_upload(self, file_path: str, size: int, *, backend_options=None) -> None:
+        options_json = (
+            msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
+        )
+        await art_put_stream(
+            key=self._item_path,
+            file_path=file_path,
+            size=size,
+            options_json=options_json,
+            **self._native_kwargs,
+        )
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def _storage_info(self) -> dict:
         """Fetch item metadata from the Artifactory storage API (cached).
