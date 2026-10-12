@@ -220,16 +220,16 @@ async def _run_concurrent_stream(
     total_bytes = 0
     total_started = time.monotonic()
     file_state: dict[int, dict[str, float]] = {}
+    # The Progress objects are rendered inside the explicit ``Live`` below; do
+    # not start them independently or two live displays register at once
+    # (raises "Only one live display may be active at once" on older Rich).
     if overall_progress is not None:
-        overall_progress.start()
         overall = overall_progress.add_task(
             f"{description}… (j={concurrency})",
             total=total if total is not None else 0,
             bytes_str="0 B",
             speed_str="0 B/s",
         )
-    if file_progress is not None:
-        file_progress.start()
 
     queue: asyncio.Queue[tuple[str, object] | None] = asyncio.Queue(maxsize=worker_count * 2)
 
@@ -419,10 +419,6 @@ async def _run_concurrent_stream(
             if overall_progress is not None and overall_progress.tasks
             else time.monotonic() - t0
         )
-        if file_progress is not None:
-            file_progress.stop()
-        if overall_progress is not None:
-            overall_progress.stop()
 
     for name, exc in failures:
         console.print(f"[red]error[/red] {name}: {exc}")

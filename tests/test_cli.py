@@ -1308,3 +1308,45 @@ def test_scp_style_unknown_host_not_rewritten(tmp_path, monkeypatch):
     SSHPath._env_config = None
     # No matching Host block -> passes through unchanged.
     assert _maybe_rewrite_scp_style("unknownhost:/path") == "unknownhost:/path"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stream_single_live_display(monkeypatch):
+    """Progress must register at most one live display at a time.
+
+    Regression for "Only one live display may be active at once": the progress
+    bars must render only inside the explicit ``Live``, never be started
+    independently (older Rich raises when a second live registers).
+    """
+    console = cli_module.console
+    depth = {"cur": 0, "max": 0}
+    orig_set = console.set_live
+    orig_clear = console.clear_live
+
+    def _set_live(live):
+        depth["cur"] += 1
+        depth["max"] = max(depth["max"], depth["cur"])
+        return orig_set(live)
+
+    def _clear_live():
+        depth["cur"] = max(0, depth["cur"] - 1)
+        return orig_clear()
+
+    monkeypatch.setattr(console, "set_live", _set_live)
+    monkeypatch.setattr(console, "clear_live", _clear_live)
+
+    async def _items():
+        async def _work(**kwargs):
+            return None
+
+        yield ("file", _work)
+
+    succeeded, failures, _elapsed = await cli_module._run_concurrent_stream(
+        _items(),
+        description="Copying",
+        verbosity=1,
+        concurrency=2,
+        show_transfer=True,
+    )
+    assert not failures
+    assert depth["max"] <= 1  # never two live displays active at once
