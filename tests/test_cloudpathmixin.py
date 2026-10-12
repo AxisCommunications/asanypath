@@ -753,7 +753,7 @@ class TestCloudFileHelpers:
         child_file.is_dir = AsyncMock(return_value=False)
         child_file.unlink = AsyncMock()
         child_dir.is_dir = AsyncMock(return_value=True)
-        child_dir.rmdir = AsyncMock()
+        child_dir._rmtree = AsyncMock()
 
         async def fake_root_iterdir(**kwargs):
             yield child_file
@@ -763,7 +763,7 @@ class TestCloudFileHelpers:
             await p.rmdir(recursive=True)
 
         child_file.unlink.assert_awaited_once()
-        child_dir.rmdir.assert_awaited_once_with(recursive=True)
+        child_dir._rmtree.assert_awaited_once_with()
 
     async def test_open_no_upload_on_exception(self, cloud_path):
         mock_write = AsyncMock()
