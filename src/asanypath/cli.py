@@ -40,6 +40,7 @@ from rich.table import Table
 from rich.text import Text
 
 from asanypath import AsAnyPath
+from asanypath._backend_opts import kwargs_for, parse_options
 from asanypath._transfer import TransferBudget, transfer_scope
 from asanypath._version import __version__
 from asanypath.asanypath import PROTOCOL_MAP
@@ -557,6 +558,60 @@ def _resolve_paths_arg(
     return paths
 
 
+_OPTS_META = "asanypath.backend_options"
+
+
+def _backend_options(two_sided: bool = False):
+    """Add -o SCHEME.KEY=VALUE (plus --src-option/--dst-option for two-path commands)."""
+
+    def make_callback(role: str):
+        def callback(ctx: click.Context, param: click.Parameter, value: tuple[str, ...]):
+            try:
+                parsed = parse_options(value)
+            except ValueError as e:
+                raise click.BadParameter(str(e), ctx=ctx, param=param) from None
+            ctx.meta.setdefault(_OPTS_META, {})[role] = parsed
+
+        return callback
+
+    def decorator(fn):
+        specs = [
+            (
+                "-o",
+                "--option",
+                "all",
+                "Backend option SCHEME.KEY=VALUE (repeatable), e.g. s3.profile=NAME",
+            )
+        ]
+        if two_sided:
+            specs += [
+                (None, "--src-option", "src", "Backend option for source paths only"),
+                (None, "--dst-option", "dst", "Backend option for destination paths only"),
+            ]
+        for short, long, role, help_text in reversed(specs):
+            names = [n for n in (short, long) if n]
+            fn = click.option(
+                *names,
+                "backend_options_" + role,
+                multiple=True,
+                expose_value=False,
+                callback=make_callback(role),
+                help=help_text,
+            )(fn)
+        return fn
+
+    return decorator
+
+
+def _make_path(path: str, kwargs: dict, role: str | None = None):
+    """Build a path, applying -o options (and --src/--dst-option for ``role``)."""
+    opts = click.get_current_context().meta.get(_OPTS_META, {})
+    extra = kwargs_for(path, opts.get("all", {}))
+    if role:
+        extra.update(kwargs_for(path, opts.get(role, {})))
+    return AsAnyPath(path, **{**kwargs, **extra})
+
+
 def _fmt_mode(mode: int) -> str:
     return f"({mode & 0o7777:04o}/{statmod.filemode(mode)})"
 
@@ -1030,6 +1085,7 @@ complete -o nosort -F _asanypath_completion asanypath
 @click.argument(
     "path", type=str, required=False, callback=_resolve_path_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 def exists(path: str, token: str | None):
     """Check if FILE exists at given path.
@@ -1046,7 +1102,7 @@ def exists(path: str, token: str | None):
             kwargs = {}
             if token:
                 kwargs["token"] = token
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
             result = await p.exists()
             if result:
                 console.print(f"[green]✓[/green] {path} exists")
@@ -1066,6 +1122,7 @@ def exists(path: str, token: str | None):
 @click.argument(
     "path", type=str, required=False, callback=_resolve_path_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 def stat(path: str, token: str | None):
     """Display file statistics for PATH.
@@ -1081,7 +1138,7 @@ def stat(path: str, token: str | None):
             kwargs = {}
             if token:
                 kwargs["token"] = token
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
 
             try:
                 st = await p.stat()
@@ -1169,6 +1226,7 @@ def stat(path: str, token: str | None):
 @click.argument(
     "path", type=str, required=False, callback=_resolve_path_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--binary", is_flag=True, help="Output as hex dump instead of text")
 def cat(path: str, token: str | None, binary: bool):
@@ -1186,7 +1244,7 @@ def cat(path: str, token: str | None, binary: bool):
             kwargs = {}
             if token:
                 kwargs["token"] = token
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
 
             if binary:
                 data = await p.read_bytes()
@@ -1213,6 +1271,7 @@ def cat(path: str, token: str | None, binary: bool):
 @click.argument(
     "path", default=".", required=False, callback=_rewrite_path_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--recursive", "-r", is_flag=True, help="Recursively list subtree as a tree")
 @click.option(
@@ -1285,7 +1344,7 @@ def ls(
                 kwargs["listing"] = listing
             if listing_attr:
                 kwargs["listing_attr"] = listing_attr
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
 
             color_mode = color.strip().lower()
             colors_enabled = color_mode != "off"
@@ -1460,6 +1519,7 @@ def ls(
 @click.argument(
     "path", type=str, required=False, callback=_resolve_path_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 def touch(path: str, token: str | None):
     """Create an empty file or update its timestamp.
@@ -1476,7 +1536,7 @@ def touch(path: str, token: str | None):
             kwargs = {}
             if token:
                 kwargs["token"] = token
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
             await p.touch(exist_ok=True)
             console.print(f"[green]\u2713[/green] Touched {path}")
             return 0
@@ -1495,6 +1555,7 @@ def touch(path: str, token: str | None):
 @click.argument(
     "path", type=str, required=False, callback=_resolve_path_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 def checksums(path: str, token: str | None):
     """Display checksums for a file.
@@ -1514,7 +1575,7 @@ def checksums(path: str, token: str | None):
             kwargs = {}
             if token:
                 kwargs["token"] = token
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
             result = await p.checksums()
             if not result:
                 console.print("[yellow]No checksums available[/yellow]")
@@ -1541,6 +1602,7 @@ def checksums(path: str, token: str | None):
 
 @cli.command("mkdir", short_help="Create directory", context_settings=CONTEXT_SETTINGS)
 @click.argument("path", type=str, required=False, callback=_resolve_path_arg)
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--parents", "-p", is_flag=True, help="Create parent directories")
 @click.option("--exist-ok", is_flag=True, help="Don't error if directory exists")
@@ -1559,7 +1621,7 @@ def mkdir(path: str, token: str | None, parents: bool, exist_ok: bool):
             kwargs = {}
             if token:
                 kwargs["token"] = token
-            p = AsAnyPath(path, **kwargs)
+            p = _make_path(path, kwargs)
 
             await p.mkdir(parents=parents, exist_ok=exist_ok)
             console.print(f"[green]✓[/green] Created {path}")
@@ -1585,6 +1647,7 @@ def mkdir(path: str, token: str | None, parents: bool, exist_ok: bool):
 @click.argument(
     "paths", nargs=-1, type=str, callback=_resolve_paths_arg, shell_complete=_path_complete
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--force", "-f", is_flag=True, help="Don't error if file doesn't exist")
 @click.option("--recursive", "recursive", "-r", is_flag=True, help="Remove directories recursively")
@@ -1608,7 +1671,7 @@ def rm(paths: tuple[str, ...], token: str | None, force: bool, recursive: bool, 
             if token:
                 kwargs["token"] = token
 
-            path_objs = [AsAnyPath(path, **kwargs) for path in paths]
+            path_objs = [_make_path(path, kwargs) for path in paths]
             for p in path_objs:
                 exists, is_dir = await _exists_or_virtual_dir(p)
                 if not exists and force:
@@ -1650,6 +1713,7 @@ def rm(paths: tuple[str, ...], token: str | None, force: bool, recursive: bool, 
 @click.argument(
     "paths", nargs=-1, type=str, callback=_rewrite_paths_arg, shell_complete=_path_complete
 )
+@_backend_options(two_sided=True)
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--force", "force", is_flag=True, help="Overwrite differing existing destinations")
 @click.option(
@@ -1716,8 +1780,8 @@ def mv(
             if token:
                 kwargs["token"] = token
 
-            src_objs = [AsAnyPath(src, **kwargs) for src in src_paths]
-            dst_obj = AsAnyPath(dst_path_raw, **kwargs)
+            src_objs = [_make_path(src, kwargs, "src") for src in src_paths]
+            dst_obj = _make_path(dst_path_raw, kwargs, "dst")
 
             dst_exists, dst_is_dir = await _exists_or_virtual_dir(dst_obj)
             # A trailing separator ("dir/", or a bare "host:" that expands to
@@ -1801,6 +1865,7 @@ def mv(
 @click.argument(
     "paths", nargs=-1, type=str, callback=_rewrite_paths_arg, shell_complete=_path_complete
 )
+@_backend_options(two_sided=True)
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--force", "force", is_flag=True, help="Overwrite differing existing destinations")
 @click.option(
@@ -1894,14 +1959,14 @@ def cp(
             # Handle '-' as stdin source
             if src_paths == ["-"]:
                 content = sys.stdin.buffer.read()
-                dst_obj = AsAnyPath(dst_path_raw, **kwargs)
+                dst_obj = _make_path(dst_path_raw, kwargs, "dst")
                 await dst_obj.write_bytes(content)
                 if verbosity:
                     console.print(f"  [dim]stdin → {dst_path_raw}[/dim]")
                 return 0
 
-            src_objs = [AsAnyPath(src, **kwargs) for src in src_paths]
-            dst_obj = AsAnyPath(dst_path_raw, **kwargs)
+            src_objs = [_make_path(src, kwargs, "src") for src in src_paths]
+            dst_obj = _make_path(dst_path_raw, kwargs, "dst")
 
             dst_exists, dst_is_dir = await _exists_or_virtual_dir(dst_obj)
             # A trailing separator ("dir/", or a bare "host:" that expands to
@@ -2218,6 +2283,7 @@ async def _needs_sync(
     type=click.Choice(["GET", "PUT", "HEAD", "DELETE"]),
     help="HTTP method the URL will be used for",
 )
+@_backend_options()
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 def presign(path: str, expires: int, method: str, token: str | None) -> None:
     """Generate a presigned URL for a cloud object.
@@ -2230,7 +2296,7 @@ def presign(path: str, expires: int, method: str, token: str | None) -> None:
         kwargs = {}
         if token:
             kwargs["token"] = token
-        p = AsAnyPath(path, **kwargs)
+        p = _make_path(path, kwargs)
         return await p.presign(expires=expires, method=method)
 
     try:
@@ -2244,6 +2310,7 @@ def presign(path: str, expires: int, method: str, token: str | None) -> None:
 @cli.command("sync", short_help="Sync directories", context_settings=CONTEXT_SETTINGS)
 @click.argument("src", type=str, shell_complete=_path_complete)
 @click.argument("dst", type=str, shell_complete=_path_complete)
+@_backend_options(two_sided=True)
 @click.option("--token", default=None, help="Bearer token for authenticated backends")
 @click.option("--delete", "delete_extra", is_flag=True, help="Delete files in DST not in SRC")
 @click.option(
@@ -2319,8 +2386,8 @@ def sync(
             if listing_attr:
                 kwargs["listing_attr"] = listing_attr
 
-            src_obj = AsAnyPath(src, **kwargs)
-            dst_obj = AsAnyPath(dst, **kwargs)
+            src_obj = _make_path(src, kwargs, "src")
+            dst_obj = _make_path(dst, kwargs, "dst")
 
             # Ensure src exists
             src_exists, src_is_dir = await _exists_or_virtual_dir(src_obj)
