@@ -11,6 +11,7 @@ import os
 import shutil
 import typing
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import aclosing
 from pathlib import Path
 
 from anyio import Path as AnyIOPath
@@ -25,6 +26,7 @@ from asanypath._transfer import (
     has_async_transfer_api,
     has_write_api,
     is_remote_destination,
+    iter_transfer_chunks,
     local_copy_file_sync,
     require_force,
     run_sync_maybe,
@@ -740,6 +742,7 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
         self,
         src,
         *,
+        remove_src: bool = False,
         force: bool = False,
         atomic: bool = False,
         chunk_size: int | None = None,
@@ -755,9 +758,11 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
 
         async def _emit_progress(delta: int) -> None:
             nonlocal transferred
-            if on_progress is None or delta <= 0:
+            if delta <= 0:
                 return
             transferred += delta
+            if on_progress is None:
+                return
             maybe = on_progress(delta, transferred, src, self)
             if inspect.isawaitable(maybe):
                 await maybe
@@ -780,17 +785,19 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
             total = 0
             try:
                 with target_path.open("wb") as dst_file:
-                    if chunk_size and getattr(src, "_supports_range_read", False):
-                        async for chunk in src.iter_bytes(chunk_size):
-                            dst_file.write(chunk)
-                            total += len(chunk)
-                            await _emit_progress(len(chunk))
-                    elif chunk_size:
-                        raise NotImplementedError("chunk_size is not supported for this source")
+                    if chunk_size != 0:
+                        if chunk_size and not getattr(src, "_supports_range_read", False):
+                            raise NotImplementedError("chunk_size is not supported for this source")
+                        async with aclosing(iter_transfer_chunks(src, chunk_size)) as chunks:
+                            async for chunk in chunks:
+                                dst_file.write(chunk)
+                                total += len(chunk)
+                                await _emit_progress(len(chunk))
                     else:
                         data = await src.read_bytes()
                         dst_file.write(data)
                         total = len(data)
+                        await _emit_progress(total)
                 if atomic:
                     await to_thread.run_sync(
                         lambda: _commit_temp_sync(target_path, self._path, force=force)
@@ -806,6 +813,8 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
                 src=src,
                 dst=self,
                 copy_fn=_copy_file,
+                remove_fn=src.unlink if remove_src else None,
+                remove_src=remove_src and str(src) != str(self),
                 on_progress=None,
                 on_done=None,
             )

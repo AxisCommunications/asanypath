@@ -40,6 +40,7 @@ from rich.table import Table
 from rich.text import Text
 
 from asanypath import AsAnyPath
+from asanypath._transfer import TransferBudget, transfer_scope
 from asanypath._version import __version__
 from asanypath.asanypath import PROTOCOL_MAP
 
@@ -173,6 +174,7 @@ async def _run_concurrent(
     verbosity: int,
     concurrency: int,
     show_transfer: bool = False,
+    concurrency_floor: int = DEFAULT_CONCURRENCY,
 ) -> tuple[int, list[tuple[str, BaseException]], float]:
     """Run a pre-collected list of work items concurrently."""
 
@@ -186,6 +188,7 @@ async def _run_concurrent(
         verbosity=verbosity,
         concurrency=concurrency,
         show_transfer=show_transfer,
+        concurrency_floor=concurrency_floor,
         total=len(items),
     )
 
@@ -198,6 +201,7 @@ async def _run_concurrent_stream(
     concurrency: int,
     show_transfer: bool = False,
     total: int | None = None,
+    concurrency_floor: int = DEFAULT_CONCURRENCY,
 ) -> tuple[int, list[tuple[str, BaseException]], float]:
     """Run items from an async stream with up to ``concurrency`` workers."""
     style = (
@@ -382,13 +386,15 @@ async def _run_concurrent_stream(
                 if item is None:
                     return
                 name, work = item
-                await _run_one(name, work)
+                async with transfer_scope():
+                    await _run_one(name, work)
             finally:
                 queue.task_done()
 
     t0 = time.monotonic()
     producer_task = asyncio.create_task(_producer())
-    worker_tasks = [asyncio.create_task(_worker()) for _ in range(worker_count)]
+    with TransferBudget(floor=concurrency_floor, ceiling=max(concurrency_floor, worker_count)):
+        worker_tasks = [asyncio.create_task(_worker()) for _ in range(worker_count)]
     refresh_task = asyncio.create_task(_refresh_metrics())
     live_ctx = contextlib.nullcontext()
     if overall_progress is not None:
@@ -1672,6 +1678,12 @@ def rm(paths: tuple[str, ...], token: str | None, force: bool, recursive: bool, 
     type=click.IntRange(min=1),
     help=f"Maximum parallel moves (default: {DEFAULT_CONCURRENCY})",
 )
+@click.option(
+    "--concurrency-floor",
+    default=DEFAULT_CONCURRENCY,
+    type=click.IntRange(min=1),
+    help="Target transfer streams when few large files are active (default: 8; 1 disables ranges)",
+)
 def mv(
     paths: tuple[str, ...],
     token: str | None,
@@ -1680,6 +1692,7 @@ def mv(
     chunk_size: int | None,
     verbosity: int,
     concurrency: int,
+    concurrency_floor: int,
 ):
     """Move/rename files or directories.
 
@@ -1757,6 +1770,7 @@ def mv(
                 description="Moving",
                 verbosity=verbosity,
                 concurrency=concurrency,
+                concurrency_floor=concurrency_floor,
                 show_transfer=True,
                 total=len(items),
             )
@@ -1817,6 +1831,12 @@ def mv(
     help=f"Maximum parallel copies (default: {DEFAULT_CONCURRENCY})",
 )
 @click.option(
+    "--concurrency-floor",
+    default=DEFAULT_CONCURRENCY,
+    type=click.IntRange(min=1),
+    help="Target transfer streams when few large files are active (default: 8; 1 disables ranges)",
+)
+@click.option(
     "--listing",
     default=None,
     help="HTTP directory-listing mode: 'python', 'apache', 'nginx', or a CSS selector.",
@@ -1835,6 +1855,7 @@ def cp(
     recursive: bool,
     verbosity: int,
     concurrency: int,
+    concurrency_floor: int,
     listing: str | None,
     listing_attr: str | None,
 ):
@@ -1958,6 +1979,7 @@ def cp(
                 description="Copying",
                 verbosity=verbosity,
                 concurrency=concurrency,
+                concurrency_floor=concurrency_floor,
                 show_transfer=True,
             )
             if failures:
@@ -2056,11 +2078,15 @@ async def _copy_with_progress_fallback(
 ):
     """Run copy and backfill progress from destination size when callbacks are absent."""
     progress_emitted = False
-    last_polled = 0
+    last_reported = 0
 
     async def _progress_cb(delta: int, transferred: int, src, dst):
         nonlocal progress_emitted
+        nonlocal last_reported
         progress_emitted = True
+        transferred = max(last_reported, transferred)
+        delta = transferred - last_reported
+        last_reported = transferred
         await _emit_progress(on_progress, delta, transferred, src, dst)
 
     monitor_task = None
@@ -2071,13 +2097,17 @@ async def _copy_with_progress_fallback(
     ):
 
         async def _monitor() -> None:
-            nonlocal last_polled
+            nonlocal last_reported
             while True:
                 await asyncio.sleep(poll_interval)
+                if progress_emitted:
+                    return
                 size = await _get_size(dst_obj)
-                if isinstance(size, int) and size > last_polled:
-                    delta = size - last_polled
-                    last_polled = size
+                if progress_emitted:
+                    return
+                if isinstance(size, int) and size > last_reported:
+                    delta = size - last_reported
+                    last_reported = size
                     await _emit_progress(on_progress, delta, size, src_obj, dst_obj)
 
         monitor_task = asyncio.create_task(_monitor())
@@ -2092,10 +2122,10 @@ async def _copy_with_progress_fallback(
 
     if on_progress is not None and not progress_emitted:
         final_size = await _get_size(dst_obj)
-        if isinstance(final_size, int) and final_size > last_polled:
+        if isinstance(final_size, int) and final_size > last_reported:
             await _emit_progress(
                 on_progress,
-                final_size - last_polled,
+                final_size - last_reported,
                 final_size,
                 src_obj,
                 dst_obj,
@@ -2234,6 +2264,12 @@ def presign(path: str, expires: int, method: str, token: str | None) -> None:
     type=click.IntRange(min=1),
     help=f"Maximum parallel transfers (default: {DEFAULT_CONCURRENCY})",
 )
+@click.option(
+    "--concurrency-floor",
+    default=DEFAULT_CONCURRENCY,
+    type=click.IntRange(min=1),
+    help="Target transfer streams when few large files are active (default: 8; 1 disables ranges)",
+)
 @click.option("--exclude", multiple=True, help="Exclude files matching glob pattern (repeatable)")
 @click.option(
     "--listing",
@@ -2254,6 +2290,7 @@ def sync(
     size_only: bool,
     verbosity: int,
     concurrency: int,
+    concurrency_floor: int,
     exclude: tuple[str, ...],
     listing: str | None,
     listing_attr: str | None,
@@ -2393,6 +2430,7 @@ def sync(
                 description="Syncing",
                 verbosity=verbosity,
                 concurrency=concurrency,
+                concurrency_floor=concurrency_floor,
                 show_transfer=True,
                 total=len(transfer_items),
             )

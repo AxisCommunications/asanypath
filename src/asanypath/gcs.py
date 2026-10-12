@@ -211,7 +211,12 @@ class GCSPath(CloudPathMixin):
         mtime = None
         if updated:
             mtime = datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
-        return SimpleNamespace(st_size=size, st_ctime=mtime, st_mtime=mtime)
+        return SimpleNamespace(
+            st_size=size,
+            st_ctime=mtime,
+            st_mtime=mtime,
+            version_id=data.get("generation"),
+        )
 
     async def checksums(self) -> dict[str, str]:
         """Return checksums from object metadata."""

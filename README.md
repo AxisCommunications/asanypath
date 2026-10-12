@@ -90,6 +90,46 @@ await src.copy(dst, recursive=True)
 await path.rmdir(recursive=True)
 ```
 
+Copies automatically use spare transfer concurrency for large ranged reads.
+The default target is 8 streams, with an 8 MiB minimum range size and at most
+8 range streams per file. Files smaller than 16 MiB stay single-stream. When
+enough files are active to meet the target, automatic copies use one request
+per file instead of adding ranges. The target is best-effort, not a minimum
+number of requests that must always be launched.
+
+S3, GCS, Azure, Artifactory, SSH, and range-capable HTTP/HTTPS sources use the
+shared reader for local downloads and source reads in cross-backend copies.
+FTP/FTPS, sources without size metadata, and HTTP servers without advertised
+range support retain single-stream downloads. Local-only copies and native
+server-side copy/rename operations retain their existing implementations.
+Uploads remain single writes; this does not introduce multipart uploads.
+
+Concurrent library copies share a default budget within the event loop. To
+configure a batch explicitly:
+
+```python
+import asyncio
+from asanypath import TransferBudget
+
+with TransferBudget(floor=8, ceiling=32, min_range_size=8 * 1024 * 1024, per_file_cap=8):
+    await asyncio.gather(*(src.copy(dst) for src, dst in pairs))
+```
+
+The ceiling bounds concurrent reads in this budget, not metadata requests or
+other processes. Parallel range buffers are bounded by the active streams
+times the range size; cross-backend destinations still buffer the complete
+object for their existing write API. `floor=1` disables automatic splitting.
+Explicit `chunk_size` requests retain sequential streaming when splitting
+would be inappropriate, and `chunk_size=0` disables streaming to local paths.
+
+S3/Azure ETags, GCS generations, and HTTP conditional requests pin the source
+version when available. Other sources are checked against fresh metadata
+after the download, which cannot guarantee a snapshot if the backend does
+not expose a reliable change token. Use `atomic=True` to keep an existing
+local destination intact on failure. Moves remove the source only after a
+successful copy. The updated Python package requires the matching native
+extension for conditional cloud reads.
+
 For synchronous code (no `await` needed):
 
 ```python
@@ -296,6 +336,12 @@ asanypath cp /local/file.txt s3://bucket/file.txt
 
 # Copy cloud → local
 asanypath cp s3://bucket/file.txt /local/file.txt
+
+# Allow 32 concurrent files; fill spare capacity toward 8 streams for large files
+asanypath cp -r s3://bucket/data/ ./data/ -j 32 --concurrency-floor 8
+
+# Disable automatic range splitting (also supported by mv and sync)
+asanypath cp s3://bucket/file.txt ./file.txt --concurrency-floor 1
 
 # Delete a file
 asanypath rm s3://bucket/file.txt --force

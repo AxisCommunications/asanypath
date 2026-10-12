@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from base64 import b64encode
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from os import getenv, linesep
@@ -25,6 +26,7 @@ from asanypath_native import (
     http_scrape_links,
 )
 
+from asanypath._transfer import RangeNotSupportedError
 from asanypath.cloud import CloudPathMixin
 
 try:
@@ -398,6 +400,44 @@ class HTTPPath(CloudPathMixin):
     async def _read_bytes_uncached(self) -> bytes:
         return await http_get(str(self), headers=self._merge_headers(None))
 
+    _supports_range_read = True
+    _conditional_range_read = True
+    _probe_range_support = True
+
+    async def _range_read(
+        self,
+        start: int,
+        end: int,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        version_id: str | None = None,
+        total_size: int | None = None,
+    ) -> bytes:
+        headers = {"range": f"bytes={start}-{end}", "accept-encoding": "identity"}
+        if etag and not etag.startswith("W/"):
+            headers["if-match"] = etag
+        elif last_modified:
+            headers["if-unmodified-since"] = last_modified
+        response = await self.request("GET", headers=headers)
+        if response.status_code == 200:
+            raise RangeNotSupportedError(response.body)
+        if response.status_code != 206:
+            raise OSError(f"HTTP {response.status_code} during ranged transfer")
+        response_headers = {key.lower(): value for key, value in response.headers.items()}
+        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response_headers.get("content-range", ""))
+        if match is None:
+            raise OSError("Invalid Content-Range response")
+        range_start, range_end, size = map(int, match.groups())
+        if (
+            range_start != start
+            or range_end != min(end, size - 1)
+            or len(response.body) != range_end - range_start + 1
+            or (total_size is not None and size != total_size)
+        ):
+            raise OSError("Invalid Content-Range response")
+        return response.body
+
     async def read_text(
         self,
         encoding: str | None = None,
@@ -481,7 +521,15 @@ class HTTPPath(CloudPathMixin):
                     )
                 except ValueError:
                     mtime = None
-        return SimpleNamespace(st_size=size, st_ctime=mtime, st_mtime=mtime)
+        normalized = {key.lower(): value for key, value in headers.items()}
+        return SimpleNamespace(
+            st_size=size,
+            st_ctime=mtime,
+            st_mtime=mtime,
+            etag=normalized.get("etag"),
+            last_modified=last_modified,
+            supports_ranges=normalized.get("accept-ranges", "").lower() == "bytes",
+        )
 
     async def checksums(self) -> dict[str, str]:
         from hashlib import md5, sha1, sha256

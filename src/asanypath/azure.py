@@ -265,7 +265,13 @@ class AzurePath(CloudPathMixin):
                 .replace(tzinfo=timezone.utc)
                 .timestamp()
             )
-        return SimpleNamespace(st_size=size, st_ctime=mtime, st_mtime=mtime)
+        return SimpleNamespace(
+            st_size=size,
+            st_ctime=mtime,
+            st_mtime=mtime,
+            etag=headers.get("ETag", headers.get("etag")),
+            last_modified=last_modified,
+        )
 
     async def checksums(self) -> dict[str, str]:
         """Return Content-MD5 from blob properties."""

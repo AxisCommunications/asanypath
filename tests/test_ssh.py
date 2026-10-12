@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import stat as stat_module
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +19,34 @@ from asanypath import AsAnyPath
 from asanypath.options import AccessGrant, AccessPolicyPatch
 from asanypath.ssh import SSHPath, disconnect_all
 from tests.conftest import classtest_factory
+
+
+async def test_ssh_copy_uses_size_aware_parallel_ranges(ssh, tmp_path):
+    from asanypath import TransferBudget
+
+    data = bytes(range(32))
+    active = 0
+    peak = 0
+
+    async def read_range(**kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return data[kwargs["start"] : kwargs["end"] + 1]
+
+    ssh.stat.return_value = _stat(size=32)
+    ssh.read_range.side_effect = read_range
+    src = SSHPath("ssh://user@host/file.bin")
+    dst = AsAnyPath(tmp_path / "download.bin")
+    with TransferBudget(floor=4, min_range_size=8):
+        await src.copy(dst)
+
+    assert await dst.read_bytes() == data
+    assert peak == 4
+    ssh.read.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Mode constants

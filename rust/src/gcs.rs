@@ -155,6 +155,14 @@ impl GcsCreds {
         format!("{}/storage/v1/b/{}/o/{}", base, self.bucket, encoded)
     }
 
+    fn media_url(&self, object_path: &str, generation: Option<&str>) -> String {
+        let mut params = vec![("alt", "media")];
+        if let Some(generation) = generation {
+            params.push(("ifGenerationMatch", generation));
+        }
+        append_params(&self.object_url(object_path), &params)
+    }
+
     fn upload_base(&self) -> String {
         let base = self.endpoint.trim_end_matches('/');
         format!("{}/upload/storage/v1/b/{}/o", base, self.bucket)
@@ -343,13 +351,21 @@ impl CloudBackend for GcsCreds {
     ) -> impl std::future::Future<Output = Result<(reqwest::StatusCode, Bytes), String>> {
         let extras = extra_headers.to_vec();
         async move {
+            let generation = extras
+                .iter()
+                .find(|(name, _)| name == "x-asanypath-generation-match")
+                .map(|(_, value)| value.as_str());
             let url = match method {
-                "GET" => append_params(&self.object_url(path), &[("alt", "media")]),
+                "GET" => self.media_url(path, generation),
                 "DELETE" => self.object_url(path),
                 _ => self.object_url(path),
             };
             let mut headers = self.auth_headers().await;
-            headers.extend(extras);
+            headers.extend(
+                extras
+                    .into_iter()
+                    .filter(|(name, _)| name != "x-asanypath-generation-match"),
+            );
             do_request_light(method, &url, &headers, body, use_h2).await
         }
     }
@@ -1239,7 +1255,21 @@ fn secs_to_datetime(secs: u64) -> (i64, i64, i64, u64, u64, u64) {
 
 #[cfg(test)]
 mod adc_tests {
-    use super::mint_adc_token;
+    use super::{GcsCreds, mint_adc_token};
+
+    #[test]
+    fn range_media_url_pins_generation() {
+        let creds = GcsCreds::new(
+            "https://storage.googleapis.com".into(),
+            "bucket".into(),
+            None,
+        );
+        let url = url::Url::parse(&creds.media_url("nested/file.bin", Some("123"))).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query.get("alt").unwrap(), "media");
+        assert_eq!(query.get("ifGenerationMatch").unwrap(), "123");
+        assert!(url.path().ends_with("nested%2Ffile.bin"));
+    }
 
     #[test]
     fn rejects_service_account_adc() {

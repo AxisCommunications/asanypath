@@ -178,6 +178,7 @@ class SSHPath(CloudPathMixin):
 
     protocol: str = "ssh"
     _supports_range_read: bool = True
+    _conditional_range_read: bool = False
     # Bytes per streamed chunk; objects below one chunk write in a single call.
     # First chunk truncates, the rest append, so no offset tracking is needed.
     _STREAM_CHUNK = UPLOAD_CHUNK_SIZE
