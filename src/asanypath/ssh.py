@@ -458,7 +458,7 @@ class SSHPath(CloudPathMixin):
     # Read / write
     # ------------------------------------------------------------------
 
-    async def read_bytes(self) -> bytes:
+    async def _read_bytes_uncached(self) -> bytes:
         try:
             return bytes(await ssh_read(path=self._item_path, **self._native_kwargs))
         except Exception as e:  # noqa: BLE001

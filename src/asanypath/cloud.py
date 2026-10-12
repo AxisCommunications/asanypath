@@ -255,8 +255,23 @@ class CloudPathMixin(CommonPurePathMixin):
             return False
         return not await self.is_dir()
 
-    async def read_bytes(self) -> bytes:
-        """Read object content as bytes."""
+    async def read_bytes(self, *, use_cache: bool | None = None) -> bytes:
+        """Read object content as bytes.
+
+        When *use_cache* is true (or the process-wide default is enabled via
+        :func:`asanypath.configure_cache`), the content is served from / stored
+        in the on-disk download cache keyed by this path. Off by default.
+        """
+        from asanypath.cache import cache_enabled
+
+        if cache_enabled(use_cache):
+            from asanypath.cache import get_cache
+
+            return await get_cache().get_or_fetch(str(self), self._read_bytes_uncached)
+        return await self._read_bytes_uncached()
+
+    async def _read_bytes_uncached(self) -> bytes:
+        """Fetch object content from the backend, bypassing the download cache."""
         native_kwargs = await self._get_native_kwargs()
         return await self._get_batcher().get(
             item=self._item_path,
@@ -304,9 +319,11 @@ class CloudPathMixin(CommonPurePathMixin):
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
+        *,
+        use_cache: bool | None = None,
     ) -> str:
         """Read object content as text."""
-        text = (await self.read_bytes()).decode(
+        text = (await self.read_bytes(use_cache=use_cache)).decode(
             encoding=encoding or "utf-8", errors=errors or "strict"
         )
         if newline is None:

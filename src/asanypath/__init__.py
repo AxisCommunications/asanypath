@@ -13,6 +13,7 @@ from asanypath.asanypath import (
     register_protocol,
 )
 from asanypath.azure import AzurePath
+from asanypath.cache import configure_cache
 from asanypath.cloud import CloudPathMixin
 from asanypath.common import CommonPurePathMixin
 from asanypath.exceptions import (
@@ -62,6 +63,7 @@ __all__ = [
     "GCSPath",
     "AzurePath",
     "ArtifactoryPath",
+    "configure_cache",
     "register_protocol",
     "list_protocols",
     "AsAnyPathError",
