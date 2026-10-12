@@ -447,7 +447,7 @@ class AsAnyPath(AsAnyPurePath):
         pass
 
     @abstractmethod
-    async def rmdir(self) -> None:
+    async def rmdir(self, *, recursive: bool = False) -> None:
         pass
 
     @abstractmethod

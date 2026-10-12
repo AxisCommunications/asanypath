@@ -18,9 +18,6 @@ from os import getenv
 from types import SimpleNamespace
 
 import msgspec
-
-from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
 from asanypath_native import (
     az_copy_batch,
     az_delete_batch,
@@ -36,6 +33,9 @@ from asanypath_native import (
     az_put_batch,
     az_put_container_acl,
 )
+
+from asanypath.cloud import CloudPathMixin
+from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
 
 AZURE_API_VERSION = "2023-11-03"
 
