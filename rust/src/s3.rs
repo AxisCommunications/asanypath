@@ -56,8 +56,11 @@ struct S3AwsConfig {
 
 static S3_AWS_CONFIGS: OnceLock<AsyncMutex<HashMap<String, S3AwsConfig>>> = OnceLock::new();
 
-async fn s3_aws_config(region_override: Option<String>) -> Result<S3AwsConfig, String> {
-    let profile = std::env::var("AWS_PROFILE").ok();
+async fn s3_aws_config(
+    profile: Option<String>,
+    region_override: Option<String>,
+) -> Result<S3AwsConfig, String> {
+    let profile = profile.or_else(|| std::env::var("AWS_PROFILE").ok());
     let cache_key = format!(
         "{}|{}",
         profile.as_deref().unwrap_or_default(),
@@ -133,9 +136,10 @@ pub fn s3_get_credentials<'py>(
     access_key: Option<String>,
     secret_key: Option<String>,
     session_token: Option<String>,
+    profile: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let config = s3_aws_config(region_override)
+        let config = s3_aws_config(profile, region_override)
             .await
             .map_err(PyRuntimeError::new_err)?;
         let resolved = match (access_key, secret_key) {

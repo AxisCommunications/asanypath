@@ -30,6 +30,7 @@ async def s3_get_credentials(
     access_key: str | None,
     secret_key: str | None,
     session_token: str | None,
+    profile: str | None = None,
 ) -> tuple[str, str, str | None, str, str | None]: ...
 def s3_presign(
     endpoint: str,
