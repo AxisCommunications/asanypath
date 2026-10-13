@@ -20,7 +20,7 @@ asanypath-native = { path = "rust" }
 root = "src"
 
 [tool.hatch.build.targets.sdist]
-exclude = ["rust"]
+exclude = ["rust", "uv.lock"]
 
 [tool.hatch.metadata.hooks.custom]
 
