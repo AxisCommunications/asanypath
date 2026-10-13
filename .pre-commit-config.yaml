@@ -23,3 +23,9 @@ repos:
       language: system
       files: ^rust/.*\.(rs|toml|lock)$
       pass_filenames: false
+    # uv.lock must only reference the public index (a mirror URL leaks internal hosts).
+    - id: uv-lock-public-index
+      name: uv.lock uses only public index URLs
+      language: pygrep
+      entry: '(registry|url) = "https?://(?!pypi\.org/|files\.pythonhosted\.org/)'
+      files: ^uv\.lock$
