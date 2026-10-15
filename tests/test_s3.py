@@ -247,7 +247,7 @@ class TestS3Path(testbase):
         ]
         with (
             patch.object(S3Path, "_get_batcher", return_value=mock_batcher),
-            patch("asanypath.s3.s3_is_dir", new=AsyncMock(return_value=False)),
+            patch.object(S3Path, "_is_dir_batch_fn", new=AsyncMock(return_value=[False])),
         ):
             results = [c async for c in p.parent.rglob("*.txt")]
         assert len(results) == 1
