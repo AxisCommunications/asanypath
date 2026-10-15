@@ -395,7 +395,7 @@ class HTTPPath(CloudPathMixin):
     def open(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
         raise NotImplementedError(f"{type(self).__name__} does not support open()")
 
-    async def read_bytes(self) -> bytes:
+    async def _read_bytes_uncached(self) -> bytes:
         return await http_get(str(self), headers=self._merge_headers(None))
 
     async def read_text(
@@ -403,8 +403,10 @@ class HTTPPath(CloudPathMixin):
         encoding: str | None = None,
         errors: str | None = None,
         newline: Literal[None, "", "\n", "\r", "\r\n"] = None,
+        *,
+        use_cache: bool | None = None,
     ) -> str:
-        text = (await self.read_bytes()).decode(
+        text = (await self.read_bytes(use_cache=use_cache)).decode(
             encoding=encoding or "utf-8", errors=errors or "strict"
         )
         match newline:

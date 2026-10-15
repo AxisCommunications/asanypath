@@ -154,6 +154,55 @@ Pure path operations (e.g. `.name`, `.parent`, joins) still work, while backend
 operations (e.g. `.exists()`, `.read_bytes()`, `.open()`) raise
 `UnsupportedProtocolError` on use.
 
+### Download caching (opt-in)
+
+Reading the same object or URL twice always re-downloads it — there is **no
+cache by default**, and the read path is unchanged unless you opt in, so
+non-caching callers pay zero overhead.
+
+Enable it with the optional `cache` extra (`pip install asanypath[cache]`,
+backed by [`diskcache`](https://pypi.org/project/diskcache/) — a pure-Python,
+zero-dependency store). Opt in per read with `use_cache=True`:
+
+```python
+from asanypath import AsAnyPath
+
+p = AsAnyPath("s3://bucket/model.bin")
+data = await p.read_bytes(use_cache=True)   # first call fetches + stores
+data = await p.read_bytes(use_cache=True)   # subsequent calls served from disk
+text = await p.read_text(use_cache=True)
+```
+
+Configure the location and limits once (location defaults to
+`~/.cache/asanypath`, honoring `$XDG_CACHE_HOME` and `$ASANYPATH_CACHE_DIR`):
+
+```python
+from asanypath import configure_cache
+
+configure_cache(
+    directory="/var/cache/asanypath",  # default: ~/.cache/asanypath
+    size_limit=2 * 1024**3,            # total on-disk cap in bytes (default 1 GiB, LRU)
+    ttl=3600,                          # per-entry expiry in seconds (default: none)
+    enabled=True,                      # make use_cache default to True process-wide
+)
+```
+
+Or via environment: `ASANYPATH_CACHE_DIR`, `ASANYPATH_CACHE_SIZE_LIMIT` (bytes),
+`ASANYPATH_CACHE_TTL` (seconds).
+
+Behaviour and trade-offs:
+
+- **Off by default, opt-in per call.** With `configure_cache(enabled=True)` the
+  default flips process-wide; an explicit `use_cache=False` always bypasses.
+- **Works for every remote backend** (S3, GCS, Azure, Artifactory, HTTP, SSH,
+  FTP). Local paths are never cached.
+- **Total-size bounded, LRU-evicted;** disk I/O runs in a worker thread so the
+  event loop stays responsive. Concurrent reads of the same key collapse to a
+  single fetch.
+- **Staleness is on you.** Entries are keyed by URL with no revalidation — a
+  cached object that changes upstream is served stale until it expires (`ttl`)
+  or is evicted. Prefer caching immutable/versioned objects, or set a `ttl`.
+
 ## Installation
 
 Most cloud backends (S3, GCS, Azure, Artifactory, HTTP) are included in the base
@@ -428,8 +477,8 @@ All path implementations support:
 
 - `open(mode, buffering)` — file-like streaming with lazy range reads; for writes, `buffering` sets the upload part size
 - `copy(dst, recursive, chunk_size)` — copy file or tree (cross-backend); `chunk_size` tunes the upload part size
-- `read_bytes()` / `write_bytes(data)`
-- `read_text(encoding)` / `write_text(data, encoding)`
+- `read_bytes()` / `write_bytes(data)` — `read_bytes(use_cache=True)` serves from / stores in the opt-in [download cache](#download-caching-opt-in)
+- `read_text(encoding)` / `write_text(data, encoding)` — `read_text` also accepts `use_cache`
 - `exists()` / `is_file()` / `is_dir()`
 - `stat()` / `checksums()` (cloud backends)
 - `mkdir(parents, exist_ok)` / `touch(exist_ok)`

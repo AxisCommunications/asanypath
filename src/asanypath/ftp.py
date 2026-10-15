@@ -390,7 +390,7 @@ class FTPPath(CloudPathMixin):
     # Read / write
     # ------------------------------------------------------------------
 
-    async def read_bytes(self) -> bytes:
+    async def _read_bytes_uncached(self) -> bytes:
         path = self._item_path
 
         async def _read(client: aioftp.Client) -> bytes:
