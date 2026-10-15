@@ -10,11 +10,13 @@ import asyncio
 import fnmatch
 import inspect
 import io
+import os
 import tempfile
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from os import PathLike
 from os.path import expanduser
+from pathlib import Path
 from types import SimpleNamespace
 from typing import IO, TYPE_CHECKING, Any, Literal
 
@@ -313,6 +315,93 @@ class CloudPathMixin(CommonPurePathMixin):
                 **(await self._get_native_kwargs()),
             )
         )
+
+    async def _resume_identity(self) -> tuple[int | None, str | None]:
+        """Probe (total_size, identity) for resumable download.
+
+        *identity* is the object's ETag (preferred) or Last-Modified, used to
+        detect upstream changes between resume attempts. Returns ``(None, None)``
+        when the backend can't answer (no HEAD), disabling resume gracefully.
+        """
+        try:
+            native_kwargs = await self._get_native_kwargs()
+            headers = await self._get_batcher().head(item=self._item_path, **native_kwargs)
+        except Exception:
+            return None, None
+        size: int | None = None
+        identity = None
+        for key, value in headers.items():
+            low = key.lower()
+            if low == "content-length":
+                try:
+                    size = int(value)
+                except (ValueError, TypeError):
+                    size = None
+            elif low == "etag":
+                identity = value.strip('"')
+            elif low == "last-modified" and identity is None:
+                identity = value
+        return size, identity
+
+    async def download(
+        self,
+        dst: str | PathLike[str],
+        *,
+        resume: bool = True,
+        chunk_size: int | None = None,
+    ) -> Path:
+        """Download this object to local *dst*, resuming a partial transfer.
+
+        Bytes stream into ``<dst>.part`` with a ``<dst>.part.meta`` sidecar; an
+        interrupted download resumes from the saved offset as long as the remote
+        object's identity (ETag/Last-Modified) is unchanged, otherwise it
+        restarts. On completion ``<dst>.part`` is atomically renamed to *dst*.
+
+        Backends without range reads or a HEAD probe download in a single pass
+        (no resume). Set ``resume=False`` to always start fresh.
+        """
+        from asanypath import _resume as resume_state
+
+        dst = Path(dst)
+        chunk = chunk_size or _CloudFile._DEFAULT_CHUNK
+        size, identity = await self._resume_identity()
+
+        if size is None or not self._supports_range_read:
+            data = await self._read_bytes_uncached()
+            await asyncio.to_thread(dst.write_bytes, data)
+            return dst
+
+        part = dst.with_name(dst.name + ".part")
+        meta = dst.with_name(dst.name + ".part.meta")
+        offset = 0
+        if resume and part.exists():
+            prev = resume_state.read_meta(meta)
+            if (
+                prev is not None
+                and prev.identity == identity
+                and prev.size == size
+                and part.stat().st_size <= size
+            ):
+                offset = part.stat().st_size
+        if offset == 0:
+            part.unlink(missing_ok=True)
+            meta.unlink(missing_ok=True)
+            resume_state.write_meta(meta, resume_state.ResumeMeta(identity=identity, size=size))
+
+        fh = await asyncio.to_thread(part.open, "ab" if offset else "wb")
+        try:
+            while offset < size:
+                data = await self._range_read(offset, min(offset + chunk, size) - 1)
+                if not data:
+                    break
+                await asyncio.to_thread(fh.write, data)
+                offset += len(data)
+        finally:
+            await asyncio.to_thread(fh.close)
+
+        await asyncio.to_thread(os.replace, part, dst)
+        meta.unlink(missing_ok=True)
+        return dst
 
     async def read_text(
         self,

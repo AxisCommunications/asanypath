@@ -203,6 +203,34 @@ Behaviour and trade-offs:
   cached object that changes upstream is served stale until it expires (`ttl`)
   or is evicted. Prefer caching immutable/versioned objects, or set a `ttl`.
 
+### Resumable downloads
+
+`download(dst)` streams an object to a local file and **resumes an interrupted
+transfer** instead of starting over:
+
+```python
+await AsAnyPath("s3://bucket/huge.bin").download("/data/huge.bin")
+# process killed mid-download... run the same call again — it continues
+await AsAnyPath("s3://bucket/huge.bin").download("/data/huge.bin")
+```
+
+Bytes stream into `<dst>.part` with a `<dst>.part.meta` sidecar recording the
+object's ETag (or `Last-Modified`) and total size. On resume the identity is
+re-checked: if the upstream object is unchanged the download continues from the
+saved offset; if it changed, the partial is discarded and it restarts cleanly.
+On completion `<dst>.part` is atomically renamed to `dst`.
+
+```python
+# tune the range-request size; disable resume to always start fresh
+await path.download("/data/huge.bin", chunk_size=32 * 1024 * 1024, resume=False)
+```
+
+Resume needs range reads **and** a HEAD probe, so it's available on the object
+stores (S3/GCS/Azure) and Artifactory/HTTP where the server supports it.
+Backends without those (e.g. FTP) download in a single pass automatically. This
+needs no extra dependency — resume state is plain sidecar files, independent of
+the optional download cache.
+
 ## Installation
 
 Most cloud backends (S3, GCS, Azure, Artifactory, HTTP) are included in the base
@@ -477,6 +505,7 @@ All path implementations support:
 
 - `open(mode, buffering)` — file-like streaming with lazy range reads; for writes, `buffering` sets the upload part size
 - `copy(dst, recursive, chunk_size)` — copy file or tree (cross-backend); `chunk_size` tunes the upload part size
+- `download(dst, resume, chunk_size)` — stream an object to a local file, resuming an interrupted transfer
 - `read_bytes()` / `write_bytes(data)` — `read_bytes(use_cache=True)` serves from / stores in the opt-in [download cache](#download-caching-opt-in)
 - `read_text(encoding)` / `write_text(data, encoding)` — `read_text` also accepts `use_cache`
 - `exists()` / `is_file()` / `is_dir()`
