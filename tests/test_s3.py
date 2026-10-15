@@ -247,7 +247,7 @@ class TestS3Path(testbase):
         ]
         with (
             patch.object(S3Path, "_get_batcher", return_value=mock_batcher),
-            patch("asanypath.s3.s3_is_dir", new=AsyncMock(return_value=False)),
+            patch.object(S3Path, "_is_dir_batch_fn", new=AsyncMock(return_value=[False])),
         ):
             results = [c async for c in p.parent.rglob("*.txt")]
         assert len(results) == 1
@@ -460,6 +460,7 @@ async def test_read_bytes_resolves_role_credentials():
         aws_access_key_id=None,
         aws_secret_access_key=None,
         aws_session_token=None,
+        profile=None,
     )
     batcher = AsyncMock()
     batcher.get.return_value = b"data"
@@ -483,6 +484,7 @@ async def test_read_bytes_resolves_role_credentials():
         access_key=None,
         secret_key=None,
         session_token=None,
+        profile=None,
     )
     batcher.get.assert_awaited_once_with(
         item="key",
@@ -493,6 +495,22 @@ async def test_read_bytes_resolves_role_credentials():
         secret_key="ROLESECRET",
         session_token="ROLETOKEN",
     )
+
+
+@pytest.mark.asyncio
+async def test_profile_kwarg_is_forwarded_to_credential_resolver():
+    resolver = AsyncMock(return_value=("KEY", "SECRET", None, "eu-west-1", None))
+    with patch("asanypath.s3.s3_get_credentials", new=resolver):
+        S3Path._env_config = None
+        try:
+            path = S3Path("s3://bucket/key", profile="prof")
+            await path._get_native_kwargs()
+            # Derived paths inherit the profile.
+            await (path / "child")._get_native_kwargs()
+        finally:
+            S3Path._env_config = None
+    assert resolver.await_count == 2
+    assert all(c.kwargs["profile"] == "prof" for c in resolver.await_args_list)
 
 
 @pytest.mark.parametrize(
@@ -513,6 +531,7 @@ async def test_endpoint_from_aws_config(region, aws_endpoint, expected):
         aws_access_key_id=None,
         aws_secret_access_key=None,
         aws_session_token=None,
+        profile=None,
     )
     resolver = AsyncMock(return_value=("KEY", "SECRET", None, region, aws_endpoint))
     with (

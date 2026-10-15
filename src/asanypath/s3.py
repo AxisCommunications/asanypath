@@ -92,10 +92,12 @@ class S3Path(CloudPathMixin):
         aws_access_key_id: str | None = None,
         aws_secret_access_key: str | None = None,
         aws_session_token: str | None = None,
+        profile: str | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         cfg = self.env_config
+        self._profile = profile or cfg.profile
         self._endpoint_override = endpoint_url or cfg.endpoint_url
         self._region_override = aws_region or cfg.aws_region
         self._endpoint_url = self._endpoint_override or _default_s3_endpoint(
@@ -118,6 +120,8 @@ class S3Path(CloudPathMixin):
             cfg.aws_secret_access_key = aws_secret_access_key
         if aws_session_token:
             cfg.aws_session_token = aws_session_token
+        if profile:
+            cfg.profile = profile
 
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
@@ -128,6 +132,7 @@ class S3Path(CloudPathMixin):
             aws_access_key_id=None,
             aws_secret_access_key=None,
             aws_session_token=None,
+            profile=None,
         )
 
     # ------------------------------------------------------------------
@@ -165,6 +170,7 @@ class S3Path(CloudPathMixin):
             access_key=self._access_key,
             secret_key=self._secret_key,
             session_token=self._session_token,
+            profile=self._profile,
         )
         self._region = region
         self._endpoint_url = self._endpoint_override or aws_endpoint or _default_s3_endpoint(region)

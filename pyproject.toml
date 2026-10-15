@@ -58,7 +58,6 @@ dev = [
 cli = ["rich-click>=1.9.7"]
 ftp = ["aioftp>=0.21"]
 credstore = ["keyring>=24"]
-cache = ["diskcache>=5.6"]
 bench = [
     "asyncssh>=2.14",
     "fsspec",
@@ -72,7 +71,7 @@ bench = [
     "aiofiles",
     "requests",
 ]
-all = ["asanypath[credstore,ftp,cache]"]
+all = ["asanypath[credstore,ftp]"]
 [project.scripts]
 asanypath = "asanypath.cli:main"
 
@@ -150,10 +149,6 @@ disable_error_code = ["no-any-return", "misc", "union-attr", "type-var", "attr-d
 [[tool.mypy.overrides]]
 module = "asanypath.batcher"
 disallow_untyped_defs = false
-
-[[tool.mypy.overrides]]
-module = "diskcache.*"
-ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

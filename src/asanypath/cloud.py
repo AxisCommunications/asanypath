@@ -995,13 +995,15 @@ class CloudPathMixin(CommonPurePathMixin):
     async def rglob(
         self, pattern: str, *, case_sensitive: bool | None = None
     ) -> AsyncIterator[Self]:
-        """Recursive glob pattern matching."""
-        async for child in self.iterdir():
-            if fnmatch.fnmatch(child.name, pattern):
-                yield child
-            if await child.is_dir():
-                async for grandchild in child.rglob(pattern, case_sensitive=case_sensitive):
-                    yield grandchild
+        """Recursive glob pattern matching.
+
+        Use ``walk()`` so cloud backends can classify directory entries in
+        batches instead of issuing one directory probe at a time.
+        """
+        async for directory, dirnames, filenames in self.walk():
+            for name in (*dirnames, *filenames):
+                if fnmatch.fnmatch(name, pattern):
+                    yield directory._child(str(directory / name))
 
     async def walk(
         self,
