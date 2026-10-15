@@ -200,9 +200,8 @@ Reading the same object or URL twice always re-downloads it — there is **no
 cache by default**, and the read path is unchanged unless you opt in, so
 non-caching callers pay zero overhead.
 
-Enable it with the optional `cache` extra (`pip install asanypath[cache]`,
-backed by [`diskcache`](https://pypi.org/project/diskcache/) — a pure-Python,
-zero-dependency store). Opt in per read with `use_cache=True`:
+Caching is included in the native extension with no extra dependencies or
+installation extras. Opt in per read with `use_cache=True`:
 
 ```python
 from asanypath import AsAnyPath
@@ -221,7 +220,7 @@ from asanypath import configure_cache
 
 configure_cache(
     directory="/var/cache/asanypath",  # default: ~/.cache/asanypath
-    size_limit=2 * 1024**3,            # total on-disk cap in bytes (default 1 GiB, LRU)
+    size_limit=2 * 1024**3,            # stored key + payload budget (default 1 GiB, LRU)
     ttl=3600,                          # per-entry expiry in seconds (default: none)
     enabled=True,                      # make use_cache default to True process-wide
 )
@@ -236,9 +235,15 @@ Behaviour and trade-offs:
   default flips process-wide; an explicit `use_cache=False` always bypasses.
 - **Works for every remote backend** (S3, GCS, Azure, Artifactory, HTTP, SSH,
   FTP). Local paths are never cached.
-- **Total-size bounded, LRU-evicted;** disk I/O runs in a worker thread so the
+- **Size-bounded, LRU-evicted;** disk I/O runs in a worker thread so the
   event loop stays responsive. Concurrent reads of the same key collapse to a
-  single fetch.
+  single fetch within a cache instance. The byte budget counts UTF-8 keys and
+  payloads; SQLite metadata and transaction journals add filesystem overhead.
+  Objects larger than the budget are returned without being cached.
+- **Byte-only native storage:** SQLite stores raw bytes, never Python pickles.
+  The database lives under `native-v1/` in the configured cache directory.
+  Legacy DiskCache files are ignored, not migrated or deleted. Multiple
+  processes can share the new store; use the same size limit across them.
 - **Staleness is on you.** Entries are keyed by URL with no revalidation — a
   cached object that changes upstream is served stale until it expires (`ttl`)
   or is evicted. Prefer caching immutable/versioned objects, or set a `ttl`.

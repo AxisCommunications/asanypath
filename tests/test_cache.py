@@ -5,9 +5,13 @@
 # https://opensource.org/licenses/MIT.
 
 import asyncio
+import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from asanypath_native import DownloadCache as NativeDownloadCache
 
 from asanypath.cache import (
     DownloadCache,
@@ -116,6 +120,257 @@ async def test_delete_and_clear(tmp_path):
     await dc.get_or_fetch("b", fetch)
     assert calls["n"] == 2  # cleared -> re-fetched
     dc.close()
+
+
+@pytest.mark.parametrize("payload", [b"", bytes(range(256)), b"\x80\x04N."])
+async def test_native_roundtrip_returns_bytes(tmp_path, payload):
+    dc = DownloadCache(tmp_path / "c")
+    assert await dc.get_or_fetch("k", lambda: _const(payload)) == payload
+
+    async def unexpected_fetch():
+        pytest.fail("A persisted byte value must be a cache hit")
+
+    dc.close()
+    dc = DownloadCache(tmp_path / "c")
+    result = await dc.get_or_fetch("k", unexpected_fetch)
+    assert isinstance(result, bytes)
+    assert result == payload
+    dc.close()
+
+
+async def test_native_lru_and_exact_byte_budget(tmp_path):
+    dc = DownloadCache(tmp_path / "c", size_limit=10)
+    await dc.get_or_fetch("a", lambda: _const(b"1111"))
+    await dc.get_or_fetch("b", lambda: _const(b"2222"))
+    assert dc._cache.get("a") == b"1111"  # refresh a's LRU position
+    await dc.get_or_fetch("c", lambda: _const(b"3333"))
+    assert dc._cache.get("a") == b"1111"
+    assert dc._cache.get("b") is None
+    assert dc._cache.get("c") == b"3333"
+    with sqlite3.connect(tmp_path / "c" / "native-v1" / "cache.sqlite3") as connection:
+        used = connection.execute(
+            "SELECT SUM(length(CAST(key AS BLOB)) + length(value)) FROM entries"
+        ).fetchone()[0]
+    assert used == 10
+    dc.close()
+
+
+def test_native_budget_counts_utf8_keys_and_replacements(tmp_path):
+    cache = NativeDownloadCache(str(tmp_path), size_limit=6)
+    cache.set("\N{LATIN SMALL LETTER E WITH ACUTE}", b"1234")
+    assert cache.get("\N{LATIN SMALL LETTER E WITH ACUTE}") == b"1234"
+    cache.set("\N{LATIN SMALL LETTER E WITH ACUTE}", b"12345")
+    assert cache.get("\N{LATIN SMALL LETTER E WITH ACUTE}") is None
+    cache.set("a", b"12345")
+    cache.set("a", b"x")
+    cache.set("b", b"123")
+    assert cache.get("a") == b"x"
+    assert cache.get("b") == b"123"
+    cache.close()
+
+
+async def test_oversized_objects_not_retained(tmp_path):
+    dc = DownloadCache(tmp_path / "c", size_limit=5)
+    await dc.get_or_fetch("a", lambda: _const(b"1234"))
+    calls = 0
+
+    async def fetch():
+        nonlocal calls
+        calls += 1
+        return b"too large"
+
+    assert await dc.get_or_fetch("b", fetch) == b"too large"
+    assert await dc.get_or_fetch("b", fetch) == b"too large"
+    assert calls == 2
+    assert dc._cache.get("a") == b"1234"
+    dc.close()
+
+
+async def test_expiry_survives_reopen(tmp_path):
+    dc = DownloadCache(tmp_path / "c", ttl=0.1)
+    await dc.get_or_fetch("a", lambda: _const(b"old"))
+    dc.close()
+    await asyncio.sleep(0.2)
+    dc = DownloadCache(tmp_path / "c")
+    assert await dc.get_or_fetch("a", lambda: _const(b"new")) == b"new"
+    dc.close()
+
+
+def test_expired_entries_reclaimed_before_lru(tmp_path):
+    cache = NativeDownloadCache(str(tmp_path), size_limit=10)
+    cache.set("a", b"1111")
+    cache.set("b", b"2222", expire=-1)
+    cache.set("c", b"3333")
+    assert cache.get("a") == b"1111"
+    assert cache.get("b") is None
+    assert cache.get("c") == b"3333"
+    cache.close()
+
+
+async def test_legacy_cache_never_opened_or_cleared(tmp_path):
+    legacy = tmp_path / "cache.db"
+    legacy.write_bytes(b"not a SQLite database; legacy cache must never be opened")
+    dc = DownloadCache(tmp_path)
+    assert await dc.get_or_fetch("a", lambda: _const(b"new")) == b"new"
+    await dc.clear()
+    dc.close()
+    assert legacy.read_bytes() == b"not a SQLite database; legacy cache must never be opened"
+
+
+def test_tampered_blob_is_returned_as_bytes_not_deserialized(tmp_path, monkeypatch):
+    import pickle
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Cache reads must never invoke Python pickle")
+
+    monkeypatch.setattr(pickle, "load", forbidden)
+    monkeypatch.setattr(pickle, "loads", forbidden)
+    cache = NativeDownloadCache(str(tmp_path), size_limit=1024)
+    cache.set("k", b"original")
+    with sqlite3.connect(tmp_path / "native-v1" / "cache.sqlite3") as connection:
+        connection.execute("UPDATE entries SET value = ? WHERE key = 'k'", (b"\x80\x04N.",))
+    assert cache.get("k") == b"\x80\x04N."
+    cache.close()
+
+
+async def test_corrupt_native_database_raises(tmp_path):
+    directory = tmp_path / "native-v1"
+    directory.mkdir()
+    (directory / "cache.sqlite3").write_bytes(b"invalid database")
+    with pytest.raises(OSError, match="Download cache database"):
+        DownloadCache(tmp_path)
+
+
+def test_invalid_native_value_type_raises(tmp_path):
+    cache = NativeDownloadCache(str(tmp_path), size_limit=1024)
+    cache.set("k", b"value")
+    with sqlite3.connect(tmp_path / "native-v1" / "cache.sqlite3") as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute("UPDATE entries SET value = 'not bytes' WHERE key = 'k'")
+    with pytest.raises(OSError, match="Download cache database"):
+        cache.get("k")
+    cache.close()
+
+
+def test_unwritable_cache_path_raises(tmp_path):
+    directory = tmp_path / "file"
+    directory.write_bytes(b"not a directory")
+    with pytest.raises(OSError, match="Create download cache directory"):
+        DownloadCache(directory)
+
+
+async def test_fetch_error_is_not_cached(tmp_path):
+    dc = DownloadCache(tmp_path)
+
+    async def fetch():
+        raise OSError("download failed")
+
+    with pytest.raises(OSError, match="download failed"):
+        await dc.get_or_fetch("a", fetch)
+    assert await dc.get_or_fetch("a", lambda: _const(b"ok")) == b"ok"
+    dc.close()
+
+
+@pytest.mark.parametrize("size_limit", [0, -1])
+def test_invalid_size_limit_raises(tmp_path, size_limit):
+    with pytest.raises(ValueError, match="size_limit must be positive"):
+        DownloadCache(tmp_path, size_limit=size_limit)
+    configure_cache(directory=tmp_path, size_limit=size_limit)
+    with pytest.raises(ValueError, match="size_limit must be positive"):
+        get_cache()
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_ttl_raises(tmp_path, ttl):
+    cache = NativeDownloadCache(str(tmp_path), size_limit=1024)
+    with pytest.raises(ValueError, match="ttl must be finite"):
+        cache.set("a", b"b", expire=ttl)
+    cache.close()
+
+
+def test_closed_cache_raises_and_close_is_idempotent(tmp_path):
+    cache = NativeDownloadCache(str(tmp_path), size_limit=1024)
+    cache.close()
+    cache.close()
+    with pytest.raises(ValueError, match="closed"):
+        cache.get("a")
+    with pytest.raises(ValueError, match="closed"):
+        cache.set("a", b"b")
+    with pytest.raises(ValueError, match="closed"):
+        cache.delete("a")
+    with pytest.raises(ValueError, match="closed"):
+        cache.clear()
+
+
+def test_cache_shared_across_processes(tmp_path):
+    cache = NativeDownloadCache(str(tmp_path), size_limit=32)
+    cache.set("parent", b"p")
+    script = """
+import sys
+from asanypath_native import DownloadCache
+cache = DownloadCache(sys.argv[1], size_limit=32)
+for i in range(20):
+    cache.set(sys.argv[2] + str(i), b"value")
+cache.close()
+"""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from asanypath_native import DownloadCache; "
+            "c = DownloadCache(sys.argv[1], 32); "
+            "assert c.get('parent') == b'p'; c.close()",
+            str(tmp_path),
+        ],
+        check=True,
+        timeout=30,
+    )
+    processes = [
+        subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(index)])
+        for index in range(3)
+    ]
+    try:
+        for process in processes:
+            assert process.wait(timeout=30) == 0
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+    cache.set("final", b"ok")
+    assert cache.get("final") == b"ok"
+    with sqlite3.connect(tmp_path / "native-v1" / "cache.sqlite3") as connection:
+        used = connection.execute(
+            "SELECT SUM(length(CAST(key AS BLOB)) + length(value)) FROM entries"
+        ).fetchone()[0]
+    assert used <= 32
+    cache.close()
+
+
+def test_concurrent_first_open_across_processes(tmp_path):
+    script = """
+import sys
+from asanypath_native import DownloadCache
+cache = DownloadCache(sys.argv[1], size_limit=1024)
+cache.set(sys.argv[2], b"shared")
+cache.close()
+"""
+    processes = [
+        subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(index)])
+        for index in range(4)
+    ]
+    try:
+        for process in processes:
+            assert process.wait(timeout=30) == 0
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+    cache = NativeDownloadCache(str(tmp_path), size_limit=1024)
+    for index in range(4):
+        assert cache.get(str(index)) == b"shared"
+    cache.close()
 
 
 async def _const(value: bytes) -> bytes:

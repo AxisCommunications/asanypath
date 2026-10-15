@@ -256,7 +256,6 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "aioftp" },
-    { name = "diskcache" },
     { name = "keyring" },
 ]
 bench = [
@@ -272,9 +271,6 @@ bench = [
     { name = "requests" },
     { name = "s3fs" },
 ]
-cache = [
-    { name = "diskcache" },
-]
 cli = [
     { name = "rich-click" },
 ]
@@ -283,7 +279,6 @@ credstore = [
 ]
 dev = [
     { name = "aioftp" },
-    { name = "diskcache" },
     { name = "keyring" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -308,9 +303,6 @@ requires-dist = [
     { name = "asyncssh", marker = "extra == 'bench'", specifier = ">=2.14" },
     { name = "azure-storage-blob", marker = "extra == 'bench'" },
     { name = "cloudpathlib", extras = ["all"], marker = "extra == 'bench'" },
-    { name = "diskcache", marker = "extra == 'all'", specifier = ">=5.6" },
-    { name = "diskcache", marker = "extra == 'cache'", specifier = ">=5.6" },
-    { name = "diskcache", marker = "extra == 'dev'", specifier = ">=5.6" },
     { name = "fsspec", marker = "extra == 'bench'" },
     { name = "gcloud-aio-storage", marker = "extra == 'bench'" },
     { name = "gcsfs", marker = "extra == 'bench'" },
@@ -328,7 +320,7 @@ requires-dist = [
     { name = "s3fs", marker = "extra == 'bench'" },
     { name = "yarl", specifier = ">=1.2" },
 ]
-provides-extras = ["all", "bench", "cache", "cli", "credstore", "dev", "ftp"]
+provides-extras = ["all", "bench", "cli", "credstore", "dev", "ftp"]
 
 [[package]]
 name = "asanypath-native"
@@ -1059,15 +1051,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/60/8b/32f9823da46cde7df2087faa08cd98d01b908f8dcab982cdba9c84e85355/decorator-5.3.1.tar.gz", hash = "sha256:4cbcdd55a6efadb9dbea26b858f4fb3264567b52d69ca0d25b721b553f60ea82", size = 58084, upload-time = "2026-05-18T06:03:28.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/05/7f/798705f5296a58ca505d600456748d1be48078eac8a7050d8a98bc9edb89/decorator-5.3.1-py3-none-any.whl", hash = "sha256:f47fe6fdbd2edd623ecfe36875d37aba411624e2670dd395dddae1358689bb3c", size = 10365, upload-time = "2026-05-18T06:03:26.517Z" },
-]
-
-[[package]]
-name = "diskcache"
-version = "5.6.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/3f/21/1c1ffc1a039ddcc459db43cc108658f32c57d271d7289a2794e401d0fdb6/diskcache-5.6.3.tar.gz", hash = "sha256:2c3a3fa2743d8535d832ec61c2054a1641f41775aa7c556758a109941e33e4fc", size = 67916, upload-time = "2023-08-31T06:12:00.316Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3f/27/4570e78fc0bf5ea0ca45eb1de3818a23787af9b390c0b0a0033a1b8236f9/diskcache-5.6.3-py3-none-any.whl", hash = "sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19", size = 45550, upload-time = "2023-08-31T06:11:58.822Z" },
 ]
 
 [[package]]

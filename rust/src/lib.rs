@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 
 #[macro_use]
 pub mod backend;
+pub mod cache;
 pub mod http;
 pub mod xml;
 
@@ -29,6 +30,7 @@ pub mod ssh;
 
 #[pymodule]
 fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<cache::DownloadCache>()?;
     // S3
     m.add_function(wrap_pyfunction!(s3::s3_is_dir, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_get_acl, m)?)?;

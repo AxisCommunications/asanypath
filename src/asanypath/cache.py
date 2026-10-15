@@ -8,12 +8,12 @@
 
 Caching is **off by default**: an unconfigured read path is byte-for-byte
 unchanged, so non-caching callers pay zero overhead. Opt in per call with
-``read_bytes(use_cache=True)`` / ``open(..., use_cache=True)``, or flip the
+``read_bytes(use_cache=True)`` / ``read_text(use_cache=True)``, or flip the
 process-wide default with :func:`configure_cache(enabled=True)`.
 
-Backed by :mod:`diskcache` (an optional dependency; install ``asanypath[cache]``).
-Raw bytes are stored keyed by the path's string form; the blocking SQLite/file
-I/O runs in a worker thread so the event loop stays responsive.
+Backed by the native extension's byte-only SQLite store. Raw bytes are stored
+keyed by the path's string form; blocking I/O runs in a worker thread so the
+event loop stays responsive. Legacy DiskCache entries are never read.
 """
 
 from __future__ import annotations
@@ -23,10 +23,8 @@ import os
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
 
-if TYPE_CHECKING:
-    from diskcache import Cache
+from asanypath_native import DownloadCache as NativeDownloadCache
 
 
 def _env_int(name: str, default: int | None) -> int | None:
@@ -40,7 +38,7 @@ def _env_int(name: str, default: int | None) -> int | None:
     return value if value > 0 else default
 
 
-# 1 GiB total on-disk cache by default; override via ASANYPATH_CACHE_SIZE_LIMIT.
+# 1 GiB key/payload budget by default; override via ASANYPATH_CACHE_SIZE_LIMIT.
 _DEFAULT_SIZE_LIMIT = 1024 * 1024 * 1024
 # No expiry by default (size-bounded LRU); override via ASANYPATH_CACHE_TTL (seconds).
 _DEFAULT_TTL: float | None = None
@@ -57,7 +55,7 @@ def _default_cache_dir() -> Path:
 
 
 class DownloadCache:
-    """Async wrapper over a :class:`diskcache.Cache` storing raw bytes.
+    """Async wrapper over the native byte cache.
 
     Concurrent misses for the same key are collapsed by a per-key lock so a
     stampede of identical reads triggers a single fetch.
@@ -70,11 +68,7 @@ class DownloadCache:
         size_limit: int = _DEFAULT_SIZE_LIMIT,
         ttl: float | None = _DEFAULT_TTL,
     ) -> None:
-        from diskcache import Cache
-
-        self._cache: Cache = Cache(
-            str(directory), size_limit=size_limit, eviction_policy="least-recently-used"
-        )
+        self._cache = NativeDownloadCache(str(directory), size_limit=size_limit)
         self._ttl = ttl
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -82,11 +76,11 @@ class DownloadCache:
         """Return cached bytes for *key*, else call *fetch*, store, and return."""
         hit = await asyncio.to_thread(self._cache.get, key)
         if hit is not None:
-            return cast(bytes, hit)
+            return hit
         async with self._locks[key]:
             hit = await asyncio.to_thread(self._cache.get, key)
             if hit is not None:
-                return cast(bytes, hit)
+                return hit
             data = await fetch()
             await asyncio.to_thread(self._cache.set, key, data, expire=self._ttl)
             return data
@@ -122,7 +116,8 @@ def configure_cache(
     """Configure the shared download cache.
 
     *directory* defaults to ``~/.cache/asanypath`` (honoring ``$ASANYPATH_CACHE_DIR``
-    and ``$XDG_CACHE_HOME``). *size_limit* is the total on-disk cap in bytes.
+    and ``$XDG_CACHE_HOME``). *size_limit* caps stored keys and payloads in bytes,
+    excluding SQLite metadata and journal overhead.
     *ttl* is a per-entry expiry in seconds (``None`` = no expiry). *enabled* sets
     the process-wide default for ``use_cache`` when a call doesn't specify one.
 
@@ -147,12 +142,13 @@ def get_cache() -> DownloadCache:
     global _cache
     if _cache is None:
         directory = _directory or _default_cache_dir()
-        directory.mkdir(parents=True, exist_ok=True)
         size_limit = (
             _size_limit
             if _size_limit is not None
-            else _env_int("ASANYPATH_CACHE_SIZE_LIMIT", _DEFAULT_SIZE_LIMIT)
-        ) or _DEFAULT_SIZE_LIMIT
+            else (
+                _env_int("ASANYPATH_CACHE_SIZE_LIMIT", _DEFAULT_SIZE_LIMIT) or _DEFAULT_SIZE_LIMIT
+            )
+        )
         ttl = _ttl if _ttl is not None else _env_int("ASANYPATH_CACHE_TTL", None)
         _cache = DownloadCache(directory, size_limit=size_limit, ttl=ttl)
     return _cache
