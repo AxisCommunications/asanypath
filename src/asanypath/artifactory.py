@@ -353,7 +353,12 @@ class ArtifactoryPath(CloudPathMixin):
             st_size=info.get("st_size", 0),
             st_ctime=info.get("st_ctime"),
             st_mtime=info.get("st_mtime"),
+            checksums=info.get("checksums"),
         )
+
+    async def _transfer_stat(self) -> SimpleNamespace:
+        self._cached_info = None
+        return await self.stat()
 
     async def checksums(self) -> dict[str, str]:
         """Return checksums (md5, sha1, sha256) from the Artifactory storage API."""

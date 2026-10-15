@@ -21,6 +21,25 @@ from asanypath.ftp import FTPPath, FTPSPath, _parse_mlst_mtime, disconnect_all  
 from asanypath.options import AccessGrant, AccessPolicyPatch  # noqa: E402
 from tests.conftest import classtest_factory  # noqa: E402
 
+
+@pytest.mark.parametrize("path_class, scheme", [(FTPPath, "ftp"), (FTPSPath, "ftps")])
+async def test_ftp_copy_keeps_single_stream_for_unsupported_ranges(tmp_path, path_class, scheme):
+    from asanypath import TransferBudget
+
+    src = path_class(f"{scheme}://user@host/file.bin")
+    dst = AsAnyPath(tmp_path / "download.bin")
+    read = AsyncMock(return_value=b"data")
+    with (
+        patch.object(src, "is_dir", AsyncMock(return_value=False)),
+        patch.object(src, "read_bytes", read),
+        patch.object(src, "_range_read", AsyncMock(side_effect=AssertionError("no FTP ranges"))),
+        TransferBudget(floor=4, min_range_size=1),
+    ):
+        await src.copy(dst)
+    assert await dst.read_bytes() == b"data"
+    read.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1121,6 +1123,97 @@ def test_sync_virtual_dir_source_mock(runner):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("files, expected_peak", [(1, 4), (2, 4), (4, 4)])
+async def test_concurrent_stream_shares_range_budget(monkeypatch, files, expected_peak):
+    from asanypath._transfer import TransferBudget, iter_transfer_chunks
+
+    monkeypatch.setattr(
+        cli_module, "TransferBudget", lambda **kw: TransferBudget(min_range_size=8, **kw)
+    )
+    active = 0
+    peak = 0
+
+    async def read_range(start, end):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return b"x" * (end - start + 1)
+
+    async def whole_read():
+        return await read_range(0, 31)
+
+    src = SimpleNamespace(
+        _supports_range_read=True,
+        stat=AsyncMock(return_value=SimpleNamespace(st_size=32)),
+        _range_read=AsyncMock(side_effect=read_range),
+        read_bytes=AsyncMock(side_effect=whole_read),
+    )
+
+    async def work():
+        assert b"".join([chunk async for chunk in iter_transfer_chunks(src)]) == b"x" * 32
+
+    async def items():
+        for index in range(files):
+            yield str(index), work
+
+    succeeded, failures, _ = await cli_module._run_concurrent_stream(
+        items(), description="Copying", verbosity=0, concurrency=files, concurrency_floor=4
+    )
+    assert succeeded == files
+    assert not failures
+    assert peak == expected_peak
+    assert src._range_read.await_count == (4 * files if files < 4 else 0)
+    assert src.read_bytes.await_count == (files if files >= 4 else 0)
+
+
+@pytest.mark.parametrize("command", ["cp", "mv", "sync"])
+def test_transfer_commands_expose_concurrency_floor(runner, command):
+    result = runner.invoke(cli, [command, "--help"])
+    assert result.exit_code == 0
+    assert "--concurrency-floor" in result.output
+
+
+def test_cp_concurrency_floor_configures_shared_budget(runner, cp_tree):
+    from asanypath import TransferBudget
+
+    src, dst = cp_tree
+    with patch.object(cli_module, "TransferBudget", wraps=TransferBudget) as budget:
+        result = runner.invoke(
+            cli, ["cp", "-r", str(src), str(dst), "-j", "2", "--concurrency-floor", "4"]
+        )
+    assert result.exit_code == 0, result.output
+    budget.assert_called_once_with(floor=4, ceiling=4)
+    assert (dst / "file0.txt").read_text() == "content0"
+
+
+async def test_copy_progress_deduplicates_polling_and_callbacks(tmp_path):
+    dst = cli_module.AsAnyPath(tmp_path / "dst.bin")
+    first_update = asyncio.Event()
+    updates = []
+
+    async def copy(target, *, on_progress):
+        await target.write_bytes(b"part")
+        await asyncio.wait_for(first_update.wait(), 1)
+        await on_progress(4, 4, src, target)
+        await target.write_bytes(b"partdone")
+        await on_progress(4, 8, src, target)
+
+    src = SimpleNamespace(copy=copy)
+
+    async def on_progress(delta, transferred, source, target):
+        updates.append((delta, transferred))
+        first_update.set()
+
+    work = cli_module._make_simple_copy_work(src, dst, verbosity=2)
+    await work(on_progress=on_progress)
+    assert sum(delta for delta, _ in updates) == 8
+    assert [transferred for _, transferred in updates] == sorted(
+        transferred for _, transferred in updates
+    )
+
+
 @pytest.fixture
 def cp_tree(tmp_path):
     """Source dir with five files; empty dest dir."""
@@ -1308,3 +1401,45 @@ def test_scp_style_unknown_host_not_rewritten(tmp_path, monkeypatch):
     SSHPath._env_config = None
     # No matching Host block -> passes through unchanged.
     assert _maybe_rewrite_scp_style("unknownhost:/path") == "unknownhost:/path"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stream_single_live_display(monkeypatch):
+    """Progress must register at most one live display at a time.
+
+    Regression for "Only one live display may be active at once": the progress
+    bars must render only inside the explicit ``Live``, never be started
+    independently (older Rich raises when a second live registers).
+    """
+    console = cli_module.console
+    depth = {"cur": 0, "max": 0}
+    orig_set = console.set_live
+    orig_clear = console.clear_live
+
+    def _set_live(live):
+        depth["cur"] += 1
+        depth["max"] = max(depth["max"], depth["cur"])
+        return orig_set(live)
+
+    def _clear_live():
+        depth["cur"] = max(0, depth["cur"] - 1)
+        return orig_clear()
+
+    monkeypatch.setattr(console, "set_live", _set_live)
+    monkeypatch.setattr(console, "clear_live", _clear_live)
+
+    async def _items():
+        async def _work(**kwargs):
+            return None
+
+        yield ("file", _work)
+
+    succeeded, failures, _elapsed = await cli_module._run_concurrent_stream(
+        _items(),
+        description="Copying",
+        verbosity=1,
+        concurrency=2,
+        show_transfer=True,
+    )
+    assert not failures
+    assert depth["max"] <= 1  # never two live displays active at once

@@ -4,6 +4,7 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
+from asanypath._transfer import TransferBudget
 from asanypath.artifactory import ArtifactoryPath
 from asanypath.asanypath import (
     PROTOCOL_MAP,
@@ -53,6 +54,7 @@ __all__ = [
     "AsAnyPath",
     "AsyncPath",
     "SyncPath",
+    "TransferBudget",
     "BackendOptions",
     "AccessGrant",
     "AccessPolicy",

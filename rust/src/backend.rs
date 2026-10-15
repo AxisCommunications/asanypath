@@ -170,11 +170,14 @@ pub trait CloudBackend {
         start: u64,
         end: u64,
         use_h2: bool,
+        conditions: &[(String, String)],
     ) -> impl std::future::Future<Output = Result<PyBytesBuf, PyErr>> {
         async move {
-            let range_header = ("range".to_string(), format!("bytes={}-{}", start, end));
+            let mut headers = conditions.to_vec();
+            headers.push(("range".to_string(), format!("bytes={}-{}", start, end)));
+            headers.push(("accept-encoding".to_string(), "identity".to_string()));
             let (status, body) = self
-                .do_request("GET", path, None, use_h2, &[range_header])
+                .do_request("GET", path, None, use_h2, &headers)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e))?;
             // A range entirely past end-of-object yields 416; treat as empty (EOF)
@@ -184,6 +187,11 @@ pub trait CloudBackend {
             }
             if !status.is_success() {
                 return Err(status_to_pyerr(status, &self.error_path(path), &body));
+            }
+            if status.as_u16() != 206 {
+                return Err(pyo3::exceptions::PyOSError::new_err(
+                    "Server ignored range request",
+                ));
             }
             Ok(PyBytesBuf(body))
         }
@@ -363,9 +371,11 @@ macro_rules! batch_copy {
 /// Usage: `range_read_impl!(py, creds, path, start, end)`
 #[macro_export]
 macro_rules! range_read_impl {
-    ($py:expr, $creds:expr, $path:expr, $start:expr, $end:expr) => {
+    ($py:expr, $creds:expr, $path:expr, $start:expr, $end:expr, $conditions:expr) => {
         pyo3_async_runtimes::tokio::future_into_py($py, async move {
-            $creds.range_get(&$path, $start, $end, false).await
+            $creds
+                .range_get(&$path, $start, $end, false, &$conditions)
+                .await
         })
     };
 }
@@ -387,7 +397,8 @@ use pyo3::prelude::*;
 #[pyo3(signature = (path, start, end, endpoint=None, bucket=None, region=None,
     access_key=None, secret_key=None, session_token=None,
     container=None, account_name=None, account_key=None, sas_token=None,
-    access_token=None, base_url=None, token=None))]
+    access_token=None, base_url=None, token=None,
+    if_match=None, if_unmodified_since=None, if_generation_match=None))]
 pub fn range_read<'py>(
     py: Python<'py>,
     path: String,
@@ -411,7 +422,20 @@ pub fn range_read<'py>(
     // Artifactory
     base_url: Option<String>,
     token: Option<String>,
+    if_match: Option<String>,
+    if_unmodified_since: Option<String>,
+    if_generation_match: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let mut conditions = Vec::new();
+    if let Some(value) = if_match {
+        conditions.push(("if-match".to_string(), value));
+    }
+    if let Some(value) = if_unmodified_since {
+        conditions.push(("if-unmodified-since".to_string(), value));
+    }
+    if let Some(value) = if_generation_match {
+        conditions.push(("x-asanypath-generation-match".to_string(), value));
+    }
     if let Some(region) = region {
         // S3
         let creds = crate::s3::S3Creds {
@@ -422,7 +446,7 @@ pub fn range_read<'py>(
             secret_key: secret_key.unwrap_or_default(),
             session_token,
         };
-        range_read_impl!(py, creds, path, start, end)
+        range_read_impl!(py, creds, path, start, end, conditions)
     } else if let Some(container) = container {
         // Azure
         use crate::azure::AzCreds;
@@ -433,12 +457,12 @@ pub fn range_read<'py>(
             account_key,
             sas_token,
         );
-        range_read_impl!(py, creds, path, start, end)
+        range_read_impl!(py, creds, path, start, end, conditions)
     } else if let Some(base_url) = base_url {
         // Artifactory
         use crate::artifactory::ArtCreds;
         let creds = ArtCreds::new(base_url, token.unwrap_or_default());
-        range_read_impl!(py, creds, path, start, end)
+        range_read_impl!(py, creds, path, start, end, conditions)
     } else {
         // GCS
         use crate::gcs::GcsCreds;
@@ -447,6 +471,6 @@ pub fn range_read<'py>(
             bucket.unwrap_or_default(),
             access_token,
         );
-        range_read_impl!(py, creds, path, start, end)
+        range_read_impl!(py, creds, path, start, end, conditions)
     }
 }

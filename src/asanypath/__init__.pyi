@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from ._transfer import TransferBudget as TransferBudget
 from ._version import __version__ as __version__
 from .artifactory import ArtifactoryPath as ArtifactoryPath
 from .asanypath import (

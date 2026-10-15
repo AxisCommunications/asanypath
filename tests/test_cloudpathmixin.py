@@ -4,6 +4,7 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
+import asyncio
 from os.path import expanduser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -17,6 +18,346 @@ from asanypath.cloud import CloudPathMixin, _CloudFile, _CloudRawIO
 from asanypath.gcs import GCSPath
 from asanypath.options import AccessPolicyPatch, BackendOptions
 from asanypath.s3 import S3Path
+
+
+@pytest.mark.parametrize(
+    "size, files, expected_peak", [(4, 1, 1), (32, 1, 4), (32, 2, 2), (32, 4, 1)]
+)
+async def test_transfer_ranges_size_and_file_budget(size, files, expected_peak):
+    from asanypath._transfer import TransferBudget, iter_transfer_chunks
+
+    data = bytes(range(size))
+    active = 0
+    peak = 0
+
+    async def read_range(start, end):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return data[start : end + 1]
+
+    src = SimpleNamespace(
+        _supports_range_read=True,
+        stat=AsyncMock(return_value=SimpleNamespace(st_size=size)),
+        _range_read=read_range,
+        read_bytes=AsyncMock(return_value=data),
+    )
+    budget = TransferBudget(floor=4, ceiling=8, min_range_size=8)
+    budget.active_files = files - 1
+    with budget:
+        chunks = [
+            chunk async for chunk in iter_transfer_chunks(src, chunk_size=8 if size >= 16 else None)
+        ]
+
+    assert b"".join(chunks) == data
+    assert peak == expected_peak if size >= 16 else peak == 0
+    if size < 16:
+        src.read_bytes.assert_awaited_once()
+    assert budget.active_files == files - 1
+
+
+async def test_transfer_ranges_reject_short_reads():
+    from asanypath._transfer import TransferBudget, iter_transfer_chunks
+
+    src = SimpleNamespace(
+        _supports_range_read=True,
+        stat=AsyncMock(return_value=SimpleNamespace(st_size=32)),
+        _range_read=AsyncMock(return_value=b"short"),
+    )
+    with TransferBudget(floor=4, min_range_size=8):
+        with pytest.raises(OSError, match="range"):
+            _ = [chunk async for chunk in iter_transfer_chunks(src, chunk_size=8)]
+
+
+@pytest.mark.parametrize("atomic, chunk_size", [(False, None), (False, 8), (True, 8)])
+async def test_cloud_copy_uses_parallel_ranges(
+    cloud_path, tmp_path, monkeypatch, atomic, chunk_size
+):
+    from asanypath import AsAnyPath
+    from asanypath._transfer import TransferBudget
+
+    data = bytes(range(32))
+    active = 0
+    peak = 0
+    updates = []
+    done = AsyncMock()
+
+    async def read_range(start, end):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return data[start : end + 1]
+
+    async def on_progress(delta, transferred, src, dst):
+        updates.append((delta, transferred))
+
+    monkeypatch.setattr(cloud_path, "stat", AsyncMock(return_value=SimpleNamespace(st_size=32)))
+    monkeypatch.setattr(cloud_path, "is_dir", AsyncMock(return_value=False))
+    monkeypatch.setattr(cloud_path, "_range_read", read_range)
+    monkeypatch.setattr(
+        cloud_path, "read_bytes", AsyncMock(side_effect=AssertionError("whole read"))
+    )
+    dst = AsAnyPath(tmp_path / "copied.bin")
+    with TransferBudget(floor=4, min_range_size=8):
+        await cloud_path.copy(
+            dst, atomic=atomic, chunk_size=chunk_size, on_progress=on_progress, on_done=done
+        )
+
+    assert await dst.read_bytes() == data
+    assert peak == 4
+    assert updates == [(8, 8), (8, 16), (8, 24), (8, 32)]
+    done.assert_awaited_once_with(cloud_path, dst, 32, True, None)
+
+
+async def test_cloud_move_to_local_removes_source_after_copy(cloud_path, tmp_path, monkeypatch):
+    from asanypath import AsAnyPath
+
+    monkeypatch.setattr(cloud_path, "stat", AsyncMock(return_value=SimpleNamespace(st_size=4)))
+    monkeypatch.setattr(cloud_path, "is_dir", AsyncMock(return_value=False))
+    monkeypatch.setattr(cloud_path, "read_bytes", AsyncMock(return_value=b"data"))
+    unlink = AsyncMock()
+    monkeypatch.setattr(cloud_path, "unlink", unlink)
+    dst = AsAnyPath(tmp_path / "moved.bin")
+    done = AsyncMock()
+    await cloud_path.copy(dst, remove_src=True, on_done=done)
+
+    assert await dst.read_bytes() == b"data"
+    unlink.assert_awaited_once()
+    done.assert_awaited_once_with(cloud_path, dst, 4, True, None)
+
+
+async def test_transfer_cancellation_cleans_up_range_workers():
+    from asanypath import TransferBudget
+    from asanypath._transfer import iter_transfer_chunks
+
+    started = asyncio.Event()
+    active = 0
+
+    async def read_range(start, end):
+        nonlocal active
+        active += 1
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
+
+    src = SimpleNamespace(
+        _supports_range_read=True,
+        stat=AsyncMock(return_value=SimpleNamespace(st_size=32)),
+        _range_read=read_range,
+    )
+
+    async def consume():
+        return [chunk async for chunk in iter_transfer_chunks(src)]
+
+    with TransferBudget(floor=4, min_range_size=8) as budget:
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert active == 0
+        assert budget.active_files == 0
+
+
+async def test_ranged_move_source_change_preserves_atomic_destination(
+    cloud_path, tmp_path, monkeypatch
+):
+    from asanypath import AsAnyPath, TransferBudget
+
+    dst = AsAnyPath(tmp_path / "existing.bin")
+    await dst.write_bytes(b"old")
+    monkeypatch.setattr(cloud_path, "is_dir", AsyncMock(return_value=False))
+    monkeypatch.setattr(cloud_path, "checksums", AsyncMock(return_value={"sha256": "different"}))
+    monkeypatch.setattr(
+        cloud_path,
+        "stat",
+        AsyncMock(
+            side_effect=[
+                SimpleNamespace(st_size=32, st_mtime=1),
+                SimpleNamespace(st_size=32, st_mtime=2),
+            ]
+        ),
+    )
+    monkeypatch.setattr(cloud_path, "_range_read", AsyncMock(return_value=b"x" * 8))
+    unlink = AsyncMock()
+    monkeypatch.setattr(cloud_path, "unlink", unlink)
+    done = AsyncMock()
+    with TransferBudget(floor=4, min_range_size=8):
+        with pytest.raises(OSError, match="Source changed"):
+            await cloud_path.copy(dst, force=True, atomic=True, remove_src=True, on_done=done)
+
+    assert await dst.read_bytes() == b"old"
+    assert not list(tmp_path.glob(".existing.bin.tmp-*"))
+    unlink.assert_not_awaited()
+    assert done.await_args.args[3] is False
+
+
+async def test_cloud_range_pins_source_version(cloud_path):
+    native = AsyncMock(return_value=b"data")
+    with patch("asanypath_native.range_read", native):
+        assert await cloud_path._range_read(0, 3, etag='"v1"', version_id="123") == b"data"
+    if isinstance(cloud_path, GCSPath):
+        assert native.await_args.kwargs["if_generation_match"] == "123"
+        assert "if_match" not in native.await_args.kwargs
+    else:
+        assert native.await_args.kwargs["if_match"] == '"v1"'
+
+
+async def test_cloud_transfer_stat_exposes_snapshot_metadata(cloud_path):
+    if isinstance(cloud_path, GCSPath):
+        with patch(
+            "asanypath.gcs.gcs_head", AsyncMock(return_value={"size": "32", "generation": "123"})
+        ):
+            metadata = await cloud_path._transfer_stat()
+        assert metadata.version_id == "123"
+    elif isinstance(cloud_path, ArtifactoryPath):
+        cloud_path._cached_info = {"st_size": 1}
+        info = AsyncMock(return_value={"size": "32", "checksum_sha1": "abc"})
+        with patch("asanypath.artifactory.art_storage_info", info):
+            metadata = await cloud_path._transfer_stat()
+        assert metadata.st_size == 32
+        assert metadata.checksums == {"sha1": "abc"}
+        info.assert_awaited_once()
+    else:
+        batcher = SimpleNamespace(
+            head=AsyncMock(return_value={"Content-Length": "32", "ETag": '"v1"'})
+        )
+        with patch.object(cloud_path, "_get_batcher", return_value=batcher):
+            metadata = await cloud_path._transfer_stat()
+        assert metadata.etag == '"v1"'
+
+
+async def test_native_range_requests_pin_version_on_wire(cloud_path, tmp_path, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+
+    from asanypath import AsAnyPath, TransferBudget
+
+    if isinstance(cloud_path, ArtifactoryPath):
+        pytest.skip("Native Artifactory content URLs require HTTPS")
+    data = bytes(range(32))
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((dict(self.headers), parse_qs(urlsplit(self.path).query)))
+            start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
+            self.send_response(206)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Content-Range", f"bytes {start}-{end}/32")
+            self.end_headers()
+            self.wfile.write(data[start : end + 1])
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    kwargs = dict(await cloud_path._get_native_kwargs())
+    kwargs["base_url" if isinstance(cloud_path, ArtifactoryPath) else "endpoint"] = endpoint
+    monkeypatch.setattr(cloud_path, "_get_native_kwargs", AsyncMock(return_value=kwargs))
+    monkeypatch.setattr(cloud_path, "is_dir", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        cloud_path,
+        "stat",
+        AsyncMock(return_value=SimpleNamespace(st_size=32, etag='"v1"', version_id="123")),
+    )
+    try:
+        with TransferBudget(floor=4, min_range_size=8):
+            dst = AsAnyPath(tmp_path / "native.bin")
+            await cloud_path.copy(dst)
+        assert await dst.read_bytes() == data
+        assert len(requests) == 4
+        for headers, query in requests:
+            if isinstance(cloud_path, GCSPath):
+                assert query["ifGenerationMatch"] == ["123"]
+                assert not any(key.lower() == "x-asanypath-generation-match" for key in headers)
+            else:
+                assert (
+                    next(value for key, value in headers.items() if key.lower() == "if-match")
+                    == '"v1"'
+                )
+    finally:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        thread.join()
+
+
+async def test_copy_callback_failure_closes_range_reader(cloud_path, tmp_path, monkeypatch):
+    from asanypath import AsAnyPath, TransferBudget
+
+    monkeypatch.setattr(cloud_path, "is_dir", AsyncMock(return_value=False))
+    monkeypatch.setattr(cloud_path, "stat", AsyncMock(return_value=SimpleNamespace(st_size=32)))
+    monkeypatch.setattr(cloud_path, "_range_read", AsyncMock(return_value=b"x" * 8))
+    callback = AsyncMock(side_effect=RuntimeError("callback failed"))
+    with TransferBudget(floor=4, min_range_size=8) as budget:
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await cloud_path.copy(
+                AsAnyPath(tmp_path / "copy.bin"), atomic=True, on_progress=callback
+            )
+        assert budget.active_files == 0
+    assert not list(tmp_path.glob(".copy.bin.tmp-*"))
+
+
+async def test_transfer_budget_contexts_are_task_local():
+    from asanypath import TransferBudget
+    from asanypath._transfer import _transfer_budget
+
+    budget = TransferBudget()
+    first_entered = asyncio.Event()
+    second_entered = asyncio.Event()
+    first_left = asyncio.Event()
+
+    async def first():
+        with budget:
+            first_entered.set()
+            await second_entered.wait()
+            assert _transfer_budget.get() is budget
+        first_left.set()
+        assert _transfer_budget.get() is None
+
+    async def second():
+        await first_entered.wait()
+        with budget:
+            second_entered.set()
+            await first_left.wait()
+            assert _transfer_budget.get() is budget
+        assert _transfer_budget.get() is None
+
+    await asyncio.wait_for(asyncio.gather(first(), second()), 1)
+
+
+async def test_sequential_chunks_release_slot_before_callbacks():
+    from asanypath import TransferBudget
+    from asanypath._transfer import iter_transfer_chunks
+
+    async def chunks(chunk_size):
+        yield b"ab"
+        yield b"cd"
+
+    src = SimpleNamespace(
+        _supports_range_read=True,
+        iter_bytes=chunks,
+        stat=AsyncMock(return_value=SimpleNamespace(st_size=4)),
+        read_bytes=AsyncMock(return_value=b"abcd"),
+    )
+
+    async def consume():
+        async for chunk in iter_transfer_chunks(src, chunk_size=2):
+            assert b"".join([inner async for inner in iter_transfer_chunks(src)]) == b"abcd"
+
+    with TransferBudget(floor=1, ceiling=1, min_range_size=8):
+        await asyncio.wait_for(consume(), 1)
+
 
 # ---------------------------------------------------------------------------
 # Test shared CloudPathMixin methods across all concrete backends.
@@ -65,13 +406,14 @@ def _make(factory, scheme, path="bucket/nested/file.txt"):
 def cloud_path(request):
     """A cloud path instance from each backend."""
     factory = request.param
-    if request.node.callspec.id == "s3":
+    backend = ("s3", "gcs", "azure", "artifactory")[request.param_index]
+    if backend == "s3":
         return factory("s3://bucket/nested/file.txt")
-    elif request.node.callspec.id == "gcs":
+    elif backend == "gcs":
         return factory("gs://bucket/nested/file.txt")
-    elif request.node.callspec.id == "azure":
+    elif backend == "azure":
         return factory("az://container/nested/file.txt")
-    elif request.node.callspec.id == "artifactory":
+    elif backend == "artifactory":
         return factory("art://host/artifactory/repo/file.txt")
 
 

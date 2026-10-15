@@ -32,6 +32,7 @@ from yarl import URL
 from asanypath._transfer import (
     async_destination_state,
     has_async_transfer_api,
+    iter_transfer_chunks,
     require_force,
     run_transfer_async,
 )
@@ -81,6 +82,7 @@ class CloudPathMixin(CommonPurePathMixin):
 
     # Subclasses set True once they implement _range_read with native support.
     _supports_range_read: bool = False
+    _conditional_range_read: bool = True
 
     # Subclasses set this to a native server-side copy batch fn (e.g. s3_copy_batch).
     _copy_batch_fn = None
@@ -303,15 +305,36 @@ class CloudPathMixin(CommonPurePathMixin):
                 break
             pos += len(chunk)
 
-    async def _range_read(self, start: int, end: int) -> bytes:
+    async def _transfer_stat(self):
+        return await self.stat()
+
+    async def _range_read(
+        self,
+        start: int,
+        end: int,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        version_id: str | None = None,
+        total_size: int | None = None,
+    ) -> bytes:
         """Read bytes [start, end] from the object via range request."""
         from asanypath_native import range_read
 
+        conditions = {}
+        if self.protocol == "gs":
+            if version_id is not None:
+                conditions["if_generation_match"] = version_id
+        elif etag and not etag.startswith("W/"):
+            conditions["if_match"] = etag
+        elif last_modified:
+            conditions["if_unmodified_since"] = last_modified
         return bytes(
             await range_read(
                 path=self._item_path,
                 start=start,
                 end=end,
+                **conditions,
                 **(await self._get_native_kwargs()),
             )
         )
@@ -799,9 +822,10 @@ class CloudPathMixin(CommonPurePathMixin):
             )
         if getattr(dst, "protocol", None) == "file" and destination_backend_options is not None:
             raise ValueError("destination_backend_options require a cloud destination")
-        if getattr(dst, "protocol", None) == "file" and (atomic or chunk_size):
+        if getattr(dst, "protocol", None) == "file" and not recursive:
             return await dst.copy_from(
                 self,
+                remove_src=remove_src,
                 force=force,
                 atomic=atomic,
                 chunk_size=chunk_size,
@@ -843,8 +867,19 @@ class CloudPathMixin(CommonPurePathMixin):
                             want_size=on_progress is not None,
                             destination_backend_options=destination_backend_options,
                         )
+                    if getattr(dst_node, "protocol", None) == "file":
+                        await dst_node.copy_from(
+                            src_node,
+                            force=force,
+                            atomic=atomic,
+                            chunk_size=chunk_size,
+                            on_progress=lambda delta, transferred, _src, _dst: _emit_progress(
+                                delta
+                            ),
+                        )
+                        return 0
                     await dst_node.parent.mkdir(parents=True, exist_ok=True)
-                    data = await src_node.read_bytes()
+                    data = b"".join([chunk async for chunk in iter_transfer_chunks(src_node)])
                     if destination_backend_options is None:
                         await dst_node.write_bytes(data)
                     else:
@@ -892,7 +927,7 @@ class CloudPathMixin(CommonPurePathMixin):
                             destination_backend_options=destination_backend_options,
                         )
                     await dst.parent.mkdir(parents=True, exist_ok=True)
-                    data = await self.read_bytes()
+                    data = b"".join([chunk async for chunk in iter_transfer_chunks(self)])
                     if destination_backend_options is None:
                         await dst.write_bytes(data)
                     else:

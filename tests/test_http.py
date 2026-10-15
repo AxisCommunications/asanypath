@@ -8,17 +8,109 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from asanypath.http import HTTPPath, HTTPSPath, _TagCollector, assemble_xml_chunks
+from asanypath.http import HTTPPath, HTTPResponse, HTTPSPath, _TagCollector, assemble_xml_chunks
 
 _HTTP_NATIVE = "asanypath.http"
 
 
 def _hp(url: str = "https://example.com/file.txt") -> HTTPPath:
     return HTTPPath(url)
+
+
+@pytest.mark.parametrize(
+    "status, content_range, valid",
+    [(206, "bytes 4-7/32", True), (206, "bytes 0-3/32", False), (200, None, False)],
+)
+async def test_http_range_response_validation(status, content_range, valid):
+    src = _hp()
+    headers = {"content-range": content_range} if content_range else {}
+    response = HTTPResponse(status_code=status, body=b"data", headers=headers)
+    request = AsyncMock(return_value=response)
+    with patch.object(src, "request", request):
+        if valid:
+            assert await src._range_read(4, 7, etag='"v1"') == b"data"
+        else:
+            with pytest.raises(OSError):
+                await src._range_read(4, 7, etag='"v1"')
+    assert request.await_args.kwargs["headers"]["range"] == "bytes=4-7"
+    assert request.await_args.kwargs["headers"]["if-match"] == '"v1"'
+
+
+@pytest.mark.parametrize("accept_ranges", ["bytes", "none"])
+async def test_http_copy_size_aware_ranges(tmp_path, accept_ranges):
+    from asanypath import AsAnyPath
+    from asanypath._transfer import TransferBudget
+
+    data = bytes(range(40))
+    src = _hp()
+    active = 0
+    peak = 0
+
+    async def request(method, **kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        start, end = map(int, kwargs["headers"]["range"].removeprefix("bytes=").split("-"))
+        return HTTPResponse(
+            status_code=206,
+            body=data[start : end + 1],
+            headers={"content-range": f"bytes {start}-{end}/40"},
+        )
+
+    whole_read = AsyncMock(return_value=data)
+    with (
+        patch.object(src, "is_dir", AsyncMock(return_value=False)),
+        patch.object(src, "read_bytes", whole_read),
+        patch.object(src, "request", AsyncMock(side_effect=request)),
+        patch(
+            "asanypath.http.http_head",
+            AsyncMock(
+                return_value={
+                    "content-length": "40",
+                    "accept-ranges": accept_ranges,
+                    "etag": '"v1"',
+                }
+            ),
+        ),
+        TransferBudget(floor=4, min_range_size=8),
+    ):
+        dst = AsAnyPath(tmp_path / "download.bin")
+        await src.copy(dst)
+
+    assert await dst.read_bytes() == data
+    assert peak == (4 if accept_ranges == "bytes" else 0)
+    assert whole_read.await_count == (0 if accept_ranges == "bytes" else 1)
+
+
+async def test_http_ignored_range_reuses_whole_response(tmp_path):
+    from asanypath import AsAnyPath, TransferBudget
+
+    src = _hp()
+    data = b"x" * 32
+    request = AsyncMock(return_value=HTTPResponse(status_code=200, body=data, headers={}))
+    whole_read = AsyncMock(side_effect=AssertionError("must reuse response"))
+    with (
+        patch.object(src, "is_dir", AsyncMock(return_value=False)),
+        patch.object(src, "request", request),
+        patch.object(src, "read_bytes", whole_read),
+        patch(
+            "asanypath.http.http_head",
+            AsyncMock(return_value={"content-length": "32", "accept-ranges": "bytes"}),
+        ),
+        TransferBudget(floor=4, min_range_size=8),
+    ):
+        dst = AsAnyPath(tmp_path / "download.bin")
+        await src.copy(dst)
+    assert await dst.read_bytes() == data
+    request.assert_awaited_once()
+    whole_read.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

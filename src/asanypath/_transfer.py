@@ -6,14 +6,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import shutil
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import aclosing, asynccontextmanager
+from contextvars import ContextVar, Token
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from asanypath.exceptions import UnsupportedProtocolError
 
@@ -21,6 +25,202 @@ _CHECKSUM_PREFERENCE = ("sha256", "sha1", "md5")
 
 # Default streaming chunk size for chunk_size=None ("auto").
 _DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024
+
+
+class RangeNotSupportedError(OSError):
+    def __init__(self, data: bytes) -> None:
+        super().__init__("Server does not support range requests")
+        self.data = data
+
+
+class TransferBudget:
+    """Share size-aware range concurrency within one transfer operation."""
+
+    def __init__(
+        self,
+        *,
+        floor: int = 8,
+        ceiling: int = 32,
+        min_range_size: int = _DEFAULT_CHUNK_SIZE,
+        per_file_cap: int = 8,
+    ) -> None:
+        if floor < 1 or ceiling < floor or min_range_size < 1 or per_file_cap < 1:
+            raise ValueError(
+                "require 1 <= floor <= ceiling and positive range size and per-file cap"
+            )
+        self.floor = floor
+        self.ceiling = ceiling
+        self.min_range_size = min_range_size
+        self.per_file_cap = per_file_cap
+        self.active_files = 0
+        self._slots = asyncio.Semaphore(ceiling)
+        self._tokens: ContextVar[tuple[Token[TransferBudget | None], ...]] = ContextVar(
+            "transfer_budget_tokens", default=()
+        )
+
+    def __enter__(self) -> TransferBudget:
+        self._tokens.set((*self._tokens.get(), _transfer_budget.set(self)))
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        tokens = self._tokens.get()
+        _transfer_budget.reset(tokens[-1])
+        self._tokens.set(tokens[:-1])
+
+
+_transfer_budget: ContextVar[TransferBudget | None] = ContextVar("transfer_budget", default=None)
+_registered_transfer: ContextVar[TransferBudget | None] = ContextVar(
+    "registered_transfer", default=None
+)
+
+
+@asynccontextmanager
+async def transfer_scope() -> AsyncIterator[TransferBudget]:
+    budget = _transfer_budget.get()
+    if budget is None:
+        loop = asyncio.get_running_loop()
+        budget = getattr(loop, "_asanypath_transfer_budget", None)
+        if budget is None:
+            budget = TransferBudget()
+            setattr(loop, "_asanypath_transfer_budget", budget)
+    if _registered_transfer.get() is budget:
+        yield budget
+        return
+    budget_token = _transfer_budget.set(budget)
+    registered_token = _registered_transfer.set(budget)
+    budget.active_files += 1
+    try:
+        await asyncio.sleep(0)
+        yield budget
+    finally:
+        budget.active_files -= 1
+        _registered_transfer.reset(registered_token)
+        _transfer_budget.reset(budget_token)
+
+
+async def iter_transfer_chunks(src: Any, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+    """Read supported sources in bounded, ordered, size-aware parallel ranges."""
+    async with transfer_scope() as budget:
+        if (
+            chunk_size
+            and chunk_size < budget.min_range_size
+            and getattr(src, "_supports_range_read", False)
+        ):
+            async with aclosing(src.iter_bytes(chunk_size)) as chunks:
+                while True:
+                    async with budget._slots:
+                        try:
+                            chunk = await anext(chunks)
+                        except StopAsyncIteration:
+                            break
+                    yield chunk
+            return
+        metadata = None
+        size = None
+        if getattr(src, "_supports_range_read", False):
+            try:
+                stat_fn = getattr(src, "_transfer_stat", src.stat)
+                metadata = await stat_fn()
+                if getattr(metadata, "supports_ranges", True):
+                    size = getattr(metadata, "st_size", None)
+            except (OSError, RuntimeError, NotImplementedError, AttributeError):
+                pass
+        spare_streams = min(budget.per_file_cap, budget.floor // max(1, budget.active_files))
+        if (
+            not isinstance(size, int)
+            or size < 2 * budget.min_range_size
+            or chunk_size == 0
+            or (chunk_size is None and spare_streams < 2)
+        ):
+            async with budget._slots:
+                data = await src.read_bytes()
+            window = chunk_size or _DEFAULT_CHUNK_SIZE
+            for offset in range(0, len(data), window):
+                yield data[offset : offset + window]
+            return
+
+        window = max(chunk_size or budget.min_range_size, budget.min_range_size)
+
+        async def read_range(start: int, end: int) -> bytes:
+            async with budget._slots:
+                if getattr(src, "_conditional_range_read", False) and any(
+                    getattr(metadata, field, None)
+                    for field in ("etag", "last_modified", "version_id")
+                ):
+                    data = await src._range_read(
+                        start,
+                        end,
+                        etag=getattr(metadata, "etag", None),
+                        last_modified=getattr(metadata, "last_modified", None),
+                        version_id=getattr(metadata, "version_id", None),
+                        total_size=size,
+                    )
+                else:
+                    data = await src._range_read(start, end)
+            if len(data) != end - start + 1:
+                raise OSError(f"Invalid range response for bytes {start}-{end}")
+            return data
+
+        offset = 0
+        if getattr(src, "_probe_range_support", False):
+            end = min(size, window) - 1
+            try:
+                first = await read_range(0, end)
+            except RangeNotSupportedError as error:
+                if len(error.data) != size:
+                    raise OSError("Source changed during ranged transfer") from error
+                for offset in range(0, size, window):
+                    yield error.data[offset : offset + window]
+                return
+            yield first
+            offset = end + 1
+        while offset < size:
+            streams = max(
+                1,
+                min(
+                    budget.per_file_cap, budget.floor // max(1, budget.active_files), size // window
+                ),
+            )
+            tasks = []
+            for _ in range(streams):
+                if offset >= size:
+                    break
+                end = min(size, offset + window) - 1
+                tasks.append(asyncio.create_task(read_range(offset, end)))
+                offset = end + 1
+            try:
+                chunks = await asyncio.gather(*tasks)
+                for chunk in chunks:
+                    yield chunk
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        final_metadata = await stat_fn()
+        for field in ("st_size", "st_mtime", "etag", "version_id", "checksums"):
+            before = getattr(metadata, field, None)
+            after = getattr(final_metadata, field, None)
+            if before is not None and before != after:
+                raise OSError("Source changed during ranged transfer")
+
+
+TransferParams = ParamSpec("TransferParams")
+TransferResult = TypeVar("TransferResult")
+
+
+def _transfer_operation(
+    fn: Callable[TransferParams, Awaitable[TransferResult]],
+) -> Callable[TransferParams, Awaitable[TransferResult]]:
+    @wraps(fn)
+    async def wrapped(
+        *args: TransferParams.args, **kwargs: TransferParams.kwargs
+    ) -> TransferResult:
+        async with transfer_scope():
+            return await fn(*args, **kwargs)
+
+    return wrapped
 
 
 def _validate_chunk_size(chunk_size: int | None) -> None:
@@ -191,6 +391,7 @@ def run_transfer_sync(
             on_done(src, dst, transferred, error is None, error)
 
 
+@_transfer_operation
 async def run_transfer_async(
     *,
     src: Any,
