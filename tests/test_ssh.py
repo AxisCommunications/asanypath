@@ -360,6 +360,32 @@ class TestSSHPath(testbase):
         with pytest.raises(FileExistsError):
             await _ssh().mkdir()
 
+    async def test_upload_buffer_small_single_write(self, ssh):
+        from io import BytesIO
+
+        with patch.object(SSHPath, "write_bytes", new=AsyncMock()) as wb:
+            await _ssh()._upload_buffer(BytesIO(b"small"), 5)
+        wb.assert_awaited_once_with(b"small")
+
+    async def test_upload_buffer_streams_chunks_with_append(self, ssh):
+        from io import BytesIO
+
+        calls: list[tuple[bool, bytes]] = []
+
+        async def write_chunk(*, path, data, truncate, **kwargs):
+            calls.append((truncate, data))
+            return len(data)
+
+        with (
+            patch.object(SSHPath, "_STREAM_THRESHOLD", 4),
+            patch.object(SSHPath, "_STREAM_CHUNK", 4),
+            patch("asanypath.ssh.ssh_write_chunk", new=write_chunk),
+        ):
+            await _ssh()._upload_buffer(BytesIO(b"abcdefghij"), 10)
+        # First chunk truncates, the rest append; reassembled bytes are intact.
+        assert [t for t, _ in calls] == [True, False, False]
+        assert b"".join(d for _, d in calls) == b"abcdefghij"
+
     async def test_rmdir(self, ssh):
         await _ssh().rmdir()
         assert ssh.rmdir.await_args.kwargs["path"] == "/home/alice/file.txt"

@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::http::{bearer_headers, do_request_light, status_to_pyerr};
+use crate::http::{bearer_headers, do_request_light, do_request_stream_file, status_to_pyerr};
 
 // ---------------------------------------------------------------------------
 // JSON response types for Artifactory Storage API
@@ -462,6 +462,44 @@ pub fn art_put_batch<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let creds = art_creds!(base_url, token);
         batch_put!(creds, items, h2)
+    })
+}
+
+/// Stream-upload a single file by PUT (body framed from disk; bounded memory).
+/// Artifactory has no multipart API, so a large object is sent as one streamed PUT.
+#[pyfunction]
+#[pyo3(signature = (base_url, key, file_path, size, token, options_json=None, use_h2=None))]
+pub fn art_put_stream<'py>(
+    py: Python<'py>,
+    base_url: String,
+    key: String,
+    file_path: String,
+    size: u64,
+    token: String,
+    options_json: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let options: crate::backend::UploadOptions =
+            sonic_rs::from_str(&options_json.unwrap_or_else(|| "{}".to_string()))
+                .map_err(|e| PyValueError::new_err(format!("invalid backend_options: {e}")))?;
+        crate::backend::require_empty_provider(&options)?;
+        let creds = art_creds!(base_url, token);
+        let url = crate::backend::append_query(&creds.content_url(&key), &options.query);
+        let mut headers = creds.auth_headers();
+        headers.push((
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        ));
+        crate::backend::merge_user_headers(&mut headers, &options)?;
+        let (status, body) = do_request_stream_file("PUT", &url, &headers, &file_path, size, h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&key), &body));
+        }
+        Ok(())
     })
 }
 

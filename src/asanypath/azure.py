@@ -12,6 +12,7 @@ https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-rest-api
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from os import getenv
@@ -31,6 +32,8 @@ from asanypath_native import (
     az_list_containers,
     az_presign,
     az_put_batch,
+    az_put_block,
+    az_put_block_list,
     az_put_container_acl,
 )
 
@@ -82,6 +85,9 @@ class AzurePath(CloudPathMixin):
 
     protocol: str = "az"
     _supports_range_read: bool = True
+    # Single PUT below the threshold, else staged block-blob parts.
+    _MULTIPART_THRESHOLD = 8 * 1024 * 1024
+    _MULTIPART_PART_SIZE = 8 * 1024 * 1024
     _is_dir_batch_fn = staticmethod(az_is_dir_batch)
     _copy_batch_fn = staticmethod(az_copy_batch)
 
@@ -179,6 +185,43 @@ class AzurePath(CloudPathMixin):
     # ------------------------------------------------------------------
     # Backend-specific operations
     # ------------------------------------------------------------------
+
+    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+        """Upload a spooled write buffer, using block blobs for large objects."""
+        if size < self._MULTIPART_THRESHOLD:
+            data = fileobj.read()
+            if backend_options is None:
+                await self.write_bytes(data)
+            else:
+                await self.write_bytes(data, backend_options=backend_options)
+            return
+        await self._block_upload(fileobj, backend_options=backend_options)
+
+    async def _block_upload(self, fileobj, *, backend_options=None) -> None:
+        """Stage fixed-size blocks then commit the list (memory bounded to one block)."""
+        options_json = (
+            msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
+        )
+        block_ids: list[str] = []
+        index = 0
+        while True:
+            chunk = fileobj.read(self._MULTIPART_PART_SIZE)
+            if not chunk:
+                break
+            # Block ids must be equal-length base64 strings.
+            block_id = base64.b64encode(f"{index:048d}".encode()).decode()
+            await az_put_block(
+                blob=self._item_path, block_id=block_id, data=chunk, **self._native_kwargs
+            )
+            block_ids.append(block_id)
+            index += 1
+        await az_put_block_list(
+            blob=self._item_path,
+            block_ids=block_ids,
+            options_json=options_json,
+            **self._native_kwargs,
+        )
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has blobs with this prefix)."""

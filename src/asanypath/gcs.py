@@ -39,6 +39,8 @@ from asanypath_native import (
     gcs_presign,
     gcs_put_acl,
     gcs_put_batch,
+    gcs_start_resumable,
+    gcs_upload_chunk,
 )
 
 from asanypath.cloud import CloudPathMixin
@@ -63,6 +65,9 @@ class GCSPath(CloudPathMixin):
 
     protocol: str = "gs"
     _supports_range_read: bool = True
+    # Single PUT below the threshold, else resumable upload in 256 KiB-aligned chunks.
+    _MULTIPART_THRESHOLD = 8 * 1024 * 1024
+    _MULTIPART_PART_SIZE = 8 * 1024 * 1024
     _is_dir_batch_fn = staticmethod(gcs_is_dir_batch)
     _copy_batch_fn = staticmethod(gcs_copy_batch)
 
@@ -144,6 +149,30 @@ class GCSPath(CloudPathMixin):
     # ------------------------------------------------------------------
     # Backend-specific operations
     # ------------------------------------------------------------------
+
+    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+        """Upload a spooled write buffer, using a resumable session for large objects."""
+        if size < self._MULTIPART_THRESHOLD:
+            data = fileobj.read()
+            if backend_options is None:
+                await self.write_bytes(data)
+            else:
+                await self.write_bytes(data, backend_options=backend_options)
+            return
+        await self._resumable_upload(fileobj, size)
+
+    async def _resumable_upload(self, fileobj, size: int) -> None:
+        """Stream the buffer via a GCS resumable session (memory bounded to one chunk)."""
+        native_kwargs = await self._get_native_kwargs()
+        session_uri = await gcs_start_resumable(object=self._item_path, total=size, **native_kwargs)
+        offset = 0
+        while True:
+            chunk = fileobj.read(self._MULTIPART_PART_SIZE)
+            if not chunk:
+                break
+            await gcs_upload_chunk(session_uri=session_uri, data=chunk, offset=offset, total=size)
+            offset += len(chunk)
+        type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has objects with this prefix)."""

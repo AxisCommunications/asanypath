@@ -943,6 +943,97 @@ pub fn az_put_batch<'py>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Block blob upload (orchestrated from Python): stage blocks, then commit list
+// ---------------------------------------------------------------------------
+
+/// Stage one block for a block blob. `block_id` is the raw (pre-URL-encode) id.
+#[pyfunction]
+#[pyo3(signature = (endpoint, container, blob, block_id, data, account_name, account_key=None, sas_token=None, use_h2=None))]
+pub fn az_put_block<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    container: String,
+    blob: String,
+    block_id: String,
+    data: Vec<u8>,
+    account_name: String,
+    account_key: Option<String>,
+    sas_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = az_creds!(endpoint, container, account_name, account_key, sas_token);
+        let base = creds.blob_url(&blob);
+        let sep = if base.contains('?') { "&" } else { "?" };
+        let url = format!(
+            "{}{}comp=block&blockid={}",
+            base,
+            sep,
+            urlencoding::encode(&block_id)
+        );
+        let mut headers = vec![("content-length".to_string(), data.len().to_string())];
+        let params = [("blockid", block_id.as_str()), ("comp", "block")];
+        creds.sign("PUT", &url, &mut headers, Some(&params));
+        let (status, body) = do_request_light("PUT", &url, &headers, Some(Bytes::from(data)), h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&blob), &body));
+        }
+        Ok(())
+    })
+}
+
+/// Commit a block blob from the staged block ids (in order).
+#[pyfunction]
+#[pyo3(signature = (endpoint, container, blob, block_ids, account_name, account_key=None, sas_token=None, options_json=None, use_h2=None))]
+pub fn az_put_block_list<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    container: String,
+    blob: String,
+    block_ids: Vec<String>,
+    account_name: String,
+    account_key: Option<String>,
+    sas_token: Option<String>,
+    options_json: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let options: crate::backend::UploadOptions =
+            sonic_rs::from_str(&options_json.unwrap_or_else(|| "{}".to_string()))
+                .map_err(|e| PyValueError::new_err(format!("invalid backend_options: {e}")))?;
+        crate::backend::require_empty_provider(&options)?;
+        let creds = az_creds!(endpoint, container, account_name, account_key, sas_token);
+        let base = creds.blob_url(&blob);
+        let sep = if base.contains('?') { "&" } else { "?" };
+        let url = format!("{}{}comp=blocklist", base, sep);
+        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>");
+        for id in &block_ids {
+            xml.push_str(&format!("<Latest>{}</Latest>", id));
+        }
+        xml.push_str("</BlockList>");
+        let body = Bytes::from(xml.into_bytes());
+        let mut headers = vec![
+            ("content-length".to_string(), body.len().to_string()),
+            ("content-type".to_string(), "application/xml".to_string()),
+        ];
+        crate::backend::merge_user_headers(&mut headers, &options)?;
+        let params = [("comp", "blocklist")];
+        creds.sign("PUT", &url, &mut headers, Some(&params));
+        let (status, resp) = do_request_light("PUT", &url, &headers, Some(body), h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+        if !status.is_success() {
+            return Err(status_to_pyerr(status, &creds.error_path(&blob), &resp));
+        }
+        Ok(())
+    })
+}
+
 #[pyfunction]
 pub fn az_copy_batch<'py>(
     py: Python<'py>,

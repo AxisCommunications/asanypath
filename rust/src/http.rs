@@ -158,6 +158,46 @@ pub async fn do_request_light(
     .await
 }
 
+/// Stream a request body from a file (bounded memory). An explicit
+/// `content_length` frames the body with Content-Length instead of chunked
+/// encoding; retries reopen the file so a consumed stream can be replayed.
+pub async fn do_request_stream_file(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    file_path: &str,
+    content_length: u64,
+    use_h2: bool,
+) -> Result<(StatusCode, Bytes), String> {
+    let method_parsed = method.parse::<Method>().map_err(|e| e.to_string())?;
+    let client = get_client(use_h2);
+    let headers = headers.to_vec();
+
+    (async || {
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let mut req = client.request(method_parsed.clone(), url);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req = req
+            .header("content-length", content_length.to_string())
+            .body(reqwest::Body::wrap_stream(stream));
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if is_retryable_status(status) {
+            return Err(format!("HTTP {} (retryable)", status.as_u16()));
+        }
+        let resp_body = resp.bytes().await.map_err(|e| e.to_string())?;
+        Ok((status, resp_body))
+    })
+    .retry(retry_backoff())
+    .when(|e: &String| is_retryable(e))
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
