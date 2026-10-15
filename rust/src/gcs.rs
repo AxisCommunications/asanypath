@@ -18,6 +18,7 @@ use futures::future::join_all;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use serde::{Deserialize, Serialize};
 use sonic_rs::JsonValueTrait;
 use std::collections::{HashMap, HashSet};
@@ -995,7 +996,7 @@ pub fn gcs_start_resumable<'py>(
 pub fn gcs_upload_chunk<'py>(
     py: Python<'py>,
     session_uri: String,
-    data: Vec<u8>,
+    data: PyBackedBytes,
     offset: u64,
     total: u64,
     use_h2: Option<bool>,
@@ -1011,10 +1012,15 @@ pub fn gcs_upload_chunk<'py>(
                 format!("bytes {offset}-{end}/{total}"),
             ),
         ];
-        let (status, body, _h) =
-            do_request("PUT", &session_uri, &headers, Some(Bytes::from(data)), h2)
-                .await
-                .map_err(PyRuntimeError::new_err)?;
+        let (status, body, _h) = do_request(
+            "PUT",
+            &session_uri,
+            &headers,
+            Some(Bytes::from_owner(data)),
+            h2,
+        )
+        .await
+        .map_err(PyRuntimeError::new_err)?;
         // 308 Resume Incomplete = intermediate chunk accepted; 2xx = final chunk done.
         if status.as_u16() == 308 || status.is_success() {
             Ok(())

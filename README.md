@@ -102,7 +102,9 @@ shared reader for local downloads and source reads in cross-backend copies.
 FTP/FTPS, sources without size metadata, and HTTP servers without advertised
 range support retain single-stream downloads. Local-only copies and native
 server-side copy/rename operations retain their existing implementations.
-Uploads remain single writes; this does not introduce multipart uploads.
+Large S3/Azure uploads also use concurrent parts within this shared budget.
+GCS resumable sessions remain sequential because the protocol requires ordered
+offsets.
 
 Concurrent library copies share a default budget within the event loop. To
 configure a batch explicitly:
@@ -115,10 +117,14 @@ with TransferBudget(floor=8, ceiling=32, min_range_size=8 * 1024 * 1024, per_fil
     await asyncio.gather(*(src.copy(dst) for src, dst in pairs))
 ```
 
-The ceiling bounds concurrent reads in this budget, not metadata requests or
-other processes. Parallel range buffers are bounded by the active streams
-times the range size; cross-backend destinations still buffer the complete
-object for their existing write API. `floor=1` disables automatic splitting.
+The ceiling bounds concurrent range reads and upload parts in this budget,
+not metadata requests, single-request writes, or other processes. Parallel
+buffers are bounded by active streams times their chunk sizes. Cross-backend
+copies spool the downloaded source to a temporary file before using the
+destination's upload API. S3/Azure then upload concurrent parts; destinations
+without a streaming upload implementation can still buffer the complete write.
+Same-backend server-side copies are unchanged.
+`floor=1` disables automatic range splitting and makes upload parts sequential.
 Explicit `chunk_size` requests retain sequential streaming when splitting
 would be inappropriate, and `chunk_size=0` disables streaming to local paths.
 
@@ -163,14 +169,24 @@ async with AsAnyPath("s3://bucket/huge.bin").open("wb") as f:
 await AsAnyPath("/data/movie.mp4").copy("s3://bucket/movie.mp4")
 ```
 
-Peak memory per upload is one part — **8 MiB by default**. Objects smaller than
-one part upload in a single request. (`write_bytes(data)` / `write_text(...)`
+S3 multipart and Azure block uploads send **up to 8 parts concurrently by
+default**, filling freed slots without waiting for a whole batch. Concurrent
+files share the budget rather than each multiplying the target concurrency.
+At the default 8 MiB part size, a single large upload buffers up to **64 MiB of
+part payload**, plus file spooling, transport and runtime overhead. Native part
+requests borrow immutable Python bytes instead of copying each buffer again.
+Objects smaller than one part upload in a single request.
+(`write_bytes(data)` / `write_text(...)`
 take the whole payload in memory by definition — use `open("wb")` or `copy()`
-for large data.)
+for large data; direct `write_bytes()` remains a single write.)
 
-**Tuning the memory footprint.** The part size *is* the max RAM held per
-in-flight chunk (parts upload sequentially, so there is no concurrency
-multiplier). Set it globally via env, or per call:
+**Tuning throughput and memory.** Buffered part payload scales with part size
+times concurrent upload slots. A slot is reserved before reading its part,
+so queued uploads do not allocate unbounded buffers. Tune concurrency with
+`TransferBudget(floor=..., ceiling=..., per_file_cap=...)`, or CLI
+`--concurrency-floor` (also used by `cp`, `mv`, and `sync`). To limit a batch
+to one in-flight part/range, use `TransferBudget(floor=1, ceiling=1)`.
+Set part size globally via env, or per call:
 
 ```bash
 export ASANYPATH_UPLOAD_CHUNK_SIZE=33554432   # 32 MiB parts (bytes)
@@ -188,6 +204,11 @@ Bigger parts mean fewer requests and a larger single-object ceiling (S3 allows
 10,000 parts, so 8 MiB parts cap an object at ~80 GB). Backend minimums are
 applied automatically: **S3** clamps to ≥ 5 MiB parts, **GCS** rounds down to a
 256 KiB multiple.
+
+On S3 failure or cancellation, in-flight workers are cancelled and joined
+before aborting the multipart upload; completion lists remain in source order.
+Azure only commits the ordered block list after all stages succeed; abandoned
+uncommitted blocks are left for Azure's automatic expiry.
 
 Unknown URI schemes now construct as `UnsupportedProtocolPath` placeholders.
 Pure path operations (e.g. `.name`, `.parent`, joins) still work, while backend
@@ -454,6 +475,22 @@ uv run --extra bench python scripts/bench.py --backend all --rounds 3 --objects 
 # Sweep concurrency levels
 uv run --extra bench python scripts/bench.py --backend art --rounds 3 --concurrency-levels 1,10,50
 ```
+
+For multipart upload throughput, use `scripts/bench_upload.py` with real shard
+files and an explicitly selected S3-compatible endpoint:
+
+```bash
+uv run --extra bench python scripts/bench_upload.py \
+  --destination s3://my-bucket/bench --endpoint-url https://my-storage-endpoint \
+  --part-mib 8 --streams 1 8 --rounds 3 /data/shard-001 /data/shard-002
+```
+
+This compares asanypath and boto3 using one shared request budget per client.
+It warms up each case, reports JSON timings and MiB/s, verifies uploaded contents
+outside the timed interval, and deletes only the uniquely named benchmark
+objects it created. Both clients use normal AWS credentials (or `--profile`).
+Run with one large shard and again with several representative shards; results
+from a local test server are not evidence of production endpoint throughput.
 
 ### S3 — live S3-compatible service (median of 20 rounds, 10 objects, c=1)
 

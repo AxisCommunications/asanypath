@@ -285,7 +285,6 @@ class SyncPath(CommonPurePathMixin):
         if remote_dst is not None:
             if atomic:
                 raise NotImplementedError("atomic=True is only supported for local destinations")
-            # chunk_size (a local streaming hint) is ignored for cloud destinations.
 
             def _copy_remote_file() -> int:
                 needs_copy, same_path, destination_exists = sync_destination_state(self, remote_dst)

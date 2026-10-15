@@ -25,6 +25,7 @@ use bytes::Bytes;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use quick_xml::Reader;
 use quick_xml::{XmlVersion, events::Event};
 use serde::{Deserialize, Serialize};
@@ -1154,7 +1155,7 @@ pub fn s3_upload_part<'py>(
     key: String,
     upload_id: String,
     part_number: u32,
-    data: Vec<u8>,
+    data: PyBackedBytes,
     region: String,
     access_key: String,
     secret_key: String,
@@ -1181,7 +1182,7 @@ pub fn s3_upload_part<'py>(
             "PUT",
             &s3_path,
             &query,
-            Some(Bytes::from(data)),
+            Some(Bytes::from_owner(data)),
             h2,
             &[],
         )

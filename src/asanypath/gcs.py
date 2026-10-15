@@ -43,6 +43,7 @@ from asanypath_native import (
     gcs_upload_chunk,
 )
 
+from asanypath._transfer import upload_parts
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import (
     GCS_CHUNK_ALIGN,
@@ -177,12 +178,13 @@ class GCSPath(CloudPathMixin):
         native_kwargs = await self._get_native_kwargs()
         session_uri = await gcs_start_resumable(object=self._item_path, total=size, **native_kwargs)
         offset = 0
-        while True:
-            chunk = fileobj.read(part_size)
-            if not chunk:
-                break
+
+        async def upload(index: int, chunk: bytes) -> None:
+            nonlocal offset
             await gcs_upload_chunk(session_uri=session_uri, data=chunk, offset=offset, total=size)
             offset += len(chunk)
+
+        await upload_parts(fileobj, size, part_size, upload, parallel=False)
         type(self)._listing_cache.pop(self._listing_cache_key(), None)
 
     async def is_dir(self) -> bool:

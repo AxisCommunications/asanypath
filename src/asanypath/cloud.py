@@ -14,6 +14,8 @@ import os
 import tempfile
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
+from functools import partial
 from os import PathLike
 from os.path import expanduser
 from pathlib import Path
@@ -30,6 +32,8 @@ from os import linesep
 from yarl import URL
 
 from asanypath._transfer import (
+    _file_io,
+    _validate_chunk_size,
     async_destination_state,
     has_async_transfer_api,
     iter_transfer_chunks,
@@ -502,6 +506,27 @@ class CloudPathMixin(CommonPurePathMixin):
         else:
             await self.write_bytes(data, backend_options=backend_options)
 
+    async def _copy_to_remote(
+        self, dst, *, chunk_size: int | None, backend_options: BackendOptions | None
+    ) -> int:
+        upload = getattr(dst, "_upload_buffer", None)
+        if upload is None:
+            data = b"".join([chunk async for chunk in iter_transfer_chunks(self, chunk_size)])
+            if backend_options is None:
+                await dst.write_bytes(data)
+            else:
+                await dst.write_bytes(data, backend_options=backend_options)
+            return len(data)
+        size = 0
+        with tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_SIZE, mode="w+b") as spool:
+            async with aclosing(iter_transfer_chunks(self, chunk_size)) as chunks:
+                async for chunk in chunks:
+                    await _file_io(partial(spool.write, chunk))
+                    size += len(chunk)
+            spool.seek(0)
+            await upload(spool, size, chunk_size=chunk_size, backend_options=backend_options)
+        return size
+
     async def unlink(self, missing_ok: bool = False) -> None:
         """Delete object."""
         try:
@@ -812,10 +837,9 @@ class CloudPathMixin(CommonPurePathMixin):
         """
         from asanypath import AsAnyPath
 
+        _validate_chunk_size(chunk_size)
         dst = dst if has_async_transfer_api(dst) else AsAnyPath(str(dst))
         same_native = self._can_server_side_copy(dst)
-        # chunk_size is a local streaming hint; cloud writes are single PUTs, so
-        # it is ignored (not an error) for non-local destinations.
         if atomic and getattr(dst, "protocol", None) != "file" and not same_native:
             raise NotImplementedError(
                 "atomic=True is only supported for local or same-backend destinations"
@@ -879,14 +903,11 @@ class CloudPathMixin(CommonPurePathMixin):
                         )
                         return 0
                     await dst_node.parent.mkdir(parents=True, exist_ok=True)
-                    data = b"".join([chunk async for chunk in iter_transfer_chunks(src_node)])
-                    if destination_backend_options is None:
-                        await dst_node.write_bytes(data)
-                    else:
-                        await dst_node.write_bytes(
-                            data, backend_options=destination_backend_options
-                        )
-                    return len(data)
+                    return await src_node._copy_to_remote(
+                        dst_node,
+                        chunk_size=chunk_size,
+                        backend_options=destination_backend_options,
+                    )
 
                 needs_copy, same_path, destination_exists = await async_destination_state(
                     src_node, dst_node
@@ -927,12 +948,11 @@ class CloudPathMixin(CommonPurePathMixin):
                             destination_backend_options=destination_backend_options,
                         )
                     await dst.parent.mkdir(parents=True, exist_ok=True)
-                    data = b"".join([chunk async for chunk in iter_transfer_chunks(self)])
-                    if destination_backend_options is None:
-                        await dst.write_bytes(data)
-                    else:
-                        await dst.write_bytes(data, backend_options=destination_backend_options)
-                    return len(data)
+                    return await self._copy_to_remote(
+                        dst,
+                        chunk_size=chunk_size,
+                        backend_options=destination_backend_options,
+                    )
 
                 needs_copy, same_path, destination_exists = await async_destination_state(self, dst)
                 if not needs_copy:
