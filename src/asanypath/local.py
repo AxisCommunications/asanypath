@@ -294,7 +294,7 @@ class SyncPath(CommonPurePathMixin):
                 run_sync_maybe(remote_dst.parent.mkdir(parents=True, exist_ok=True))
                 size = self._path.stat().st_size
                 with self._path.open("rb") as src_file:
-                    run_sync_maybe(remote_dst._upload_buffer(src_file, size))
+                    run_sync_maybe(remote_dst._upload_buffer(src_file, size, chunk_size=chunk_size))
                 return size
 
             def _copy_remote_tree() -> int:
@@ -315,7 +315,11 @@ class SyncPath(CommonPurePathMixin):
                         run_sync_maybe(destination_file.parent.mkdir(parents=True, exist_ok=True))
                         size = source_file._path.stat().st_size
                         with source_file._path.open("rb") as src_file:
-                            run_sync_maybe(destination_file._upload_buffer(src_file, size))
+                            run_sync_maybe(
+                                destination_file._upload_buffer(
+                                    src_file, size, chunk_size=chunk_size
+                                )
+                            )
                         total += size
                 return total
 
@@ -596,7 +600,7 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
                     await maybe_mkdir
                 size = self._path.stat().st_size
                 with self._path.open("rb") as src_file:
-                    await remote_dst._upload_buffer(src_file, size)
+                    await remote_dst._upload_buffer(src_file, size, chunk_size=chunk_size)
                 return size
 
             async def _copy_remote_tree() -> int:
@@ -619,7 +623,9 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
                             await maybe_mkdir
                         size = source_file._path.stat().st_size
                         with source_file._path.open("rb") as src_file:
-                            await destination_file._upload_buffer(src_file, size)
+                            await destination_file._upload_buffer(
+                                src_file, size, chunk_size=chunk_size
+                            )
                         total += size
                 return total
 

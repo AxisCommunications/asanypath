@@ -59,12 +59,19 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from os import getenv
 from types import SimpleNamespace
-from typing import IO, TYPE_CHECKING, TypeVar
+from typing import IO, TYPE_CHECKING, TypeVar, cast
 
 import aioftp
+from yarl import URL
 
 from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import (
+    UPLOAD_CHUNK_SIZE,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
+)
 
 if TYPE_CHECKING:
     from typing import Self
@@ -155,10 +162,8 @@ class FTPPath(CloudPathMixin):
     _tls: bool = False
     _default_port: int = 21
     _supports_range_read: bool = False
-    # Large objects stream to the data connection in chunks instead of buffering
-    # the whole payload in memory.
-    _STREAM_THRESHOLD = 8 * 1024 * 1024
-    _STREAM_CHUNK = 1024 * 1024
+    # Bytes per streamed read; objects below this write in a single call.
+    _STREAM_CHUNK = UPLOAD_CHUNK_SIZE
 
     def __init__(
         self,
@@ -171,10 +176,11 @@ class FTPPath(CloudPathMixin):
     ) -> None:
         super().__init__(*parts)
         cfg = self.env_config
-        self._host = host or self._path.host or cfg.host
-        self._port = port or self._path.port or cfg.port
-        url_pw = self._path.password
-        url_user = self._path.user
+        url = cast(URL, self._path)
+        self._host = host or url.host or cfg.host
+        self._port = port or url.port or cfg.port
+        url_pw = url.password
+        url_user = url.user
         # Username precedence: kwarg > URL > netrc > env default.
         # Password precedence: kwarg > URL > netrc > anonymous default.
         netrc_user, netrc_pw, netrc_account = _netrc_lookup(self._host)
@@ -218,7 +224,7 @@ class FTPPath(CloudPathMixin):
 
     @property
     def _item_path(self) -> str:
-        return self._path.path or "/"
+        return cast(URL, self._path).path or "/"
 
     @property
     def _native_kwargs(self) -> dict:
@@ -404,10 +410,16 @@ class FTPPath(CloudPathMixin):
         return await self._op(_write)
 
     async def _upload_buffer(
-        self, fileobj: IO[bytes], size: int, *, backend_options: BackendOptions | None = None
+        self,
+        fileobj: IO[bytes],
+        size: int,
+        *,
+        backend_options: BackendOptions | None = None,
+        chunk_size: int | None = None,
     ) -> None:
         """Stream large objects to the FTP data connection (bounded memory)."""
-        if size < self._STREAM_THRESHOLD:
+        chunk_bytes = chunk_size or self._STREAM_CHUNK
+        if size < chunk_bytes:
             await self.write_bytes(fileobj.read())
             return
         path = self._item_path
@@ -415,7 +427,7 @@ class FTPPath(CloudPathMixin):
         async def _stream(client: aioftp.Client) -> int:
             async with client.upload_stream(path) as stream:
                 while True:
-                    chunk = fileobj.read(self._STREAM_CHUNK)
+                    chunk = fileobj.read(chunk_bytes)
                     if not chunk:
                         break
                     await stream.write(chunk)

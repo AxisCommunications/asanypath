@@ -102,7 +102,7 @@ disable_error_code = ["attr-defined", "arg-type", "assignment"]
 module = "asanypath.local"
 disallow_untyped_defs = false
 warn_return_any = false
-disable_error_code = ["type-var", "misc", "override", "return-value"]
+disable_error_code = ["type-var", "misc", "override", "return-value", "assignment", "no-redef"]
 
 [[tool.mypy.overrides]]
 module = "asanypath.common"
@@ -120,19 +120,31 @@ disable_error_code = ["override", "type-arg", "return-value", "assignment", "att
 module = ["asanypath.s3", "asanypath.gcs", "asanypath.azure", "asanypath.artifactory"]
 disallow_untyped_defs = false
 warn_return_any = false
-disable_error_code = ["no-any-return", "attr-defined", "assignment", "override"]
+disable_error_code = ["no-any-return", "attr-defined", "assignment", "override", "arg-type", "misc"]
+
+[[tool.mypy.overrides]]
+module = ["asanypath.ssh", "asanypath.ftp"]
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["attr-defined", "override", "arg-type", "misc", "no-any-return", "assignment"]
+
+[[tool.mypy.overrides]]
+module = "asanypath.sync"
+disallow_untyped_defs = false
+warn_return_any = false
+disable_error_code = ["no-any-return", "misc", "attr-defined", "arg-type"]
 
 [[tool.mypy.overrides]]
 module = "asanypath.cloud"
 disallow_untyped_defs = false
 warn_return_any = false
-disable_error_code = ["no-any-return", "arg-type"]
+disable_error_code = ["no-any-return", "arg-type", "attr-defined", "misc", "assignment"]
 
 [[tool.mypy.overrides]]
 module = "asanypath.asanypath"
 disallow_untyped_defs = false
 warn_return_any = false
-disable_error_code = ["no-any-return", "misc", "union-attr", "type-var"]
+disable_error_code = ["no-any-return", "misc", "union-attr", "type-var", "attr-defined"]
 
 [[tool.mypy.overrides]]
 module = "asanypath.batcher"

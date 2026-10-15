@@ -39,7 +39,13 @@ from asanypath_native import (
 )
 
 from asanypath.cloud import CloudPathMixin
-from asanypath.options import AccessGrant, AccessPolicy, AccessPolicyPatch, BackendOptions
+from asanypath.options import (
+    UPLOAD_CHUNK_SIZE,
+    AccessGrant,
+    AccessPolicy,
+    AccessPolicyPatch,
+    BackendOptions,
+)
 
 
 def _jfrog_conf_token(base_url: str) -> str | None:
@@ -99,9 +105,9 @@ class ArtifactoryPath(CloudPathMixin):
 
     protocol: str = "art"
     _supports_range_read: bool = True
-    # Artifactory has no multipart API: large objects stream a single PUT body
-    # from disk (bounded memory) instead of buffering the whole object.
-    _STREAM_THRESHOLD = 8 * 1024 * 1024
+    # Artifactory has no multipart API: objects at/above this size stream a single
+    # PUT body from disk (bounded memory) instead of buffering the whole object.
+    _STREAM_THRESHOLD = UPLOAD_CHUNK_SIZE
     _copy_batch_fn = staticmethod(art_copy_batch)
 
     @staticmethod
@@ -201,9 +207,11 @@ class ArtifactoryPath(CloudPathMixin):
     # Backend-specific operations
     # ------------------------------------------------------------------
 
-    async def _upload_buffer(self, fileobj, size: int, *, backend_options=None) -> None:
+    async def _upload_buffer(
+        self, fileobj, size: int, *, backend_options=None, chunk_size: int | None = None
+    ) -> None:
         """Upload a spooled write buffer; large objects stream a single PUT from disk."""
-        if size < self._STREAM_THRESHOLD:
+        if size < (chunk_size or self._STREAM_THRESHOLD):
             data = fileobj.read()
             if backend_options is None:
                 await self.write_bytes(data)

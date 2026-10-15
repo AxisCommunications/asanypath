@@ -638,7 +638,7 @@ class TestCloudFileOpen:
         payload = b"x" * (_CloudFile._SPOOL_MAX_SIZE + 4096)
         captured = {}
 
-        async def fake_upload(self, fileobj, size, *, backend_options=None):
+        async def fake_upload(self, fileobj, size, *, backend_options=None, chunk_size=None):
             captured["rolled"] = fileobj._rolled
             captured["size"] = size
             captured["data"] = fileobj.read()
