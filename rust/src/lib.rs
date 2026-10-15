@@ -40,6 +40,10 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(s3::s3_get_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_head_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_put_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(s3::s3_create_multipart, m)?)?;
+    m.add_function(wrap_pyfunction!(s3::s3_upload_part, m)?)?;
+    m.add_function(wrap_pyfunction!(s3::s3_complete_multipart, m)?)?;
+    m.add_function(wrap_pyfunction!(s3::s3_abort_multipart, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_is_dir_batch, m)?)?;
