@@ -31,6 +31,7 @@ use quick_xml::{XmlVersion, events::Event};
 use serde::{Deserialize, Serialize};
 
 use crate::http::{do_request, extract_host, status_to_pyerr};
+use crate::listing::{ListEntry, Listing};
 use crate::xml::local_name;
 use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
@@ -292,110 +293,61 @@ async fn do_s3_request(
 // XML listing parser
 // ---------------------------------------------------------------------------
 
-pub(crate) fn parse_listing_page(
-    body: &[u8],
-    search_prefix: &str,
-    current_key: &str,
-    bucket: &str,
-    found_all: &mut HashMap<String, ()>,
-    uris: &mut Vec<String>,
-) -> Option<String> {
+pub(crate) fn parse_listing_page(body: &[u8], listing: &mut Listing) -> Option<String> {
     let mut reader = Reader::from_reader(body);
     reader.config_mut().trim_text(true);
 
     let mut buf = Vec::with_capacity(256);
-    let mut in_tag: Option<String> = None;
-    let mut text_buf = String::new();
-    let mut continuation_token: Option<String> = None;
+    let mut text = String::new();
+    let mut in_contents = false;
+    let mut in_prefixes = false;
+    let mut key = String::new();
+    let mut size = None;
+    let mut modified = None;
+    let mut continuation_token = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let name = e.name();
-                let name_ref = name.as_ref();
-                let local = local_name(name_ref);
-                match local {
-                    "Key" | "Prefix" | "NextContinuationToken" => {
-                        in_tag = Some(local.to_string());
-                        text_buf.clear();
+                match local_name(name.as_ref()) {
+                    "Contents" => {
+                        in_contents = true;
+                        key.clear();
+                        size = None;
+                        modified = None;
+                    }
+                    "CommonPrefixes" => in_prefixes = true,
+                    _ => {}
+                }
+                text.clear();
+            }
+            Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                match local_name(name.as_ref()) {
+                    "Key" if in_contents => key = std::mem::take(&mut text),
+                    "Size" if in_contents => size = text.parse().ok(),
+                    "LastModified" if in_contents => modified = Some(std::mem::take(&mut text)),
+                    "Contents" => {
+                        in_contents = false;
+                        listing.add_object(&key, size, modified.take());
+                    }
+                    "Prefix" if in_prefixes => listing.add_prefix(&text),
+                    "CommonPrefixes" => in_prefixes = false,
+                    "NextContinuationToken" if !text.is_empty() => {
+                        continuation_token = Some(std::mem::take(&mut text));
                     }
                     _ => {}
                 }
             }
-            Ok(Event::Text(e)) => {
-                if in_tag.is_some() {
-                    text_buf.push_str(&e.xml10_content());
-                }
-            }
-            Ok(Event::End(_)) => {
-                if let Some(tag) = in_tag.take() {
-                    let found = text_buf.clone();
-                    match tag.as_str() {
-                        "NextContinuationToken" => {
-                            if !found.is_empty() {
-                                continuation_token = Some(found);
-                            }
-                        }
-                        "Prefix" => {
-                            if found == search_prefix || found.is_empty() {
-                                continue;
-                            }
-                            let trimmed = found.trim_end_matches('/');
-                            add_uri(trimmed, current_key, bucket, found_all, uris);
-                        }
-                        "Key" => {
-                            if !search_prefix.is_empty()
-                                && found.trim_end_matches('/')
-                                    == search_prefix.trim_end_matches('/')
-                            {
-                                continue;
-                            }
-                            let relative =
-                                if !search_prefix.is_empty() && found.starts_with(search_prefix) {
-                                    &found[search_prefix.len()..]
-                                } else {
-                                    &found
-                                };
-                            let relative = relative.trim_start_matches('/');
-                            let resolved = if !relative.is_empty() {
-                                let first_component =
-                                    relative.split('/').next().unwrap_or(relative);
-                                format!("{}{}", search_prefix, first_component)
-                            } else {
-                                found.clone()
-                            };
-                            let trimmed = resolved.trim_end_matches('/');
-                            add_uri(trimmed, current_key, bucket, found_all, uris);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
         buf.clear();
     }
 
     continuation_token
-}
-
-fn add_uri(
-    path: &str,
-    current_key: &str,
-    bucket: &str,
-    found_all: &mut HashMap<String, ()>,
-    uris: &mut Vec<String>,
-) {
-    if path.is_empty() || path.trim_end_matches('/') == current_key {
-        return;
-    }
-    if found_all.contains_key(path) {
-        return;
-    }
-    found_all.insert(path.to_string(), ());
-    uris.push(format!("s3://{}/{}", bucket, path));
 }
 
 // ---------------------------------------------------------------------------
@@ -544,16 +496,9 @@ impl CloudBackend for S3Creds {
 // Internal async helpers (used by both single + batch pyfunctions)
 // ---------------------------------------------------------------------------
 
-async fn do_s3_list(creds: &S3Creds, prefix: &str, use_h2: bool) -> Result<Vec<String>, PyErr> {
-    let current_key = prefix.trim_matches('/').to_string();
-    let search_prefix = if current_key.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", current_key)
-    };
-
-    let mut found_all = HashMap::new();
-    let mut uris = Vec::new();
+async fn do_s3_list(creds: &S3Creds, prefix: &str, use_h2: bool) -> Result<Vec<ListEntry>, PyErr> {
+    let mut listing = Listing::new(format!("s3://{}", creds.bucket), prefix);
+    let search_prefix = listing.search_prefix().to_string();
     let mut continuation_token: Option<String> = None;
 
     loop {
@@ -578,21 +523,13 @@ async fn do_s3_list(creds: &S3Creds, prefix: &str, use_h2: bool) -> Result<Vec<S
             ));
         }
 
-        continuation_token = parse_listing_page(
-            &body,
-            &search_prefix,
-            &current_key,
-            &creds.bucket,
-            &mut found_all,
-            &mut uris,
-        );
-
+        continuation_token = parse_listing_page(&body, &mut listing);
         if continuation_token.is_none() {
             break;
         }
     }
 
-    Ok(uris)
+    Ok(listing.finish())
 }
 
 /// List all buckets (service-level ListBuckets). Returns bare bucket names.
@@ -1380,43 +1317,7 @@ pub fn s3_exists_batch<'py>(
     })
 }
 
-/// Check is_dir for multiple prefixes concurrently. Returns list of bools.
-#[pyfunction]
-pub fn s3_is_dir_batch<'py>(
-    py: Python<'py>,
-    endpoint: String,
-    bucket: String,
-    prefixes: Vec<String>,
-    region: String,
-    access_key: String,
-    secret_key: String,
-    session_token: Option<String>,
-    use_h2: Option<bool>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let h2 = use_h2.unwrap_or(false);
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = s3_creds!(
-            endpoint,
-            bucket,
-            region,
-            access_key,
-            secret_key,
-            session_token
-        );
-        let futs: Vec<_> = prefixes
-            .iter()
-            .map(|p| do_s3_is_dir(&creds, p, h2))
-            .collect();
-        let results = join_all(futs).await;
-        let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            out.push(r?);
-        }
-        Ok(out)
-    })
-}
-
-/// List multiple prefixes concurrently. Returns list of URI lists.
+/// List multiple prefixes concurrently. Returns `(uri, is_dir, size, modified)` lists.
 #[pyfunction]
 pub fn s3_list_batch<'py>(
     py: Python<'py>,
@@ -1476,7 +1377,39 @@ pub fn s3_list_buckets<'py>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_s3_acl;
+    use super::{Listing, parse_listing_page, parse_s3_acl};
+
+    #[test]
+    fn parses_listing_page_metadata() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>dir/</Prefix><Delimiter>/</Delimiter>
+  <Contents><Key>dir/</Key><Size>0</Size></Contents>
+  <Contents>
+    <Key>dir/a.txt</Key><LastModified>2024-01-02T03:04:05.000Z</LastModified>
+    <ETag>"x"</ETag><Size>42</Size>
+  </Contents>
+  <CommonPrefixes><Prefix>dir/sub/</Prefix></CommonPrefixes>
+  <NextContinuationToken>next</NextContinuationToken>
+</ListBucketResult>"#;
+        let mut listing = Listing::new("s3://b".into(), "dir");
+        assert_eq!(
+            parse_listing_page(body, &mut listing).as_deref(),
+            Some("next")
+        );
+        assert_eq!(
+            listing.finish(),
+            vec![
+                (
+                    "s3://b/dir/a.txt".into(),
+                    false,
+                    Some(42),
+                    Some("2024-01-02T03:04:05.000Z".into())
+                ),
+                ("s3://b/dir/sub".into(), true, None, None),
+            ]
+        );
+    }
 
     #[test]
     fn parses_owner_and_grants() {

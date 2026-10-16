@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import re
+from collections.abc import AsyncIterator
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from os import PathLike, getenv, sep
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
@@ -25,6 +29,64 @@ T = TypeVar("T", bound="CommonPurePathMixin")
 
 SCHEME_SEP = "://"
 OS_SEP = sep
+
+# Upper bound on concurrent per-entry probes when a listing lacks metadata.
+_FILL_CONCURRENCY = 32
+
+
+class DirEntry(NamedTuple):
+    """One directory listing entry with the metadata the backend reported.
+
+    ``None`` means the field is unknown: the listing did not include it and
+    it was not requested (or could not be fetched) when filling entries.
+    """
+
+    path: Any
+    is_dir: bool | None = None
+    size: int | None = None
+    mtime: float | None = None
+
+
+def parse_listing_mtime(text: str | None) -> float | None:
+    """Parse an ISO-8601 or RFC 1123 listing timestamp to a POSIX float."""
+    if not text:
+        return None
+    try:
+        if text.endswith("GMT"):
+            return parsedate_to_datetime(text).timestamp()
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _needs_fill(entry: DirEntry, stat: bool) -> bool:
+    return entry.is_dir is None or (
+        stat and not entry.is_dir and (entry.size is None or entry.mtime is None)
+    )
+
+
+async def _fill_entry(entry: DirEntry, stat: bool) -> DirEntry:
+    """Probe the fields of *entry* the listing left unknown."""
+    path = entry.path
+    is_dir = entry.is_dir
+    if is_dir is None:
+        try:
+            is_dir = await path.is_dir()
+        except (OSError, NotImplementedError, ValueError):
+            pass
+    size, mtime = entry.size, entry.mtime
+    if stat and not is_dir and (size is None or mtime is None):
+        try:
+            st = await path.stat()
+        except (OSError, NotImplementedError, ValueError):
+            pass
+        else:
+            if size is None:
+                size = getattr(st, "st_size", None)
+            if mtime is None:
+                mtime = getattr(st, "st_mtime", None)
+    return DirEntry(path, is_dir, size, mtime)
+
 
 # ---------------------------------------------------------------------------
 # Cached regex patterns and base URL resolution (avoid repeated work)
@@ -335,6 +397,35 @@ class CommonPurePathMixin:
 
     def with_suffix(self, suffix: str) -> Self:
         return self.parent / (self.stem + suffix)
+
+    async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:
+        """Return this directory's entries with whatever metadata one listing
+        call yields. Backends whose listing reports types, sizes or times
+        override this; the default knows only the child paths.
+        """
+        return [DirEntry(child) async for child in self.iterdir()]  # type: ignore[attr-defined]
+
+    async def scandir(self, *, stat: bool = False) -> AsyncIterator[DirEntry]:
+        """Yield :class:`DirEntry` items for this directory.
+
+        ``is_dir`` is always resolved. With ``stat=True``, ``size`` and
+        ``mtime`` are resolved for non-directories too. Fields the listing
+        already reported cost nothing; the rest are probed concurrently.
+        """
+        entries = await self._list_entries(stat=stat)
+        missing = [i for i, e in enumerate(entries) if _needs_fill(e, stat)]
+        if missing:
+            limit = asyncio.Semaphore(_FILL_CONCURRENCY)
+
+            async def fill(entry: DirEntry) -> DirEntry:
+                async with limit:
+                    return await _fill_entry(entry, stat)
+
+            filled = await asyncio.gather(*(fill(entries[i]) for i in missing))
+            for i, entry in zip(missing, filled):
+                entries[i] = entry
+        for entry in entries:
+            yield entry
 
     def _resolve_base_url_prefix(self) -> str | None:
         """Resolve base URL host/path prefix for this protocol from environment.

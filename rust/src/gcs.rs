@@ -21,11 +21,12 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use serde::{Deserialize, Serialize};
 use sonic_rs::JsonValueTrait;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::http::{bearer_headers, do_request, do_request_light, status_to_pyerr};
+use crate::listing::{ListEntry, Listing};
 
 // ---------------------------------------------------------------------------
 // Typed JSON response structs (avoids Value allocations)
@@ -44,6 +45,9 @@ struct ListResponse {
 #[derive(Deserialize)]
 struct ListItem {
     name: String,
+    // The JSON API encodes uint64 values as strings.
+    size: Option<String>,
+    updated: Option<String>,
 }
 
 /// Response for service-level bucket listing (GET /storage/v1/b).
@@ -651,16 +655,13 @@ async fn do_gcs_put_acl(creds: &GcsCreds, object_path: &str, acl_json: &str) -> 
     Ok(())
 }
 
-async fn do_gcs_list(creds: &GcsCreds, prefix: &str, use_h2: bool) -> Result<Vec<String>, PyErr> {
-    let current_key = prefix.trim_matches('/').to_string();
-    let search_prefix = if current_key.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", current_key)
-    };
-
-    let mut found_all = HashSet::new();
-    let mut uris = Vec::new();
+async fn do_gcs_list(
+    creds: &GcsCreds,
+    prefix: &str,
+    use_h2: bool,
+) -> Result<Vec<ListEntry>, PyErr> {
+    let mut listing = Listing::new(format!("gs://{}", creds.bucket), prefix);
+    let search_prefix = listing.search_prefix().to_string();
     let mut page_token: Option<String> = None;
     let headers = creds.auth_headers().await;
 
@@ -692,37 +693,12 @@ async fn do_gcs_list(creds: &GcsCreds, prefix: &str, use_h2: bool) -> Result<Vec
 
         let resp: ListResponse = sonic_rs::from_slice(&body)
             .map_err(|e| PyRuntimeError::new_err(format!("JSON parse error: {e}")))?;
-
-        // Prefixes (subdirectories)
         for p in &resp.prefixes {
-            let value = p.trim_end_matches('/');
-            if !value.is_empty() && value != current_key && found_all.insert(value.to_string()) {
-                uris.push(format!("gs://{}/{}", creds.bucket, value));
-            }
+            listing.add_prefix(p);
         }
-
-        // Items (files)
-        for item in &resp.items {
-            let name = &item.name;
-            if name.is_empty() || name.trim_end_matches('/') == current_key {
-                continue;
-            }
-            let relative = if !search_prefix.is_empty() && name.starts_with(&search_prefix) {
-                &name[search_prefix.len()..]
-            } else {
-                name.as_str()
-            };
-            let relative = relative.trim_start_matches('/');
-            let resolved = if !relative.is_empty() {
-                let first = relative.split('/').next().unwrap_or(relative);
-                format!("{}{}", search_prefix, first)
-            } else {
-                name.to_string()
-            };
-            let value = resolved.trim_end_matches('/').to_string();
-            if !value.is_empty() && value != current_key && found_all.insert(value.clone()) {
-                uris.push(format!("gs://{}/{}", creds.bucket, value));
-            }
+        for item in resp.items {
+            let size = item.size.and_then(|s| s.parse().ok());
+            listing.add_object(&item.name, size, item.updated);
         }
 
         page_token = resp.next_page_token;
@@ -731,7 +707,7 @@ async fn do_gcs_list(creds: &GcsCreds, prefix: &str, use_h2: bool) -> Result<Vec
         }
     }
 
-    Ok(uris)
+    Ok(listing.finish())
 }
 
 /// List all buckets in a project (GET /storage/v1/b?project=). Returns bare names.
@@ -1084,32 +1060,6 @@ pub fn gcs_exists_batch<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let creds = gcs_creds!(endpoint, bucket, access_token);
         batch_collect!(creds, object_paths, h2, exists)
-    })
-}
-
-/// Check is_dir for multiple prefixes concurrently. Returns list of bools.
-#[pyfunction]
-pub fn gcs_is_dir_batch<'py>(
-    py: Python<'py>,
-    endpoint: String,
-    bucket: String,
-    prefixes: Vec<String>,
-    access_token: Option<String>,
-    use_h2: Option<bool>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let h2 = use_h2.unwrap_or(false);
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = gcs_creds!(endpoint, bucket, access_token);
-        let futs: Vec<_> = prefixes
-            .iter()
-            .map(|p| do_gcs_is_dir(&creds, p, h2))
-            .collect();
-        let results = join_all(futs).await;
-        let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            out.push(r?);
-        }
-        Ok(out)
     })
 }
 

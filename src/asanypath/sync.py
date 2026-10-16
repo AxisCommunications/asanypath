@@ -155,9 +155,14 @@ class _SyncProxy:
         if inspect.isasyncgenfunction(attr):  # pragma: no cover
 
             def _sync_iter_method(*args, **kwargs):  # pragma: no cover
+                from asanypath.common import DirEntry
+
                 async_it = attr(*args, **kwargs)
                 for item in _SyncRunner.get().iter(async_it):  # pragma: no cover
-                    yield _wrap(item) if _is_path(item) else item
+                    if isinstance(item, DirEntry):
+                        yield item._replace(path=_wrap(item.path))
+                    else:
+                        yield _wrap(item) if _is_path(item) else item
 
             return _sync_iter_method
 

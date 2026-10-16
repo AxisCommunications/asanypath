@@ -28,7 +28,6 @@ from asanypath_native import (
     az_get_container_acl,
     az_head_batch,
     az_is_dir,
-    az_is_dir_batch,
     az_list_batch,
     az_list_containers,
     az_presign,
@@ -95,7 +94,6 @@ class AzurePath(CloudPathMixin):
     _supports_range_read: bool = True
     # Bytes per staged block; objects below one block upload in a single PUT.
     _MULTIPART_PART_SIZE = UPLOAD_CHUNK_SIZE
-    _is_dir_batch_fn = staticmethod(az_is_dir_batch)
     _copy_batch_fn = staticmethod(az_copy_batch)
 
     @staticmethod

@@ -16,7 +16,7 @@ from asanypath.asanypath import (
 from asanypath.azure import AzurePath
 from asanypath.cache import configure_cache
 from asanypath.cloud import CloudPathMixin
-from asanypath.common import CommonPurePathMixin
+from asanypath.common import CommonPurePathMixin, DirEntry
 from asanypath.exceptions import (
     AsAnyPathError,
     InvalidPathError,
@@ -62,6 +62,7 @@ __all__ = [
     "S3Path",
     "CloudPathMixin",
     "CommonPurePathMixin",
+    "DirEntry",
     "GCSPath",
     "AzurePath",
     "ArtifactoryPath",

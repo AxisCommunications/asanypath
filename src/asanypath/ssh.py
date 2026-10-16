@@ -81,6 +81,7 @@ from yarl import URL
 
 from asanypath._prompt import interactive as _interactive
 from asanypath.cloud import CloudPathMixin, _explicit
+from asanypath.common import DirEntry
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -745,15 +746,16 @@ class SSHPath(CloudPathMixin):
             return
         await self.write_bytes(b"")
 
-    async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
+    async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:
         try:
-            entries = await ssh_list(path=self._item_path, **(await self._get_native_kwargs()))
+            listing = await ssh_list(path=self._item_path, **(await self._get_native_kwargs()))
         except Exception as e:  # noqa: BLE001
             # A missing path / non-dir surfaces as "not a directory" for iterdir;
             # other failures keep their mapped type.
             _map_native_error(e, str(self), ignore=FileNotFoundError)
             raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
-        for name, size, mtime, atime, uid, gid, permissions in entries:
+        entries = []
+        for name, size, mtime, atime, uid, gid, permissions in listing:
             if name in (".", ".."):
                 continue
             # ``read_dir`` already returned attrs for every entry; cache
@@ -763,7 +765,8 @@ class SSHPath(CloudPathMixin):
             )
             child = self._confined_child(str(self._path / name), _cached_attrs=attrs)
             if child is not None:
-                yield child
+                entries.append(DirEntry(child, stat_module.S_ISDIR(permissions or 0), size, mtime))
+        return entries
 
     async def walk(
         self,

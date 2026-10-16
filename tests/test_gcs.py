@@ -21,6 +21,11 @@ from tests.conftest import classtest_factory
 testbase = classtest_factory("_TestGCSPath", GCSPath)
 
 
+def _rows(*uris: str, dirs: tuple[str, ...] = ()) -> list[tuple]:
+    """Native list rows: (uri, is_dir, size, modified)."""
+    return [(u, u in dirs, None, None) for u in uris]
+
+
 def _make_gcs_path(
     path: str = "gs://bucket/object/file.txt",
     project_id: str = "test-project",
@@ -161,7 +166,7 @@ class TestGCSPath(testbase):
     async def test_iterdir(self, dir_path, list_return, expected_strs):
         d = _make_gcs_path(dir_path)
         mock_batcher = AsyncMock()
-        mock_batcher.list = AsyncMock(return_value=list_return)
+        mock_batcher.list = AsyncMock(return_value=_rows(*list_return))
         with patch.object(GCSPath, "_get_batcher", return_value=mock_batcher):
             results = [str(x) async for x in d.iterdir()]
         for expected in expected_strs:
@@ -302,7 +307,7 @@ class TestGCSPath(testbase):
 
     async def test_glob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [f"{p.parent}/file.txt", f"{p.parent}/other.md"]
+        mock_batcher.list.return_value = _rows(f"{p.parent}/file.txt", f"{p.parent}/other.md")
         with (
             patch.object(GCSPath, "_get_batcher", return_value=mock_batcher),
             patch("asanypath.gcs.gcs_is_dir", new=AsyncMock(return_value=False)),
@@ -312,7 +317,7 @@ class TestGCSPath(testbase):
 
     async def test_rglob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [f"{p.parent}/file.txt"]
+        mock_batcher.list.return_value = _rows(f"{p.parent}/file.txt")
         mock_batcher.exists.return_value = False
         with (
             patch.object(GCSPath, "_get_batcher", return_value=mock_batcher),
@@ -326,25 +331,19 @@ class TestGCSPath(testbase):
 
         async def mock_list(item, **kwargs):
             if item == "root":
-                return ["gs://bucket/root/file.txt", "gs://bucket/root/sub"]
+                return _rows(
+                    "gs://bucket/root/file.txt",
+                    "gs://bucket/root/sub",
+                    dirs=("gs://bucket/root/sub",),
+                )
             if item == "root/sub":
-                return ["gs://bucket/root/sub/deep.txt"]
+                return _rows("gs://bucket/root/sub/deep.txt")
             return []
 
         mock_batcher = AsyncMock()
         mock_batcher.list = AsyncMock(side_effect=mock_list)
 
-        async def mock_is_dir_batch(prefixes, **kwargs):
-            return [p.endswith("sub") for p in prefixes]
-
-        with (
-            patch.object(GCSPath, "_get_batcher", return_value=mock_batcher),
-            patch.object(
-                type(root),
-                "_is_dir_batch_fn",
-                new=AsyncMock(side_effect=mock_is_dir_batch),
-            ),
-        ):
+        with patch.object(GCSPath, "_get_batcher", return_value=mock_batcher):
             entries = [(r, d[:], f[:]) async for r, d, f in root.walk()]
 
         assert entries[0][0] == root

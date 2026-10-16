@@ -27,7 +27,6 @@ from asanypath_native import (
     s3_get_credentials,
     s3_head_batch,
     s3_is_dir,
-    s3_is_dir_batch,
     s3_list_batch,
     s3_list_buckets,
     s3_presign,
@@ -84,7 +83,6 @@ class S3Path(CloudPathMixin):
         "list": {"batch_fn": s3_list_batch, "items_key": "prefixes"},
     }
 
-    _is_dir_batch_fn = staticmethod(s3_is_dir_batch)
     _copy_batch_fn = staticmethod(s3_copy_batch)
 
     def __init__(

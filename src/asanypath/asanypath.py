@@ -23,6 +23,7 @@ from asanypath.exceptions import InvalidPathError
 from asanypath.unsupported import UnsupportedProtocolPath
 
 if TYPE_CHECKING:
+    from asanypath.common import DirEntry
     from asanypath.options import AccessPolicy, AccessPolicyPatch, BackendOptions
 
 
@@ -364,6 +365,10 @@ class AsAnyPath(AsAnyPurePath):
 
     @abstractmethod
     async def iterdir(self) -> AsyncIterator[Self]:
+        pass
+
+    @abstractmethod
+    async def scandir(self, *, stat: bool = False) -> AsyncIterator[DirEntry]:
         pass
 
     @abstractmethod

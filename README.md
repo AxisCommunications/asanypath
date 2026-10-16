@@ -44,6 +44,11 @@ info = await path.stat()
 async for child in path.parent.iterdir():
     print(child.name)
 
+# List with metadata: is_dir always; size/mtime with stat=True.
+# Fields the listing already reports cost no extra requests.
+async for entry in path.parent.scandir(stat=True):
+    print(entry.path.name, entry.is_dir, entry.size, entry.mtime)
+
 # Glob
 async for p in AsAnyPath("s3://bucket/logs/").glob("**/*.json"):
     print(p)
@@ -404,6 +409,13 @@ asanypath exists s3://bucket/file.txt
 # Print file contents
 asanypath cat s3://bucket/file.txt
 
+# List directory in columns; directories end with "/"
+asanypath ls s3://bucket/prefix/
+
+# Long listing (size, modified) and tree view
+asanypath ls -l s3://bucket/prefix/
+asanypath ls -r -d 2 s3://bucket/prefix/
+
 # List directory (Artifactory with token)
 asanypath ls art://repo/path/ --token mytoken
 
@@ -650,7 +662,7 @@ All path implementations support:
 - `stat()` / `checksums()` (cloud backends)
 - `mkdir(parents, exist_ok)` / `touch(exist_ok)`
 - `unlink(missing_ok)` / `rmdir(recursive)`
-- `iterdir()` / `rename(target)`
+- `iterdir()` / `scandir(stat)` / `rename(target)`
 - `get_access_policy()` / `update_access_policy(policy_patch)`
 
 ### Backend Operation Options
