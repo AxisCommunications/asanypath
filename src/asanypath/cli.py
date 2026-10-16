@@ -1726,7 +1726,7 @@ def rm(paths: tuple[str, ...], token: str | None, force: bool, recursive: bool, 
     "--chunk-size",
     default=None,
     type=click.IntRange(min=0),
-    help="Streaming chunk size for local-destination transfers (default: auto; 0 disables)",
+    help="Range/upload part size in bytes (default: auto; 0 disables local streaming)",
 )
 @click.option(
     "--verbose",
@@ -1746,7 +1746,7 @@ def rm(paths: tuple[str, ...], token: str | None, force: bool, recursive: bool, 
     "--concurrency-floor",
     default=DEFAULT_CONCURRENCY,
     type=click.IntRange(min=1),
-    help="Target transfer streams when few large files are active (default: 8; 1 disables ranges)",
+    help="Target range/upload streams (default: 8; 1 makes each file sequential)",
 )
 def mv(
     paths: tuple[str, ...],
@@ -1878,7 +1878,7 @@ def mv(
     "--chunk-size",
     default=None,
     type=click.IntRange(min=0),
-    help="Streaming chunk size for local-destination transfers (default: auto; 0 disables)",
+    help="Range/upload part size in bytes (default: auto; 0 disables local streaming)",
 )
 @click.option("--recursive", "recursive", "-r", is_flag=True, help="Copy directories recursively")
 @click.option(
@@ -1899,7 +1899,7 @@ def mv(
     "--concurrency-floor",
     default=DEFAULT_CONCURRENCY,
     type=click.IntRange(min=1),
-    help="Target transfer streams when few large files are active (default: 8; 1 disables ranges)",
+    help="Target range/upload streams (default: 8; 1 makes each file sequential)",
 )
 @click.option(
     "--listing",
@@ -2335,7 +2335,7 @@ def presign(path: str, expires: int, method: str, token: str | None) -> None:
     "--concurrency-floor",
     default=DEFAULT_CONCURRENCY,
     type=click.IntRange(min=1),
-    help="Target transfer streams when few large files are active (default: 8; 1 disables ranges)",
+    help="Target range/upload streams (default: 8; 1 makes each file sequential)",
 )
 @click.option("--exclude", multiple=True, help="Exclude files matching glob pattern (repeatable)")
 @click.option(

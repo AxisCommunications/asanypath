@@ -11,13 +11,13 @@ import inspect
 import os
 import shutil
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
 from contextvars import ContextVar, Token
 from functools import wraps
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import IO, Any, ParamSpec, TypeVar
 
 from asanypath.exceptions import UnsupportedProtocolError
 
@@ -34,7 +34,12 @@ class RangeNotSupportedError(OSError):
 
 
 class TransferBudget:
-    """Share size-aware range concurrency within one transfer operation."""
+    """Share range-read and multipart-upload concurrency across transfers.
+
+    ``floor`` is a best-effort stream target divided among active files;
+    ``ceiling`` bounds requests across this budget, and ``per_file_cap`` bounds
+    each file's fan-out. Upload workers reserve capacity before buffering.
+    """
 
     def __init__(
         self,
@@ -80,7 +85,7 @@ async def transfer_scope() -> AsyncIterator[TransferBudget]:
     if budget is None:
         loop = asyncio.get_running_loop()
         budget = getattr(loop, "_asanypath_transfer_budget", None)
-        if budget is None:
+        if not isinstance(budget, TransferBudget):
             budget = TransferBudget()
             setattr(loop, "_asanypath_transfer_budget", budget)
     if _registered_transfer.get() is budget:
@@ -98,7 +103,74 @@ async def transfer_scope() -> AsyncIterator[TransferBudget]:
         _transfer_budget.reset(budget_token)
 
 
-async def iter_transfer_chunks(src: Any, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+UploadResult = TypeVar("UploadResult")
+
+
+async def _file_io(operation: Callable[[], UploadResult]) -> UploadResult:
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Join non-cancellable disk I/O before the caller can close its file.
+        await task
+        raise
+
+
+async def upload_parts(
+    fileobj: IO[bytes],
+    size: int,
+    part_size: int,
+    upload: Callable[[int, bytes], Awaitable[UploadResult]],
+    *,
+    parallel: bool = True,
+) -> list[UploadResult]:
+    """Upload bounded parts with backpressure, returning results in source order."""
+    if part_size < 1:
+        raise ValueError("upload part size must be positive")
+    async with transfer_scope() as budget:
+        workers = (
+            min(
+                budget.per_file_cap,
+                max(1, budget.floor // budget.active_files),
+                max(1, (size + part_size - 1) // part_size),
+            )
+            if parallel
+            else 1
+        )
+        read_lock = asyncio.Lock()
+        results: dict[int, UploadResult] = {}
+        part_number = 0
+
+        async def worker() -> None:
+            nonlocal part_number
+            while True:
+                # Reserve capacity before allocating a buffer, not just before I/O.
+                async with budget._slots:
+                    async with read_lock:
+                        chunk = await _file_io(lambda: fileobj.read(part_size))
+                        if not chunk:
+                            return
+                        part_number += 1
+                        number = part_number
+                    try:
+                        results[number] = await upload(number, chunk)
+                    finally:
+                        del chunk
+
+        tasks = [asyncio.create_task(worker()) for _ in range(workers)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return [results[number] for number in sorted(results)]
+
+
+async def iter_transfer_chunks(
+    src: Any, chunk_size: int | None = None
+) -> AsyncGenerator[bytes, None]:
     """Read supported sources in bounded, ordered, size-aware parallel ranges."""
     async with transfer_scope() as budget:
         if (
@@ -143,6 +215,7 @@ async def iter_transfer_chunks(src: Any, chunk_size: int | None = None) -> Async
 
         async def read_range(start: int, end: int) -> bytes:
             async with budget._slots:
+                data: bytes
                 if getattr(src, "_conditional_range_read", False) and any(
                     getattr(metadata, field, None)
                     for field in ("etag", "last_modified", "version_id")

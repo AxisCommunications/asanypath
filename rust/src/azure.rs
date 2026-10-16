@@ -16,6 +16,7 @@ use futures::future::join_all;
 use hmac::{Hmac, KeyInit, Mac};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
@@ -956,7 +957,7 @@ pub fn az_put_block<'py>(
     container: String,
     blob: String,
     block_id: String,
-    data: Vec<u8>,
+    data: PyBackedBytes,
     account_name: String,
     account_key: Option<String>,
     sas_token: Option<String>,
@@ -976,9 +977,10 @@ pub fn az_put_block<'py>(
         let mut headers = vec![("content-length".to_string(), data.len().to_string())];
         let params = [("blockid", block_id.as_str()), ("comp", "block")];
         creds.sign("PUT", &url, &mut headers, Some(&params));
-        let (status, body) = do_request_light("PUT", &url, &headers, Some(Bytes::from(data)), h2)
-            .await
-            .map_err(PyRuntimeError::new_err)?;
+        let (status, body) =
+            do_request_light("PUT", &url, &headers, Some(Bytes::from_owner(data)), h2)
+                .await
+                .map_err(PyRuntimeError::new_err)?;
         if !status.is_success() {
             return Err(status_to_pyerr(status, &creds.error_path(&blob), &body));
         }
