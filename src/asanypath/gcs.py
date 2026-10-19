@@ -181,7 +181,7 @@ class GCSPath(CloudPathMixin):
             offset += len(chunk)
 
         await upload_parts(fileobj, size, part_size, upload, parallel=False)
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has objects with this prefix)."""

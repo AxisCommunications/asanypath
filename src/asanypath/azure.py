@@ -227,7 +227,7 @@ class AzurePath(CloudPathMixin):
             options_json=options_json,
             **self._native_kwargs,
         )
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has blobs with this prefix)."""

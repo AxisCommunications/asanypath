@@ -215,14 +215,10 @@ class HTTPPath(CloudPathMixin):
         """Return auth headers for this path. Override for per-instance auth."""
         return _build_auth_headers()
 
-    def _identity_parts(self) -> tuple:
-        auth_env = (
-            getenv("HTTP_AUTH_USER"),
-            getenv("HTTP_AUTH_PASSWORD"),
-            getenv("HTTP_AUTH_TOKEN"),
-            getenv("HTTP_AUTH_HEADER"),
-        )
-        return (*super()._identity_parts(), auth_env)
+    _IDENTITY_ENV = ("HTTP_AUTH_USER", "HTTP_AUTH_PASSWORD", "HTTP_AUTH_TOKEN", "HTTP_AUTH_HEADER")
+
+    def _identity_env(self) -> tuple:
+        return tuple(map(getenv, self._IDENTITY_ENV))
 
     def _merge_headers(
         self,
@@ -354,7 +350,7 @@ class HTTPPath(CloudPathMixin):
                 listing=self._listing,
                 listing_attr=self._listing_attr,
             )
-            if self._is_direct_child(child):
+            if self._plain_child_name(link) is not None or self._is_direct_child(child):
                 yield child
             else:
                 logger.warning("Skipping listing entry %r: not a direct child of %s", link, self)

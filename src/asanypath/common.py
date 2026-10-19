@@ -133,12 +133,24 @@ class CommonPurePathMixin:
     def _derive(self, *parts: Any) -> Self:
         """Build a path from *parts* that keeps this path's explicit options."""
         options = self._init_options
-        if options and self._options_bound_to_authority:
+        if options and self._options_bound_to_authority and not self._keeps_authority(parts):
             probe = object.__new__(type(self))
             CommonPurePathMixin.__init__(probe, *parts)
             if probe._path.raw_authority != self._path.raw_authority:
                 options = {}
         return type(self)(*parts, **options)
+
+    def _keeps_authority(self, parts: tuple) -> bool:
+        """True when a path built from *parts* provably has this path's
+        authority, so :meth:`_derive` can skip parsing a probe path."""
+        auth = self._path.raw_authority
+        if not auth or not parts:
+            return False
+        if parts[0] == self.drive:
+            return len(parts) > 1 and parts[1] == auth
+        # Base-URL expansion of the leading part only rewrites bare shorthand
+        # hosts; a qualified authority survives joining unchanged.
+        return parts[0] == str(self) and ("." in auth or ":" in auth or auth == "localhost")
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}('{self}')"

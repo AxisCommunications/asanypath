@@ -133,14 +133,21 @@ class S3Path(CloudPathMixin):
         )
 
     # AWS settings that pick the default credentials when none are explicit.
-    _IDENTITY_ENV = ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_ROLE_ARN", "AWS_ENDPOINT_URL")
+    # The native layer caches the resolved AWS config per profile, so only
+    # AWS_PROFILE can switch identity after a path's first request.
+    _IDENTITY_ENV = ("AWS_PROFILE",)
+    _IDENTITY_ENV_AT_FIRST_USE = ("AWS_ACCESS_KEY_ID", "AWS_ROLE_ARN", "AWS_ENDPOINT_URL")
 
     # ------------------------------------------------------------------
     # CloudPathMixin hooks
     # ------------------------------------------------------------------
 
+    def _identity_env(self) -> tuple:
+        return tuple(map(os.environ.get, self._IDENTITY_ENV))
+
     def _identity_parts(self) -> tuple:
-        return (*super()._identity_parts(), [os.environ.get(n) for n in self._IDENTITY_ENV])
+        env = tuple(map(os.environ.get, self._IDENTITY_ENV_AT_FIRST_USE))
+        return (*super()._identity_parts(), env)
 
     @property
     def _item_path(self) -> str:
@@ -246,7 +253,7 @@ class S3Path(CloudPathMixin):
                 except Exception:
                     logging.getLogger(__name__).exception("Failed to abort S3 multipart upload")
             raise
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def is_dir(self) -> bool:
         """Check if path is a directorish."""

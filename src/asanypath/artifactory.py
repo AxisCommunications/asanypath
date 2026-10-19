@@ -257,7 +257,7 @@ class ArtifactoryPath(CloudPathMixin):
             options_json=options_json,
             **self._native_kwargs,
         )
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def _storage_info(self) -> dict:
         """Fetch item metadata from the Artifactory storage API (cached).
