@@ -95,8 +95,8 @@ def test_unsupported_protocol_raises_on_use():
 
 def test_missing_ssh_handler_falls_back_to_placeholder(monkeypatch):
     """If SSH support is unavailable, ssh:// should still construct safely."""
-    monkeypatch.setattr(PROTOCOL_MAP, "_ensure", lambda: None)
     monkeypatch.delitem(PROTOCOL_MAP, "ssh", raising=False)
+    monkeypatch.setitem(PROTOCOL_MAP._pending, "ssh", ("asanypath._missing_backend", "SSHPath"))
     path = AsAnyPath("ssh://server/file.txt")
     assert isinstance(path, UnsupportedProtocolPath)
     with pytest.raises(UnsupportedProtocolError, match="ssh"):
@@ -187,3 +187,48 @@ def test_https_url_routing(monkeypatch, env_vars, input_url, expected_type, expe
         assert not isinstance(path, HTTPSPath)
     if expected_str:
         assert str(path) == expected_str
+
+
+def _run_clean(code: str) -> str:
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_local_path_does_not_import_cloud_backends():
+    out = _run_clean(
+        "import sys, asanypath; asanypath.AsAnyPath('.');"
+        "print([m for m in ('asanypath.s3', 'asanypath.cloud', 'asanypath.artifactory')"
+        " if m in sys.modules])"
+    )
+    assert out == "[]"
+
+
+def test_register_before_lookup_keeps_builtins():
+    out = _run_clean(
+        "from asanypath import AsyncPath, register_protocol, list_protocols, PROTOCOL_MAP;"
+        "register_protocol('mine', AsyncPath);"
+        "print('s3' in list_protocols(), PROTOCOL_MAP['mine'] is AsyncPath)"
+    )
+    assert out == "True True"
+
+
+def test_register_overrides_builtin():
+    out = _run_clean(
+        "from asanypath import AsyncPath, register_protocol, PROTOCOL_MAP;"
+        "register_protocol('s3', AsyncPath);"
+        "print(PROTOCOL_MAP['s3'] is AsyncPath)"
+    )
+    assert out == "True"
+
+
+def test_lazy_exports_and_dir():
+    import asanypath
+
+    assert asanypath.S3Path is S3Path
+    assert {"S3Path", "SyncPath", "DirEntry"} <= set(dir(asanypath))
+    with pytest.raises(AttributeError, match="nope"):
+        asanypath.nope  # noqa: B018

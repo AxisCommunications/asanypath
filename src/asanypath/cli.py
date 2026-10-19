@@ -22,22 +22,11 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from os import getenv
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import rich_click as click
 from rich.cells import cell_len
 from rich.console import Console, Group
-from rich.live import Live
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.table import Table
 from rich.text import Text
 
 from asanypath import AsAnyPath, DirEntry
@@ -46,6 +35,11 @@ from asanypath._transfer import TransferBudget, transfer_scope
 from asanypath._version import __version__
 from asanypath.asanypath import PROTOCOL_MAP
 
+if TYPE_CHECKING:
+    from rich.progress import Progress
+
+# Progress, Live and Table are imported where used so quick commands such as
+# ls start faster.
 console = Console()
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
@@ -93,6 +87,17 @@ def _fmt_bytes_ratio(transferred: float, total: float) -> tuple[str, str]:
 
 
 def _make_overall_progress(*, show_transfer: bool = False) -> Progress:
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
     cols = [
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -119,6 +124,8 @@ def _make_overall_progress(*, show_transfer: bool = False) -> Progress:
 
 
 def _make_file_progress(*, show_transfer: bool = False) -> Progress:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
     cols = [
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -206,6 +213,8 @@ async def _run_concurrent_stream(
     concurrency_floor: int = DEFAULT_CONCURRENCY,
 ) -> tuple[int, list[tuple[str, BaseException]], float]:
     """Run items from an async stream with up to ``concurrency`` workers."""
+    from rich.live import Live
+
     style = (
         "none"
         if verbosity <= 0 or (total is not None and total <= 1)
@@ -976,6 +985,8 @@ def cli():
 @cli.command(short_help="List supported protocols", context_settings=CONTEXT_SETTINGS)
 def protocols():
     """Show all supported URI protocols and their implementations."""
+    from rich.table import Table
+
     protocol_descriptions = {
         "art": "JFrog Artifactory repositories",
         "az": "Azure Blob Storage containers",
