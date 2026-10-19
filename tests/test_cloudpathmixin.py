@@ -812,11 +812,9 @@ class TestIterdirCache:
         # Pre-populate cache with a recent entry
         import time
 
-        cache_key = p._listing_cache_key()
-        type(p)._listing_cache[cache_key] = (
-            time.monotonic(),
-            [f"{p}/a.txt", f"{p}/b.txt"],
-        )
+        type(p)._listing_cache[str(p)] = {
+            p._identity_fingerprint(): (time.monotonic(), [f"{p}/a.txt", f"{p}/b.txt"])
+        }
         results = [child async for child in p.iterdir()]
         assert len(results) == 2
         assert results[0].name == "a.txt"

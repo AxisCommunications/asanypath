@@ -29,19 +29,13 @@ class MicroBatcher:
     Each operation is registered with :meth:`register`, which returns a
     submit coroutine callers use to enqueue work.  At the end of the
     current tick, all enqueued items are flushed together via the
-    backend-provided *flush_fn*.
-
-    Parameters
-    ----------
-    key_fn:
-        Callable that produces a hashable grouping key from the keyword
-        arguments passed to the submit function.  Calls with the same
-        key are batched together.
+    backend-provided *flush_fn*.  Calls are batched together only when all
+    their keyword arguments (credentials included) are identical.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[str, list] = {}
-        self._scheduled: set[str] = set()
+        # A key is present exactly while its flush is scheduled.
+        self._pending: dict[tuple, list] = {}
         self._ops: dict[str, _OpSpec] = {}
 
     def __getattr__(self, name: str) -> Callable[..., Coroutine]:
@@ -70,7 +64,8 @@ class MicroBatcher:
             ``async def flush_fn(items, futures, use_h2, **kwargs)``
             Called with the collected items list and their futures.
         key_fn:
-            ``def key_fn(**kwargs) -> str`` — returns a grouping key.
+            ``def key_fn(**kwargs) -> str`` — identifies the backend client;
+            grouping always uses the full keyword arguments.
         item_key:
             Name of the keyword argument that carries the per-call item
             (default ``"item"``).
@@ -98,18 +93,18 @@ class MicroBatcher:
         item = kwargs.pop(spec.item_key)
         # The flush reuses one caller's kwargs for the whole batch, so only
         # calls with identical kwargs (credentials included) may share it.
-        key = f"{spec.op}|{spec.key_fn(**kwargs)}|{sorted(kwargs.items())!r}"
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        pending = self._pending.setdefault(key, [])
+        key = (spec.op, tuple(kwargs.items()))
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        pending = self._pending.get(key)
+        if pending is None:
+            pending = self._pending[key] = []
+            loop.call_soon(self._flush, key, spec, kwargs)
         pending.append((item, fut))
-        if key not in self._scheduled:
-            self._scheduled.add(key)
-            asyncio.get_running_loop().call_soon(self._flush, key, spec, kwargs)
         return await fut
 
-    def _flush(self, key: str, spec: _OpSpec, kwargs: dict) -> None:
+    def _flush(self, key: tuple, spec: _OpSpec, kwargs: dict) -> None:
         items = self._pending.pop(key, [])
-        self._scheduled.discard(key)
         if not items:
             return
         collected = [i for i, _ in items]

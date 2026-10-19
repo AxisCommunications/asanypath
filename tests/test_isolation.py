@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from yarl import URL
 
 from asanypath import _credstore
 from asanypath import cache as cache_module
@@ -19,6 +20,7 @@ from asanypath.azure import AzurePath
 from asanypath.batcher import MicroBatcher
 from asanypath.cache import DownloadCache
 from asanypath.cloud import CloudPathMixin
+from asanypath.common import CommonPurePathMixin
 from asanypath.ftp import FTPPath
 from asanypath.gcs import GCSPath
 from asanypath.http import HTTPPath
@@ -305,7 +307,18 @@ def test_artifactory_cache_identity_changes_with_implicit_token(monkeypatch):
 
 @pytest.mark.parametrize(
     "entry",
-    ["../outside.txt", "%2E%2E/outside.txt", "sub/../../outside.txt", "a%2Fb", "", "sub?x=/../"],
+    [
+        "../outside.txt",
+        "%2E%2E/outside.txt",
+        "sub/../../outside.txt",
+        "a%2Fb",
+        "",
+        "sub?x=/../",
+        "..\t",
+        ".\n.",
+        "\r",
+        "sub/..\t/..\t/",
+    ],
 )
 async def test_iterdir_skips_entries_outside_the_listed_prefix(entry, monkeypatch, caplog):
     async def fake_fetch(self):
@@ -372,3 +385,45 @@ async def test_http_listing_skips_links_outside_the_listed_directory(monkeypatch
     children = [str(c) async for c in HTTPPath("http://host.example/dir/").iterdir()]
 
     assert children == ["http://host.example/dir/ok.txt"]
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        f"{TRUSTED}/dir/file",
+        "art://trusted.example:8443/artifactory/repo/a",
+        "art://localhost/artifactory/repo/a",
+        "art://trusted.example/artifactory",
+    ],
+)
+@pytest.mark.parametrize("join", ["x", "/x", "//x", "?q=/../x", "#f", "..", "../../.."])
+def test_derive_shortcut_agrees_with_probe(uri, join):
+    path = ArtifactoryPath(uri, token="trusted-token")
+
+    for derived in (path / join, path.parent, *path.parents):
+        probe = object.__new__(ArtifactoryPath)
+        CommonPurePathMixin.__init__(probe, str(derived))
+        same = probe._path.raw_authority == path._path.raw_authority
+        assert derived._init_options == ({"token": "trusted-token"} if same else {})
+
+
+def test_shorthand_host_still_probes_on_join(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", "base.example/artifactory")
+    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
+    path = ArtifactoryPath("art://trusted.example/artifactory/repo", token="trusted-token")
+    path._path = path._path.with_host("rti")
+
+    assert not path._keeps_authority((str(path), "x"))
+
+
+@pytest.mark.parametrize("parent", ["s3://bucket/dir/sub", "s3://bucket/dir/sub/", "s3://bucket"])
+def test_plain_listing_names_parse_to_a_direct_child(parent):
+    path = _s3(parent)
+    chars = [chr(c) for c in range(0x00, 0x80)] + ["ü", "日本", "e\u0301", "\u200b"]
+    names = [form for c in chars for form in (c, f"a{c}b", f"{c}x/", f"..{c}", f"{c}..")]
+    for name in names:
+        uri = f"{parent.rstrip('/')}/{name}"
+        tail = path._plain_child_name(uri)
+        if tail is not None:
+            assert URL(uri, encoded="?" in uri) == path._path / tail, repr(name)
+            assert path._is_direct_child(path._child(uri)), repr(name)
