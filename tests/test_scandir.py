@@ -13,9 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from click.testing import CliRunner
-from rich.console import COLOR_SYSTEMS
+from rich.text import Text
 
-import asanypath.cli as cli_module
 from asanypath import AsyncPath, DirEntry, SyncPath
 from asanypath.cli import _columns, cli
 from asanypath.common import CommonPurePathMixin, parse_listing_mtime
@@ -123,8 +122,8 @@ async def test_complete_entries_skip_probes():
     ],
 )
 def test_columns_fill_column_major(width, expected):
-    names = [(n, n) for n in ("a", "bbb", "ccc", "dd", "e")]
-    assert _columns(names, width) == expected
+    names = [Text(n) for n in ("a", "bbb", "ccc", "dd", "e")]
+    assert _columns(names, width).plain == expected
 
 
 def test_ls_hides_dotfiles_unless_all(tmp_path):
@@ -148,10 +147,3 @@ def test_ls_hides_dotfiles_unless_all(tmp_path):
 def test_ls_only_dotfiles_is_empty(tmp_path):
     (tmp_path / ".hidden").write_text("x")
     assert CliRunner().invoke(cli, ["ls", str(tmp_path)]).exit_code == 1
-
-
-def test_painter_emits_ansi_only_with_color(monkeypatch):
-    monkeypatch.setattr(cli_module.console, "_color_system", COLOR_SYSTEMS["truecolor"])
-    assert cli_module._painter(True)("d/", "bold blue") == "\x1b[1;34md/\x1b[0m"
-    assert cli_module._painter(False)("d/", "bold blue") == "d/"
-    assert cli_module._painter(True)("d/", None) == "d/"

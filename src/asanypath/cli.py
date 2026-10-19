@@ -17,7 +17,7 @@ import shlex
 import stat as statmod
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from os import getenv
@@ -25,7 +25,7 @@ from pathlib import Path
 
 import rich_click as click
 from rich.cells import cell_len
-from rich.console import COLOR_SYSTEMS, Console, Group
+from rich.console import Console, Group
 from rich.live import Live
 from rich.progress import (
     BarColumn,
@@ -37,8 +37,8 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.style import Style
 from rich.table import Table
+from rich.text import Text
 
 from asanypath import AsAnyPath, DirEntry
 from asanypath._backend_opts import kwargs_for, parse_options
@@ -474,11 +474,9 @@ LS_DEPTH_GRADIENTS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _columns(names: list[tuple[str, str]], width: int, gap: int = 2) -> str:
-    """Lay out ``(plain, styled)`` names column-major in as many columns as fit
-    *width*, like ``ls``. Widths come from the plain text; styled text is emitted.
-    """
-    lens = [cell_len(plain) for plain, _ in names]
+def _columns(names: list[Text], width: int, gap: int = 2) -> Text:
+    """Lay out *names* column-major in as many columns as fit *width*, like ``ls``."""
+    lens = [cell_len(n.plain) for n in names]
     count = len(names)
     rows, widths = count, [max(lens, default=0)]
     for ncols in range(min(count, max(1, width // (min(lens, default=1) + gap))), 1, -1):
@@ -487,30 +485,18 @@ def _columns(names: list[tuple[str, str]], width: int, gap: int = 2) -> str:
         if sum(cols) + gap * (len(cols) - 1) <= width:
             rows, widths = nrows, cols
             break
-    lines = []
+    out = Text()
     for r in range(rows):
-        parts = []
+        if r:
+            out.append("\n")
         for c, col_width in enumerate(widths):
             i = c * rows + r
             if i >= count:
                 break
-            parts.append(names[i][1])
+            out.append(names[i])
             if c < len(widths) - 1 and i + rows < count:
-                parts.append(" " * (col_width - lens[i] + gap))
-        lines.append("".join(parts))
-    return "\n".join(lines)
-
-
-def _painter(enabled: bool) -> Callable[[str, str | None], str]:
-    """Return ``paint(text, style)`` emitting ANSI codes when the console supports color."""
-    system = COLOR_SYSTEMS.get(console.color_system or "") if enabled else None
-
-    def paint(text: str, style: str | None) -> str:
-        if not style or system is None:
-            return text
-        return Style.parse(style).render(text, color_system=system)
-
-    return paint
+                out.append(" " * (col_width - lens[i] + gap))
+    return out
 
 
 def mask_token(token: str | None, max_visible: int = 4) -> str:
@@ -1434,26 +1420,23 @@ def ls(
                     rows.extend(subtrees.get(i, ()))
                 return rows
 
-            paint = _painter(colors_enabled)
-
-            def _name_text(entry: DirEntry, branch_state: tuple[bool, ...]) -> tuple[str, str]:
-                """Return the entry's (plain, styled) display text."""
+            def _name_text(entry: DirEntry, branch_state: tuple[bool, ...]) -> Text:
                 name = entry.path.name + ("/" if entry.is_dir else "")
                 if not tree_mode:
-                    return name, paint(name, sty("dir") if entry.is_dir else sty("name"))
-                plain, styled = [], []
+                    return Text(name, style=sty("dir") if entry.is_dir else sty("name"))
+                text = Text()
                 for depth_index, ancestor_is_last in enumerate(branch_state[:-1], start=1):
-                    guide = "    " if ancestor_is_last else "│   "
-                    plain.append(guide)
-                    styled.append(paint(guide, depth_sty(depth_index) or sty("guide")))
+                    if ancestor_is_last:
+                        text.append("    ")
+                    else:
+                        text.append("│   ", style=depth_sty(depth_index) or sty("guide"))
                 branch_depth = len(branch_state)
                 branch_glyph = "└── " if branch_state[-1] else "├── "
-                plain += [branch_glyph, name]
-                styled.append(paint(branch_glyph, depth_sty(branch_depth) or sty("guide")))
-                styled.append(
-                    paint(name, depth_sty(branch_depth, bold=bool(entry.is_dir)) or sty("name"))
+                text.append(branch_glyph, style=depth_sty(branch_depth) or sty("guide"))
+                text.append(
+                    name, style=depth_sty(branch_depth, bold=bool(entry.is_dir)) or sty("name")
                 )
-                return "".join(plain), "".join(styled)
+                return text
 
             rows = await _collect(p)
             if not rows:
@@ -1465,25 +1448,31 @@ def ls(
                 return 0
 
             names = [_name_text(entry, state) for entry, state in rows]
-            lines = [paint(path, sty("root"))] if tree_mode else []
+            out = Text()
+            if tree_mode:
+                out.append(path, style=sty("root"))
+                out.append("\n")
             if long_format:
                 sizes = ["" if e.size is None else str(e.size) for e, _ in rows]
                 size_width = max(map(len, sizes))
-                for (entry, _), size, (_, name) in zip(rows, sizes, names):
+                for (entry, _), size, name in zip(rows, sizes, names):
                     modified = (
                         datetime.fromtimestamp(entry.mtime).strftime("%Y-%m-%d %H:%M:%S")
                         if entry.mtime is not None
                         else ""
                     )
-                    lines.append(
-                        f"{paint(size.rjust(size_width), sty('size'))} "
-                        f"{paint(modified.ljust(19), sty('modified'))} {name}"
-                    )
+                    out.append(size.rjust(size_width), style=sty("size"))
+                    out.append(" ")
+                    out.append(modified.ljust(19), style=sty("modified"))
+                    out.append(" ")
+                    out.append(name)
+                    out.append("\n")
             elif tree_mode or not console.is_terminal:
-                lines.extend(styled for _, styled in names)
+                out.append(Text("\n").join(names))
             else:
-                lines.append(_columns(names, console.width))
-            console.file.write("\n".join(line.rstrip() for line in lines) + "\n")
+                out.append(_columns(names, console.width))
+            out.rstrip()
+            console.print(out, soft_wrap=True)
 
             return 0
         except NotImplementedError:
