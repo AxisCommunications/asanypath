@@ -2,13 +2,14 @@
 
 ## Reporting a Vulnerability
 
-Do not report suspected vulnerabilities in public issues. Once the public
-repository is available, use its GitHub private vulnerability-reporting feature
-to provide reproduction details, affected versions, and potential impact.
+Do not report suspected vulnerabilities in public issues or pull requests.
+Report them privately through GitHub's private vulnerability reporting: open
+the repository's **Security** tab and choose **Report a vulnerability**.
+Include reproduction details, affected versions, and potential impact. Do not
+include credentials, tokens, or customer data in the report.
 
-Until that feature is configured, contact the project maintainer through the
-approved private support channel. Do not include credentials, tokens, or
-customer data in the report.
+Maintainers coordinate fixes through a GitHub security advisory and publish the
+advisory together with the patched release.
 
 ## Supported Versions
 

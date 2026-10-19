@@ -39,7 +39,7 @@ from asanypath_native import (
 )
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -136,16 +136,12 @@ class AzurePath(CloudPathMixin):
             or cfg.endpoint_url
             or (f"https://{self._account_name}.blob.core.windows.net")
         )
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, etc.) inherit them.
-        if account_name:
-            cfg.account_name = account_name
-        if account_key:
-            cfg.account_key = account_key
-        if sas_token:
-            cfg.sas_token = sas_token
-        if endpoint_url:
-            cfg.endpoint_url = endpoint_url
+        self._init_options = _explicit(
+            endpoint_url=endpoint_url,
+            account_name=account_name,
+            account_key=account_key,
+            sas_token=sas_token,
+        )
 
         # URL format: az://container/blob/path
         self._container = self._path.host or ""

@@ -57,6 +57,17 @@ _CASES = [
 ]
 
 
+@pytest.fixture
+def ambient_token(monkeypatch):
+    """Ambient Artifactory token for paths on another authority.
+
+    Host-bound backends never carry explicit credentials to a different
+    host, so such paths resolve credentials from the environment.
+    """
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient-token")
+    ArtifactoryPath._env_config = None
+
+
 @pytest.fixture(params=_CASES)
 def path_and_factory(request):
     factory, uri = request.param
@@ -122,7 +133,7 @@ class TestCommonPurePath:
         assert child.name == "child.txt"
         assert isinstance(child, type(p))
 
-    def test_rtruediv(self, path_and_factory):
+    def test_rtruediv(self, path_and_factory, ambient_token):
         p, factory = path_and_factory
         root = f"{p.protocol}://root"
         result = root / p
@@ -225,7 +236,7 @@ class TestCommonPurePath:
         assert renamed.suffix == ".md"
         assert renamed.stem == "file"
 
-    def test_with_segments(self, path_and_factory):
+    def test_with_segments(self, path_and_factory, ambient_token):
         p, factory = path_and_factory
         new_uri = f"{p.protocol}://other/path.txt"
         result = p.with_segments(new_uri)
@@ -269,7 +280,7 @@ class TestCommonPurePath:
         p, factory = path_and_factory
         assert not p.is_relative_to(f"{p.protocol}://totally/different")
 
-    def test_relative_to(self, path_and_factory):
+    def test_relative_to(self, path_and_factory, ambient_token):
         p, factory = path_and_factory
         parent = p.parent
         rel = p.relative_to(str(parent))
