@@ -21,6 +21,7 @@ from asanypath.cache import DownloadCache
 from asanypath.cloud import CloudPathMixin
 from asanypath.ftp import FTPPath
 from asanypath.gcs import GCSPath
+from asanypath.http import HTTPPath
 from asanypath.s3 import S3Path
 from asanypath.ssh import SSHPath
 
@@ -274,13 +275,37 @@ async def test_download_cache_is_scoped_to_credentials(monkeypatch, tmp_path):
     assert not any("secret" in key for key in keys)
 
 
+def test_http_cache_identity_changes_with_auth_env(monkeypatch):
+    path = HTTPPath("https://example.invalid/data")
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "admin-token")
+    admin_key = path._identity_fingerprint()
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "reader-token")
+    reader_key = path._identity_fingerprint()
+
+    assert admin_key != reader_key
+
+
+def test_artifactory_cache_identity_changes_with_implicit_token(monkeypatch):
+    uri = f"{TRUSTED}/file.txt"
+    tokens = iter(["admin-token", "reader-token"])
+    monkeypatch.setattr(_credstore, "load", lambda key, **_: next(tokens))
+    monkeypatch.setattr("asanypath.artifactory._jfrog_conf_token", lambda base_url: None)
+    ArtifactoryPath._service_tokens.clear()
+    admin = ArtifactoryPath(uri)
+    ArtifactoryPath._service_tokens.clear()
+    reader = ArtifactoryPath(uri)
+
+    assert admin._identity_fingerprint() != reader._identity_fingerprint()
+
+
 # ---------------------------------------------------------------------------
 # Listing confinement
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "entry", ["../outside.txt", "%2E%2E/outside.txt", "sub/../../outside.txt", "a%2Fb", ""]
+    "entry",
+    ["../outside.txt", "%2E%2E/outside.txt", "sub/../../outside.txt", "a%2Fb", "", "sub?x=/../"],
 )
 async def test_iterdir_skips_entries_outside_the_listed_prefix(entry, monkeypatch, caplog):
     async def fake_fetch(self):
@@ -331,3 +356,19 @@ async def test_artifactory_listing_skips_dot_segment_names():
     path._get_batcher = lambda: _Batcher()  # type: ignore[method-assign]
 
     assert [str(c) async for c in path.iterdir()] == [f"{TRUSTED}/dir/ok"]
+
+
+async def test_http_listing_skips_links_outside_the_listed_directory(monkeypatch):
+    async def fake_scrape(url, selector, **_):
+        return [
+            "http://host.example/dir/ok.txt",
+            "http://host.example/dir/sub?x=/../",
+            "http://host.example/other/file.txt",
+            "http://elsewhere.example/dir/file.txt",
+        ]
+
+    monkeypatch.setattr("asanypath.http.http_scrape_links", fake_scrape)
+
+    children = [str(c) async for c in HTTPPath("http://host.example/dir/").iterdir()]
+
+    assert children == ["http://host.example/dir/ok.txt"]

@@ -48,6 +48,10 @@ from asanypath.options import SPOOL_MAX_SIZE, AccessPolicy, AccessPolicyPatch, B
 
 logger = logging.getLogger(__name__)
 
+# Characters that make a listing name a drive, stream or path on the local OS
+# when joined onto a local destination.
+_UNSAFE_NAME_CHARS = "\\:" if os.name == "nt" else ""
+
 
 def _explicit(**options: Any) -> dict[str, Any]:
     """Keep the constructor options the caller actually passed."""
@@ -193,6 +197,10 @@ class CloudPathMixin(CommonPurePathMixin):
         that normalize to another prefix must not be treated as children.
         """
         parent, path = cast(URL, self._path), cast(URL, child._path)
+        # ``name``/``parts`` split the whole URL string, so a query or
+        # fragment would let them disagree with the path checked here.
+        if path.raw_query_string or path.raw_fragment:
+            return False
         child_path = path.path.rstrip("/")
         if not parent.raw_authority and not parent.path.strip("/"):
             return bool(path.raw_authority) and not child_path
@@ -201,6 +209,7 @@ class CloudPathMixin(CommonPurePathMixin):
             path.raw_authority == parent.raw_authority
             and head == parent.path.rstrip("/")
             and name not in ("", ".", "..")
+            and not any(c in name for c in _UNSAFE_NAME_CHARS)
         )
 
     def _confined_child(self, uri: str, **attrs: object) -> Self | None:

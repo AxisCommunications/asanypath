@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from base64 import b64encode
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -28,6 +29,8 @@ from asanypath_native import (
 
 from asanypath._transfer import RangeNotSupportedError
 from asanypath.cloud import CloudPathMixin
+
+logger = logging.getLogger(__name__)
 
 try:
     from asanypath_native import http_request
@@ -212,6 +215,15 @@ class HTTPPath(CloudPathMixin):
         """Return auth headers for this path. Override for per-instance auth."""
         return _build_auth_headers()
 
+    def _identity_parts(self) -> tuple:
+        auth_env = (
+            getenv("HTTP_AUTH_USER"),
+            getenv("HTTP_AUTH_PASSWORD"),
+            getenv("HTTP_AUTH_TOKEN"),
+            getenv("HTTP_AUTH_HEADER"),
+        )
+        return (*super()._identity_parts(), auth_env)
+
     def _merge_headers(
         self,
         user_headers: dict[str, str] | list[tuple[str, str]] | None,
@@ -337,11 +349,15 @@ class HTTPPath(CloudPathMixin):
             headers=self._merge_headers(None),
         )
         for link in urls:
-            yield type(self)(
+            child = type(self)(
                 link,
                 listing=self._listing,
                 listing_attr=self._listing_attr,
             )
+            if self._is_direct_child(child):
+                yield child
+            else:
+                logger.warning("Skipping listing entry %r: not a direct child of %s", link, self)
 
     async def walk(
         self,
