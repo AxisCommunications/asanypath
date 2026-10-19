@@ -37,7 +37,7 @@ from asanypath_native import (
 from yarl import URL
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin, _explicit
+from asanypath.cloud import CloudPathMixin, ServiceEndpointMixin, _explicit
 from asanypath.options import (
     S3_MIN_PART_SIZE,
     UPLOAD_CHUNK_SIZE,
@@ -56,7 +56,7 @@ def _default_s3_endpoint(region: str) -> str:
     return f"https://s3.{region}.{suffix}"
 
 
-class S3Path(CloudPathMixin):
+class S3Path(CloudPathMixin, ServiceEndpointMixin):
     protocol: str = "s3"
     _supports_range_read: bool = True
     # Bytes per part; objects below one part upload in a single PUT. Shared

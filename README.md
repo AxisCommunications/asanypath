@@ -82,6 +82,23 @@ with path.open("rb") as f:
 Files smaller than the buffer size are fetched in one shot automatically.
 Supported on S3, GCS, Azure, and Artifactory.
 
+### Service endpoints
+
+S3, GCS, Azure and Artifactory paths expose a read-only `endpoint_url` property:
+
+```python
+path = AsAnyPath("s3://bucket/key", endpoint_url="https://storage.example.com")
+print(path.endpoint_url)  # https://storage.example.com
+```
+
+This is the complete service base URL, including any service-root path such as
+`/artifactory`, but excluding the bucket, container, repository and object path.
+Reading it performs no I/O. For S3, it initially reflects an explicit override
+or regional default; AWS configuration resolution during an operation can
+update it. It is not necessarily the final per-request URL (for example, after
+bucket addressing or redirects). Local, HTTP, SSH and FTP paths do not expose
+this property.
+
 ### Copy and recursive delete
 
 ```python

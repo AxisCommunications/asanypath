@@ -43,7 +43,7 @@ from asanypath_native import (
 )
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin, _explicit
+from asanypath.cloud import CloudPathMixin, ServiceEndpointMixin, _explicit
 from asanypath.options import (
     GCS_CHUNK_ALIGN,
     UPLOAD_CHUNK_SIZE,
@@ -56,7 +56,7 @@ from asanypath.options import (
 GCS_API_BASE = "https://storage.googleapis.com"
 
 
-class GCSPath(CloudPathMixin):
+class GCSPath(CloudPathMixin, ServiceEndpointMixin):
     """Async path implementation for Google Cloud Storage.
 
     Uses the GCS JSON API for object operations.

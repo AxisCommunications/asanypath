@@ -529,8 +529,10 @@ async def test_endpoint_from_aws_config(region, aws_endpoint, expected):
         S3Path._env_config = None
         try:
             path = S3Path("s3://bucket/key")
+            assert path.endpoint_url == "https://s3.amazonaws.com"
+            resolver.assert_not_awaited()
             await path._get_native_kwargs()
-            assert path._endpoint_url == expected
+            assert path.endpoint_url == expected
         finally:
             S3Path._env_config = None
 

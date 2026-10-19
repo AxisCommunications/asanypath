@@ -38,7 +38,7 @@ from asanypath_native import (
 )
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin, _explicit
+from asanypath.cloud import CloudPathMixin, ServiceEndpointMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -75,7 +75,7 @@ def _parse_connection_string(cs: str | None) -> dict[str, str]:
     return out
 
 
-class AzurePath(CloudPathMixin):
+class AzurePath(CloudPathMixin, ServiceEndpointMixin):
     """Async path implementation for Azure Blob Storage.
 
     Uses the Azure Blob Storage REST API via the shared-key or SAS authentication.

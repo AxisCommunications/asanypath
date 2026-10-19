@@ -275,10 +275,10 @@ class TestArtifactoryPath(testbase):
             "art://artifactory.example.com/artifactory/generic",
             "art://artifactory.example.com/artifactory/maven",
         ]
-        assert mock.await_args.kwargs["base_url"] == "artifactory.example.com/artifactory"
+        assert mock.await_args.kwargs["base_url"] == "https://artifactory.example.com/artifactory"
 
     async def test_list_repos_root_fallback_parse(self):
-        # No trailing slash: 'artifactory' lands in the repo slot; base is rebuilt.
+        # The service root is recognized with or without a trailing slash.
         root = _make_artifactory_path("art://artifactory.example.com/artifactory")
         with patch(
             "asanypath.artifactory.art_list_repos",
@@ -286,7 +286,7 @@ class TestArtifactoryPath(testbase):
         ) as mock:
             result = await root._list_containers()
         assert result == ["art://artifactory.example.com/artifactory/generic"]
-        assert mock.await_args.kwargs["base_url"] == "artifactory.example.com/artifactory"
+        assert mock.await_args.kwargs["base_url"] == "https://artifactory.example.com/artifactory"
 
     async def test_list_repos_none_when_repo_set(self, p):
         with patch("asanypath.artifactory.art_list_repos", new=AsyncMock()) as mock:
