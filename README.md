@@ -236,6 +236,23 @@ For backends whose credentials authenticate against the host in the URL
 different host. Listing results are only yielded when they name a direct child
 of the listed path.
 
+Ambient credentials are scoped the same way:
+
+- **Artifactory:** a JFrog CLI server token is only used for that server's
+  exact host and port. When `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`) is set,
+  `ARTIFACTORY_IDENTITY_TOKEN` is only used for that service.
+- **SSH:** host keys are checked like OpenSSH. `StrictHostKeyChecking`
+  (`yes`, `ask`, `accept-new`, `no`) and `UserKnownHostsFile` are read from
+  ssh_config; the default is `ask` against `~/.ssh/known_hosts`. Interactive
+  sessions are prompted for a host with no recorded key; non-interactive ones
+  refuse it. A changed key is refused. Pass `known_hosts=()` (or set
+  `SSH_KNOWN_HOSTS=none`) to disable checking.
+- **HTTP(S):** on a redirect to another scheme, host or port, only
+  non-credential headers (`Range`, `Accept`, conditional headers, ...) are
+  forwarded.
+- **Azure `presign()`** signs a blob-scoped SAS with the account key; a
+  configured SAS token is never handed out as a presigned URL.
+
 ### Download caching (opt-in)
 
 Reading the same object or URL twice always re-downloads it — there is **no
@@ -283,12 +300,16 @@ Behaviour and trade-offs:
   payloads; SQLite metadata and transaction journals add filesystem overhead.
   Objects larger than the budget are returned without being cached.
 - **Byte-only native storage:** SQLite stores raw bytes, never Python pickles.
-  The database lives under `native-v1/` in the configured cache directory.
+  The database lives under `native-v1/` in the configured cache directory,
+  readable only by its owner (directory `0700`, files `0600` on POSIX).
   Legacy DiskCache files are ignored, not migrated or deleted. Multiple
-  processes can share the new store; use the same size limit across them.
+  processes of the same user can share the new store; use the same size limit
+  across them.
 - **Scoped to credentials.** Entries are keyed by URL plus a hash of the
   path's credentials and endpoint, so different identities never share an
-  entry. Credentials themselves are never written to the cache.
+  entry. Credentials themselves are never written to the cache. A cached entry
+  is not revalidated, so revoking an identity's access upstream does not evict
+  what it already cached.
 - **Staleness is on you.** Entries are keyed by URL with no revalidation — a
   cached object that changes upstream is served stale until it expires (`ttl`)
   or is evicted. Prefer caching immutable/versioned objects, or set a `ttl`.

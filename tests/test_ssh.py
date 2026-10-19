@@ -561,7 +561,7 @@ def resolve_config(monkeypatch):
     """Point ssh_config discovery at a dummy path and stub the native resolver."""
     monkeypatch.setenv("SSH_CONFIG", "/tmp/cfg")
     SSHPath._env_config = None
-    mock = MagicMock(return_value=("real.example.com", 2222, "deploy", None))
+    mock = MagicMock(return_value=("real.example.com", 2222, "deploy", None, None, None))
     monkeypatch.setattr("asanypath.ssh.ssh_resolve_config", mock)
     yield mock
     SSHPath._env_config = None
@@ -593,7 +593,7 @@ def test_repr_surfaces_resolution(resolve_config):
 
 
 def test_unknown_alias_passes_through(resolve_config):
-    resolve_config.return_value = (None, None, None, None)
+    resolve_config.return_value = (None, None, None, None, None, None)
     p = SSHPath("ssh://nosuchhost/x")
     assert p._resolved_host == "nosuchhost"
     # Port falls back to default; no User in config.

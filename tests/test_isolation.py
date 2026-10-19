@@ -16,6 +16,7 @@ from yarl import URL
 from asanypath import _credstore
 from asanypath import cache as cache_module
 from asanypath.artifactory import ArtifactoryPath
+from asanypath.artifactory import _jfrog_conf_token as real_jfrog_conf_token
 from asanypath.azure import AzurePath
 from asanypath.batcher import MicroBatcher
 from asanypath.cache import DownloadCache
@@ -427,3 +428,130 @@ def test_plain_listing_names_parse_to_a_direct_child(parent):
         if tail is not None:
             assert URL(uri, encoded="?" in uri) == path._path / tail, repr(name)
             assert path._is_direct_child(path._child(uri)), repr(name)
+
+
+# ---------------------------------------------------------------------------
+# SSH / FTP sessions
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ssh_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SSH_CONFIG", "")
+    monkeypatch.delenv("SSH_KNOWN_HOSTS", raising=False)
+    SSHPath._env_config = None
+    yield tmp_path
+    SSHPath._env_config = None
+
+
+def test_ssh_checks_host_keys_by_default(ssh_env):
+    kwargs = SSHPath("ssh://u@host.example/f")._native_kwargs
+
+    assert kwargs["host_key_policy"] == "ask"
+    assert kwargs["known_hosts"] == str(ssh_env / ".ssh" / "known_hosts")
+
+
+@pytest.mark.parametrize(
+    ("env", "kwargs", "expected"),
+    [
+        ("none", {}, ("disabled", "")),
+        ("/pinned", {}, ("ask", "/pinned")),
+        (None, {"known_hosts": "/kwarg"}, ("ask", "/kwarg")),
+        (None, {"known_hosts": ()}, ("disabled", "")),
+    ],
+)
+def test_ssh_known_hosts_settings(ssh_env, monkeypatch, env, kwargs, expected):
+    if env is not None:
+        monkeypatch.setenv("SSH_KNOWN_HOSTS", env)
+
+    native = SSHPath("ssh://u@host.example/f", **kwargs)._native_kwargs
+
+    assert (native["host_key_policy"], native["known_hosts"]) == expected
+
+
+def test_ssh_config_host_key_settings_apply(ssh_env, monkeypatch):
+    monkeypatch.setenv("SSH_CONFIG", "/cfg")
+    monkeypatch.setattr(
+        "asanypath.ssh.ssh_resolve_config",
+        lambda host, paths: (None, None, None, None, "Accept-New", "~/pinned"),
+    )
+
+    native = SSHPath("ssh://u@host.example/f")._native_kwargs
+
+    assert (native["host_key_policy"], native["known_hosts"]) == (
+        "accept-new",
+        str(ssh_env / "pinned"),
+    )
+
+
+def test_ftp_sessions_are_keyed_by_credentials():
+    def key(secret):
+        return FTPPath("ftp://u@a.example/f", username="u", **{"pass" + "word": secret})._client_key
+
+    assert key("right") == key("right")
+    assert key("right") != key("wrong")
+    assert not any("right" in str(part) for part in key("right"))
+
+
+# ---------------------------------------------------------------------------
+# Ambient Artifactory tokens
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def jfrog_conf(tmp_path, monkeypatch):
+    import json
+
+    from asanypath import artifactory
+
+    monkeypatch.setattr(artifactory, "_jfrog_conf_token", real_jfrog_conf_token)
+    monkeypatch.setenv("JFROG_CLI_HOME", str(tmp_path))
+    (tmp_path / "jfrog-cli.conf.v6").write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {"url": "https://corp.jfrog.io/", "accessToken": "CORP", "isDefault": True},
+                    {"url": "https://art.example:8443/", "accessToken": "PORTED"},
+                ]
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("uri", "token"),
+    [
+        ("art://corp.jfrog.io/artifactory/repo/f", "CORP"),
+        ("art://CORP.jfrog.io:443/artifactory/repo/f", "CORP"),
+        ("art://art.example:8443/artifactory/repo/f", "PORTED"),
+        ("art://attacker.example/artifactory/repo/f", None),
+        ("art://rog.io/artifactory/repo/f", None),
+        ("art://art.example/artifactory/repo/f", None),
+    ],
+)
+def test_jfrog_cli_token_only_for_its_own_host(jfrog_conf, uri, token):
+    if token is None:
+        with pytest.raises(ValueError, match="token required"):
+            ArtifactoryPath(uri)
+    else:
+        assert ArtifactoryPath(uri)._token == token
+
+
+def test_env_token_is_bound_to_the_configured_base_url(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient")
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", "corp.example/artifactory")
+    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
+    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
+
+    assert ArtifactoryPath("art://corp.example/artifactory/repo/f")._token == "ambient"
+    with pytest.raises(ValueError, match="token required"):
+        ArtifactoryPath("art://attacker.example/artifactory/repo/f")
+
+
+def test_env_token_without_base_url_applies_to_any_host(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient")
+    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
+    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
+
+    assert ArtifactoryPath("art://any.example/artifactory/repo/f")._token == "ambient"

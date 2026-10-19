@@ -311,8 +311,9 @@ class AzurePath(CloudPathMixin):
     async def presign(self, *, expires: int = 3600, method: str = "GET") -> str:
         """Generate a presigned URL for this Azure blob using a Service SAS token.
 
-        Requires account_key to be set. If a SAS token is already configured,
-        returns the blob URL with the existing SAS token appended.
+        The SAS is signed with the account key and scoped to this blob,
+        *method* and *expires*. A configured SAS token is never returned: it is
+        a credential that may grant more than this blob.
 
         Args:
             expires: URL validity in seconds (default 3600).
@@ -320,6 +321,9 @@ class AzurePath(CloudPathMixin):
 
         Returns:
             A presigned URL string.
+
+        Raises:
+            ValueError: If no account key is configured.
         """
         return az_presign(
             endpoint=self._endpoint_url,

@@ -27,8 +27,15 @@ Non-secret env defaults (used only when the URL and ssh_config don't supply):
 
     SSH_USER         (default: $USER)
     SSH_KEY_FILE     single path; pass a list via kwarg for several
-    SSH_KNOWN_HOSTS  "none" to disable host-key check; otherwise a file path.
-                     Default: ~/.ssh/known_hosts (strict verification).
+    SSH_KNOWN_HOSTS  "none" to disable host-key checking; otherwise a file path.
+                     Default: ssh_config ``UserKnownHostsFile``, else
+                     ~/.ssh/known_hosts.
+
+Host keys are checked like OpenSSH: ssh_config ``StrictHostKeyChecking``
+(``yes``, ``ask``, ``accept-new``, ``no``) applies, defaulting to ``ask``.
+With ``ask``, an interactive session is prompted the first time it meets a
+host with no recorded key; otherwise unknown hosts are refused. A changed key
+is always refused (except with ``no``).
     SSH_CONFIG       OpenSSH client config path; "" disables; otherwise
                      ~/.ssh/config and /etc/ssh/ssh_config are consulted
                      when present.
@@ -41,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import stat as stat_module
+import sys
 from collections.abc import AsyncIterator
 from os import getenv
 from pathlib import Path
@@ -50,6 +58,8 @@ from typing import IO, TYPE_CHECKING, NoReturn, cast, overload
 
 from asanypath_native import (
     ssh_disconnect_all,
+    ssh_known_host,
+    ssh_learn_host_key,
     ssh_list,
     ssh_lstat,
     ssh_mkdir,
@@ -58,6 +68,7 @@ from asanypath_native import (
     ssh_rename,
     ssh_resolve_config,
     ssh_rmdir,
+    ssh_scan_host_key,
     ssh_setstat,
     ssh_stat,
     ssh_unlink,
@@ -66,6 +77,7 @@ from asanypath_native import (
 )
 from yarl import URL
 
+from asanypath._prompt import interactive as _interactive
 from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
@@ -151,9 +163,10 @@ def _resolve_alias(
     host: str | None,
     port: int | None,
     user: str | None,
-) -> tuple[str | None, int | None, str | None, str | None]:
+) -> tuple[str | None, int | None, str | None, str | None, str | None, str | None]:
     """Expand ``(host, port, user)`` via OpenSSH config; return resolved values
-    plus the configured ``IdentityFile`` (for native key auth).
+    plus the configured ``IdentityFile`` (for native key auth),
+    ``StrictHostKeyChecking`` and first ``UserKnownHostsFile``.
 
     Falls back to the supplied values when no config is available or no
     match is found. ``port`` / ``user`` come back as ``None`` when neither
@@ -162,15 +175,58 @@ def _resolve_alias(
     """
     cfg_paths = _discover_ssh_config()
     if not host or not cfg_paths:
-        return host, port, user, None
+        return host, port, user, None, None, None
     try:
-        cfg_host, cfg_port, cfg_user, cfg_identity = ssh_resolve_config(host, cfg_paths)
+        cfg_host, cfg_port, cfg_user, cfg_identity, cfg_strict, cfg_known = ssh_resolve_config(
+            host, cfg_paths
+        )
     except Exception:  # noqa: BLE001
-        return host, port, user, None
+        return host, port, user, None, None, None
     resolved_host = cfg_host or host
     resolved_port = port or cfg_port
     resolved_user = user or cfg_user
-    return resolved_host, resolved_port, resolved_user, cfg_identity
+    return resolved_host, resolved_port, resolved_user, cfg_identity, cfg_strict, cfg_known
+
+
+_TRUSTED_HOSTS: set[tuple[str, int, str]] = set()
+_TRUST_LOCKS: dict[tuple[str, int, str], asyncio.Lock] = {}
+
+
+async def _confirm_unknown_host(host: str, port: int, known_hosts: str) -> None:
+    """OpenSSH ``StrictHostKeyChecking ask``: when interactive, prompt before
+    the first connection to a host with no key recorded in *known_hosts*.
+
+    Non-interactive sessions return without prompting; the native layer then
+    refuses the unknown key.
+    """
+    target = (host, port, known_hosts)
+    if target in _TRUSTED_HOSTS:
+        return
+    async with _TRUST_LOCKS.setdefault(target, asyncio.Lock()):
+        if target in _TRUSTED_HOSTS:
+            return
+        try:
+            known = ssh_known_host(host, port, known_hosts)
+        except Exception:  # noqa: BLE001 - let the connection report the file error
+            return
+        if not known:
+            if not _interactive():
+                return
+            description, public_key = await ssh_scan_host_key(host, port)
+            label = host if port == 22 else f"[{host}]:{port}"
+            fingerprint = description.rsplit(" ", 1)[-1]
+            question = (
+                f"The authenticity of host '{label}' can't be established.\n"
+                f"{description}.\n"
+                "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+            )
+            loop = asyncio.get_running_loop()
+            answer = (await loop.run_in_executor(None, input, question)).strip()
+            if answer.lower() != "yes" and answer != fingerprint:
+                raise RuntimeError(f"Host key verification failed: {label} was not accepted")
+            ssh_learn_host_key(host, port, public_key, known_hosts)
+            print(f"Permanently added '{label}' to {known_hosts}.", file=sys.stderr)
+        _TRUSTED_HOSTS.add(target)
 
 
 class SSHPath(CloudPathMixin):
@@ -215,12 +271,16 @@ class SSHPath(CloudPathMixin):
         # Eager alias resolution. str(self) keeps the original URL;
         # .resolved_target surfaces what we connect to; the connection
         # pool keys on the resolved tuple.
-        r_host, r_port, r_user, r_identity = _resolve_alias(self._host, typed_port, typed_user)
+        r_host, r_port, r_user, r_identity, r_strict, r_known = _resolve_alias(
+            self._host, typed_port, typed_user
+        )
         self._resolved_host = r_host
         self._resolved_port = r_port if r_port is not None else cfg.port
         self._resolved_user = r_user if r_user is not None else cfg.user
         # ssh_config IdentityFile, used for native key auth when no explicit key.
         self._config_identity = r_identity
+        self._config_strict_host_key_checking = r_strict
+        self._config_known_hosts = r_known
         self._init_options = _explicit(
             host=host,
             port=port,
@@ -256,7 +316,7 @@ class SSHPath(CloudPathMixin):
         elif known:
             known_hosts = known
         else:
-            known_hosts = None  # default: ~/.ssh/known_hosts (strict)
+            known_hosts = None  # ssh_config UserKnownHostsFile, else ~/.ssh/known_hosts
         port = getenv("SSH_PORT")
         config_paths = _discover_ssh_config()
         return SimpleNamespace(
@@ -309,10 +369,29 @@ class SSHPath(CloudPathMixin):
             "key_path": key_path,
             "key_passphrase": None,
             "use_agent": use_agent,
-            # Host-key checking is disabled for ``None`` (and SSH_KNOWN_HOSTS=
-            # none -> ()); any other value keeps strict verification.
-            "strict_host_key": self._known_hosts not in (None, ()),
+            **self._host_key_kwargs(),
         }
+
+    def _host_key_kwargs(self) -> dict:
+        """Native host-key settings, following OpenSSH (see module docstring)."""
+        if self._known_hosts == ():
+            return {"host_key_policy": "disabled", "known_hosts": ""}
+        known_hosts = (
+            (self._known_hosts if isinstance(self._known_hosts, str) else None)
+            or getattr(self, "_config_known_hosts", None)
+            or "~/.ssh/known_hosts"
+        )
+        policy = getattr(self, "_config_strict_host_key_checking", None) or "ask"
+        return {
+            "host_key_policy": policy.lower(),
+            "known_hosts": str(Path(known_hosts).expanduser()),
+        }
+
+    async def _get_native_kwargs(self) -> dict:
+        kwargs = self._native_kwargs
+        if kwargs["host_key_policy"] == "ask":
+            await _confirm_unknown_host(kwargs["host"], kwargs["port"], kwargs["known_hosts"])
+        return kwargs
 
     # ------------------------------------------------------------------
     # Stat / type checks
@@ -328,7 +407,7 @@ class SSHPath(CloudPathMixin):
         stat_fn = ssh_stat if follow_symlinks else ssh_lstat
         try:
             size, mtime, atime, uid, gid, permissions = await stat_fn(
-                path=self._item_path, **self._native_kwargs
+                path=self._item_path, **(await self._get_native_kwargs())
             )
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
@@ -417,7 +496,7 @@ class SSHPath(CloudPathMixin):
                 gid=gid,
                 atime=None,
                 mtime=None,
-                **self._native_kwargs,
+                **(await self._get_native_kwargs()),
             )
         if policy_patch.grants:
             attrs = await self._attrs()
@@ -438,7 +517,7 @@ class SSHPath(CloudPathMixin):
                 gid=None,
                 atime=None,
                 mtime=None,
-                **self._native_kwargs,
+                **(await self._get_native_kwargs()),
             )
 
     async def checksums(self) -> dict[str, str]:
@@ -457,13 +536,15 @@ class SSHPath(CloudPathMixin):
 
     async def _read_bytes_uncached(self) -> bytes:
         try:
-            return bytes(await ssh_read(path=self._item_path, **self._native_kwargs))
+            return bytes(await ssh_read(path=self._item_path, **(await self._get_native_kwargs())))
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
 
     async def write_bytes(self, data: bytes) -> int:
         try:
-            return await ssh_write(path=self._item_path, data=data, **self._native_kwargs)
+            return await ssh_write(
+                path=self._item_path, data=data, **(await self._get_native_kwargs())
+            )
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
 
@@ -490,7 +571,7 @@ class SSHPath(CloudPathMixin):
                     path=self._item_path,
                     data=chunk,
                     truncate=truncate,
-                    **self._native_kwargs,
+                    **(await self._get_native_kwargs()),
                 )
             except Exception as e:  # noqa: BLE001
                 _map_native_error(e, str(self))
@@ -500,7 +581,7 @@ class SSHPath(CloudPathMixin):
         try:
             return bytes(
                 await ssh_read_range(
-                    path=self._item_path, start=start, end=end, **self._native_kwargs
+                    path=self._item_path, start=start, end=end, **(await self._get_native_kwargs())
                 )
             )
         except Exception as e:  # noqa: BLE001
@@ -512,7 +593,7 @@ class SSHPath(CloudPathMixin):
 
     async def unlink(self, missing_ok: bool = False) -> None:
         try:
-            await ssh_unlink(path=self._item_path, **self._native_kwargs)
+            await ssh_unlink(path=self._item_path, **(await self._get_native_kwargs()))
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self), ignore=FileNotFoundError if missing_ok else ())
 
@@ -520,7 +601,9 @@ class SSHPath(CloudPathMixin):
         if not (parents or exist_ok) and await self.exists():
             raise FileExistsError(17, "File exists", str(self))
         try:
-            await ssh_mkdir(path=self._item_path, parents=parents, **self._native_kwargs)
+            await ssh_mkdir(
+                path=self._item_path, parents=parents, **(await self._get_native_kwargs())
+            )
         except Exception as e:  # noqa: BLE001
             try:
                 _map_native_error(e, str(self), ignore=FileExistsError if exist_ok else ())
@@ -543,7 +626,7 @@ class SSHPath(CloudPathMixin):
 
     async def _native_rmdir(self) -> None:
         try:
-            await ssh_rmdir(path=self._item_path, **self._native_kwargs)
+            await ssh_rmdir(path=self._item_path, **(await self._get_native_kwargs()))
         except Exception as e:  # noqa: BLE001
             _map_native_error(e, str(self))
 
@@ -589,7 +672,9 @@ class SSHPath(CloudPathMixin):
         if (target_path._host, target_path._port) == (self._host, self._port):
             try:
                 await ssh_rename(
-                    src=self._item_path, dst=target_path._item_path, **self._native_kwargs
+                    src=self._item_path,
+                    dst=target_path._item_path,
+                    **(await self._get_native_kwargs()),
                 )
             except Exception as e:  # noqa: BLE001
                 _map_native_error(e, str(self))
@@ -604,7 +689,9 @@ class SSHPath(CloudPathMixin):
             await target_path.unlink(missing_ok=True)
             try:
                 await ssh_rename(
-                    src=self._item_path, dst=target_path._item_path, **self._native_kwargs
+                    src=self._item_path,
+                    dst=target_path._item_path,
+                    **(await self._get_native_kwargs()),
                 )
             except Exception as e:  # noqa: BLE001
                 _map_native_error(e, str(self))
@@ -623,14 +710,14 @@ class SSHPath(CloudPathMixin):
                 gid=None,
                 atime=now,
                 mtime=now,
-                **self._native_kwargs,
+                **(await self._get_native_kwargs()),
             )
             return
         await self.write_bytes(b"")
 
     async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
         try:
-            entries = await ssh_list(path=self._item_path, **self._native_kwargs)
+            entries = await ssh_list(path=self._item_path, **(await self._get_native_kwargs()))
         except Exception as e:  # noqa: BLE001
             # A missing path / non-dir surfaces as "not a directory" for iterdir;
             # other failures keep their mapped type.

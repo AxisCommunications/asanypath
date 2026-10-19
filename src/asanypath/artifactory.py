@@ -19,6 +19,7 @@ from os import getenv
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import urlsplit
 
 import msgspec
 
@@ -49,34 +50,41 @@ from asanypath.options import (
 )
 
 
-def _jfrog_conf_token(base_url: str) -> str | None:
-    """Return an access token from the JFrog CLI config matching ``base_url``.
+def _service_netloc(url: str) -> str:
+    """``host[:port]`` (lowercase, default HTTPS port dropped) of an Artifactory
+    URL or ``host/artifactory`` base URL."""
+    parts = urlsplit(url if "://" in url else f"https://{url}")
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    default = 80 if parts.scheme == "http" else 443
+    return host if port in (None, default) else f"{host}:{port}"
 
-    Reads ``$JFROG_CLI_HOME`` (default ``~/.jfrog``), preferring a server whose
-    configured URL contains the target host, else the default/first server.
+
+def _jfrog_conf_token(base_url: str) -> str | None:
+    """Return an access token from the JFrog CLI config for ``base_url``'s host.
+
+    Reads ``$JFROG_CLI_HOME`` (default ``~/.jfrog``) and only uses a server
+    whose configured URL has exactly this host (and port): a token is never
+    sent to a service it wasn't configured for.
     """
     root = Path(getenv("JFROG_CLI_HOME") or (Path.home() / ".jfrog"))
-    host = base_url.split("/")[0].lower() if base_url else ""
+    target = _service_netloc(base_url) if base_url else ""
+    if not target:
+        return None
     for name in ("jfrog-cli.conf.v7", "jfrog-cli.conf.v6", "jfrog-cli.conf.v5", "jfrog-cli.conf"):
         try:
             data = json.loads((root / name).read_text())
         except (OSError, ValueError):
             continue
         servers = data.get("servers") if isinstance(data, dict) else None
-        if not servers:
-            continue
-        match = next(
-            (
-                s
-                for s in servers
-                if host and host in f"{s.get('url', '')}{s.get('artifactoryUrl', '')}".lower()
-            ),
-            None,
-        )
-        if match is None:
-            match = next((s for s in servers if s.get("isDefault")), servers[0])
-        if token := match.get("accessToken"):
-            return token
+        for server in servers or ():
+            urls = (server.get("url"), server.get("artifactoryUrl"))
+            if any(url and _service_netloc(url) == target for url in urls):
+                if token := server.get("accessToken"):
+                    return token
     return None
 
 
@@ -163,7 +171,7 @@ class ArtifactoryPath(CloudPathMixin):
             self._token = token
             self._init_options = {"token": token}
         else:
-            self._token = self.env_config.token or known.get(cred_key)
+            self._token = self._env_token() or known.get(cred_key)
             if not self._token:
                 self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._base_url)
                 if self._token:
@@ -188,6 +196,15 @@ class ArtifactoryPath(CloudPathMixin):
     # ------------------------------------------------------------------
     # CloudPathMixin hooks
     # ------------------------------------------------------------------
+
+    def _env_token(self) -> str | None:
+        """``ARTIFACTORY_IDENTITY_TOKEN``, unless ``ARTIFACTORY_BASE_URL`` (or
+        ``ART_BASE_URL``) names a different service than this path's."""
+        token = self.env_config.token
+        base = self._resolve_base_url_prefix()
+        if token and base and _service_netloc(base) != _service_netloc(self._base_url):
+            return None
+        return token
 
     @property
     def _item_path(self) -> str:

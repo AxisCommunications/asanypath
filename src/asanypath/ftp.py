@@ -52,8 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import hashlib
 import netrc
-import sys
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
@@ -64,6 +64,7 @@ from typing import IO, TYPE_CHECKING, TypeVar, cast
 import aioftp
 from yarl import URL
 
+from asanypath._prompt import interactive as _interactive
 from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
@@ -97,16 +98,6 @@ def disconnect_all() -> None:
 
 
 _UNSET = object()
-
-
-def _interactive() -> bool:
-    """Whether the backend may prompt the user for credentials."""
-    if getenv("ASANYPATH_INTERACTIVE") == "0":
-        return False
-    try:
-        return sys.stdin.isatty()
-    except (AttributeError, ValueError):  # pragma: no cover
-        return False  # pragma: no cover
 
 
 async def _prompt_password(label: str) -> str:
@@ -232,7 +223,10 @@ class FTPPath(CloudPathMixin):
 
     @property
     def _client_key(self) -> tuple:
-        return (self._host, self._port, self._user, self._tls)
+        # Pooled sessions are already logged in, so only callers presenting
+        # the same credentials may share one.
+        secret = repr((self._password, self._account)).encode()
+        return (self._host, self._port, self._user, self._tls, hashlib.sha256(secret).hexdigest())
 
     async def _ensure_client(self) -> aioftp.Client:
         key = self._client_key
