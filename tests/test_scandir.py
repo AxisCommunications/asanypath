@@ -12,10 +12,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from rich.text import Text
+from click.testing import CliRunner
+from rich.console import COLOR_SYSTEMS
 
+import asanypath.cli as cli_module
 from asanypath import AsyncPath, DirEntry, SyncPath
-from asanypath.cli import _columns
+from asanypath.cli import _columns, cli
 from asanypath.common import CommonPurePathMixin, parse_listing_mtime
 
 
@@ -121,5 +123,35 @@ async def test_complete_entries_skip_probes():
     ],
 )
 def test_columns_fill_column_major(width, expected):
-    names = [Text(n) for n in ("a", "bbb", "ccc", "dd", "e")]
-    assert _columns(names, width).plain == expected
+    names = [(n, n) for n in ("a", "bbb", "ccc", "dd", "e")]
+    assert _columns(names, width) == expected
+
+
+def test_ls_hides_dotfiles_unless_all(tmp_path):
+    (tmp_path / ".hidden").write_text("x")
+    (tmp_path / ".hdir").mkdir()
+    (tmp_path / ".hdir" / "inner").write_text("x")
+    (tmp_path / "shown").write_text("x")
+    runner = CliRunner()
+    default = runner.invoke(cli, ["ls", "-r", str(tmp_path)])
+    assert default.exit_code == 0, default.output
+    assert "shown" in default.output
+    assert ".hidden" not in default.output and "inner" not in default.output
+    everything = runner.invoke(cli, ["ls", "-a", "-1", str(tmp_path)])
+    assert {line.rsplit("/", 1)[-1] for line in everything.output.split()} == {
+        ".hdir",
+        ".hidden",
+        "shown",
+    }
+
+
+def test_ls_only_dotfiles_is_empty(tmp_path):
+    (tmp_path / ".hidden").write_text("x")
+    assert CliRunner().invoke(cli, ["ls", str(tmp_path)]).exit_code == 1
+
+
+def test_painter_emits_ansi_only_with_color(monkeypatch):
+    monkeypatch.setattr(cli_module.console, "_color_system", COLOR_SYSTEMS["truecolor"])
+    assert cli_module._painter(True)("d/", "bold blue") == "\x1b[1;34md/\x1b[0m"
+    assert cli_module._painter(False)("d/", "bold blue") == "d/"
+    assert cli_module._painter(True)("d/", None) == "d/"

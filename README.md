@@ -409,8 +409,9 @@ asanypath exists s3://bucket/file.txt
 # Print file contents
 asanypath cat s3://bucket/file.txt
 
-# List directory in columns; directories end with "/"
+# List directory in columns; directories end with "/", dotfiles need -a
 asanypath ls s3://bucket/prefix/
+asanypath ls -a s3://bucket/prefix/
 
 # Long listing (size, modified) and tree view
 asanypath ls -l s3://bucket/prefix/
