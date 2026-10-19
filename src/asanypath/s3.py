@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Mapping
-from contextlib import suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import cast
@@ -35,6 +36,7 @@ from asanypath_native import (
 )
 from yarl import URL
 
+from asanypath._transfer import upload_parts
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import (
     S3_MIN_PART_SIZE,
@@ -198,24 +200,24 @@ class S3Path(CloudPathMixin):
             else:
                 await self.write_bytes(data, backend_options=backend_options)
             return
-        await self._multipart_upload(fileobj, part, backend_options=backend_options)
+        await self._multipart_upload(fileobj, part, size=size, backend_options=backend_options)
 
-    async def _multipart_upload(self, fileobj, part_size: int, *, backend_options=None) -> None:
-        """Stream the buffer to S3 as multipart parts (memory bounded to one part)."""
+    async def _multipart_upload(
+        self, fileobj, part_size: int, *, size: int, backend_options=None
+    ) -> None:
+        """Upload concurrent parts within the shared transfer and buffer budget."""
         options_json = (
             msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
         )
         native_kwargs = await self._get_native_kwargs()
-        upload_id = await s3_create_multipart(
-            key=self._item_path, options_json=options_json, **native_kwargs
+        creation = asyncio.ensure_future(
+            s3_create_multipart(key=self._item_path, options_json=options_json, **native_kwargs)
         )
-        parts: list[tuple[int, str]] = []
+        upload_id = None
         try:
-            part_number = 1
-            while True:
-                chunk = fileobj.read(part_size)
-                if not chunk:
-                    break
+            upload_id = await asyncio.shield(creation)
+
+            async def upload(part_number: int, chunk: bytes) -> tuple[int, str]:
                 etag = await s3_upload_part(
                     key=self._item_path,
                     upload_id=upload_id,
@@ -223,14 +225,25 @@ class S3Path(CloudPathMixin):
                     data=chunk,
                     **native_kwargs,
                 )
-                parts.append((part_number, etag))
-                part_number += 1
+                return part_number, etag
+
+            parts = await upload_parts(fileobj, size, part_size, upload)
             await s3_complete_multipart(
                 key=self._item_path, upload_id=upload_id, parts=parts, **native_kwargs
             )
         except BaseException:
-            with suppress(Exception):
-                await s3_abort_multipart(key=self._item_path, upload_id=upload_id, **native_kwargs)
+            if upload_id is None and not creation.cancelled():
+                try:
+                    upload_id = await creation
+                except Exception:
+                    logging.getLogger(__name__).exception("S3 multipart initiation failed")
+            if upload_id is not None:
+                try:
+                    await s3_abort_multipart(
+                        key=self._item_path, upload_id=upload_id, **native_kwargs
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception("Failed to abort S3 multipart upload")
             raise
         type(self)._listing_cache.pop(self._listing_cache_key(), None)
 

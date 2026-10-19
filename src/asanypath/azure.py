@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from os import getenv
 from types import SimpleNamespace
+from uuid import uuid4
 
 import msgspec
 from asanypath_native import (
@@ -37,6 +38,7 @@ from asanypath_native import (
     az_put_container_acl,
 )
 
+from asanypath._transfer import upload_parts
 from asanypath.cloud import CloudPathMixin
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
@@ -203,26 +205,26 @@ class AzurePath(CloudPathMixin):
             else:
                 await self.write_bytes(data, backend_options=backend_options)
             return
-        await self._block_upload(fileobj, part, backend_options=backend_options)
+        await self._block_upload(fileobj, part, size=size, backend_options=backend_options)
 
-    async def _block_upload(self, fileobj, part_size: int, *, backend_options=None) -> None:
-        """Stage fixed-size blocks then commit the list (memory bounded to one block)."""
+    async def _block_upload(
+        self, fileobj, part_size: int, *, size: int, backend_options=None
+    ) -> None:
+        """Stage bounded concurrent blocks, then commit them in source order."""
         options_json = (
             msgspec.json.encode(backend_options).decode() if backend_options is not None else "{}"
         )
-        block_ids: list[str] = []
-        index = 0
-        while True:
-            chunk = fileobj.read(part_size)
-            if not chunk:
-                break
-            # Block ids must be equal-length base64 strings.
-            block_id = base64.b64encode(f"{index:048d}".encode()).decode()
+        upload_id = uuid4().hex
+
+        async def upload(index: int, chunk: bytes) -> str:
+            # Equal-length, upload-specific ids avoid mixing concurrent writers.
+            block_id = base64.b64encode(f"{upload_id}{index:016d}".encode()).decode()
             await az_put_block(
                 blob=self._item_path, block_id=block_id, data=chunk, **self._native_kwargs
             )
-            block_ids.append(block_id)
-            index += 1
+            return block_id
+
+        block_ids = await upload_parts(fileobj, size, part_size, upload)
         await az_put_block_list(
             blob=self._item_path,
             block_ids=block_ids,

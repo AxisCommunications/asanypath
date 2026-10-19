@@ -29,7 +29,8 @@ def _env_bytes(name: str, default: int) -> int:
 
 # Bytes held in memory per in-flight upload part/chunk. Objects smaller than this
 # upload in a single request; larger ones stream in parts of this size — so this
-# is the peak resident memory per upload (parts upload sequentially, no fan-out).
+# bounds each buffer, not the whole upload. Concurrent S3/Azure parts share the
+# TransferBudget; buffered payload scales with part size times active slots.
 # Tunable via ``ASANYPATH_UPLOAD_CHUNK_SIZE``; also overridable per call through
 # ``copy(chunk_size=...)`` and, for writes, ``open(..., buffering=...)``.
 UPLOAD_CHUNK_SIZE: int = _env_bytes("ASANYPATH_UPLOAD_CHUNK_SIZE", 8 * 1024 * 1024)

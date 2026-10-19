@@ -1288,13 +1288,13 @@ class TestServerSideCopy:
         with pytest.raises(NotImplementedError, match="atomic"):
             await src.copy(dst, atomic=True)
 
-    async def test_chunk_size_cross_backend_ignored(self):
+    async def test_chunk_size_cross_backend_controls_reads_and_uploads(self):
         src, dst = _s3("s3://bucket1/a.txt"), _s3("s3://bucket2/b.txt")
         with (
             patch.object(S3Path, "is_dir", new=AsyncMock(return_value=False)),
             patch.object(S3Path, "exists", new=AsyncMock(return_value=False)),
-            patch.object(S3Path, "read_bytes", new=AsyncMock(return_value=b"data")),
+            patch.object(S3Path, "_range_read", new=AsyncMock(return_value=b"data")) as read,
             patch.object(S3Path, "write_bytes", new=AsyncMock(return_value=4)),
         ):
-            # chunk_size is not applicable to cloud writes — ignored, not an error.
             await src.copy(dst, chunk_size=1024)
+        read.assert_awaited_once_with(0, 1023)
