@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -88,6 +89,7 @@ class ArtifactoryPath(CloudPathMixin):
     Example:
         ```python
         import asyncio
+        import hashlib
         from asanypath import AsAnyPath
 
         async def main():
@@ -209,6 +211,11 @@ class ArtifactoryPath(CloudPathMixin):
             "base_url": self._base_url,
             "token": self._token,
         }
+
+    def _identity_parts(self) -> tuple:
+        # Keep cache identity scoped even when the token came from keyring/JFrog.
+        token_fp = hashlib.sha256(self._token.encode()).hexdigest()
+        return (*super()._identity_parts(), self._base_url, token_fp)
 
     # ------------------------------------------------------------------
     # Backend-specific operations
