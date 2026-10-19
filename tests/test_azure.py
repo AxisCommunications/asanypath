@@ -454,14 +454,23 @@ async def test_presign_with_account_key():
 
 
 @pytest.mark.asyncio
-async def test_presign_with_existing_sas():
+async def test_presign_never_returns_the_configured_sas():
     p = _make_azure_path(
         "az://container/blob/file.txt",
         account_key=None,
-        sas_token="sv=2023-11-03&sr=c&sig=abc123",
+        sas_token="sv=2023-11-03&sr=c&sp=rwdl&sig=abc123",
     )
-    url = await p.presign()
-    assert url.endswith("?sv=2023-11-03&sr=c&sig=abc123")
+    with pytest.raises(ValueError, match="SAS token is a credential") as excinfo:
+        await p.presign(expires=60)
+    assert "abc123" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_presign_prefers_account_key_over_configured_sas():
+    p = _make_azure_path("az://container/blob/file.txt", sas_token="sv=x&sp=rwdl&sig=abc123")
+    url = await p.presign(expires=60, method="GET")
+    assert "abc123" not in url
+    assert "sr=b" in url and "sp=r" in url
 
 
 @pytest.mark.asyncio

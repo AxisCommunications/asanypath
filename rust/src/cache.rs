@@ -17,6 +17,43 @@ fn database_error(error: rusqlite::Error) -> PyErr {
     PyOSError::new_err(format!("Download cache database: {error}"))
 }
 
+/// Create (or tighten) the cache directory and database file so only the
+/// owner can read them: entries hold bytes fetched with private credentials.
+/// SQLite gives its journal file the database file's mode.
+fn prepare_private_files(directory: &std::path::Path, database: &std::path::Path) -> PyResult<()> {
+    let create_error = |error: std::io::Error| {
+        PyOSError::new_err(format!("Create download cache directory: {error}"))
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        if let Some(parent) = directory.parent() {
+            std::fs::create_dir_all(parent).map_err(create_error)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Best effort for directories created by earlier versions.
+                let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+            }
+            Err(error) => return Err(create_error(error)),
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(database)
+            .map_err(create_error)?;
+        let _ = std::fs::set_permissions(database, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = database;
+        std::fs::create_dir_all(directory).map_err(create_error)?;
+    }
+    Ok(())
+}
+
 fn now() -> PyResult<f64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -58,11 +95,9 @@ impl DownloadCache {
         py.detach(|| {
             // Never open or migrate a legacy DiskCache database.
             let directory = directory.join("native-v1");
-            std::fs::create_dir_all(&directory).map_err(|error| {
-                PyOSError::new_err(format!("Create download cache directory: {error}"))
-            })?;
-            let connection =
-                Connection::open(directory.join("cache.sqlite3")).map_err(database_error)?;
+            let database = directory.join("cache.sqlite3");
+            prepare_private_files(&directory, &database)?;
+            let connection = Connection::open(&database).map_err(database_error)?;
             connection
                 .busy_timeout(Duration::from_secs(60))
                 .map_err(database_error)?;

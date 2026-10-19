@@ -19,7 +19,10 @@ use pyo3::types::PyBytes;
 use russh::client::{self, Handle};
 #[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
-use russh::keys::{PrivateKeyWithHashAlg, check_known_hosts, load_secret_key};
+use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
+use russh::keys::{
+    HashAlg, PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key,
+};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use ssh2_config::{ParseRule, SshConfig};
@@ -43,14 +46,15 @@ struct ConnParams {
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 }
 
 /// Build a `ConnParams` from the flat connection kwargs spread by
 /// `SSHPath._native_kwargs`. Repeated verbatim at the top of each op.
 macro_rules! conn {
     ($host:ident, $port:ident, $user:ident, $password:ident, $key_path:ident,
-     $key_passphrase:ident, $use_agent:ident, $strict_host_key:ident) => {
+     $key_passphrase:ident, $use_agent:ident, $host_key_policy:ident, $known_hosts:ident) => {
         ConnParams {
             host: $host,
             port: $port,
@@ -59,7 +63,8 @@ macro_rules! conn {
             key_path: $key_path,
             key_passphrase: $key_passphrase,
             use_agent: $use_agent,
-            strict_host_key: $strict_host_key,
+            host_key_policy: $host_key_policy,
+            known_hosts: $known_hosts,
         }
     };
 }
@@ -76,14 +81,70 @@ impl ConnParams {
 }
 
 // ---------------------------------------------------------------------------
-// russh client handler — verifies the server key against ~/.ssh/known_hosts
-// unless strict checking is disabled.
+// russh client handler — verifies the server key against a known_hosts file
+// following OpenSSH's StrictHostKeyChecking semantics.
 // ---------------------------------------------------------------------------
+
+/// OpenSSH `StrictHostKeyChecking`, plus `Disabled` for an explicit opt-out
+/// (`known_hosts=()` / `SSH_KNOWN_HOSTS=none`) that never touches any file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostKeyPolicy {
+    /// Unknown and changed keys are refused.
+    Yes,
+    /// As `Yes`; the Python layer prompts for unknown hosts when interactive.
+    Ask,
+    /// Unknown keys are recorded and accepted; changed keys are refused.
+    AcceptNew,
+    /// Unknown keys are recorded; changed keys are accepted.
+    No,
+    Disabled,
+}
+
+impl HostKeyPolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "yes" | "true" => Ok(Self::Yes),
+            "ask" => Ok(Self::Ask),
+            "accept-new" => Ok(Self::AcceptNew),
+            "no" | "off" | "false" => Ok(Self::No),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!("unsupported host key policy {other:?}")),
+        }
+    }
+}
+
+fn host_label(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+fn describe_key(key: &PublicKey) -> String {
+    format!(
+        "{} key fingerprint is {}",
+        key.algorithm(),
+        key.fingerprint(HashAlg::Sha256)
+    )
+}
 
 struct Handler {
     host: String,
     port: u16,
-    strict_host_key: bool,
+    policy: HostKeyPolicy,
+    known_hosts: String,
+    /// Why the server key was refused, reported instead of russh's generic error.
+    rejected: Arc<Mutex<Option<String>>>,
+    /// The server key, kept for `ssh_scan_host_key`.
+    seen: Arc<Mutex<Option<PublicKey>>>,
+}
+
+impl Handler {
+    fn reject(&self, reason: String) -> Result<bool, anyhow::Error> {
+        *self.rejected.lock().unwrap() = Some(reason);
+        Ok(false)
+    }
 }
 
 impl client::Handler for Handler {
@@ -93,15 +154,38 @@ impl client::Handler for Handler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        if !self.strict_host_key {
+        if let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key {
+            *self.seen.lock().unwrap() = Some(key.clone());
+        }
+        if self.policy == HostKeyPolicy::Disabled {
             return Ok(true);
         }
-        match server_public_key {
-            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => {
-                // Ok(true)=known-good, Ok(false)=unknown host, Err=key mismatch.
-                Ok(check_known_hosts(&self.host, self.port, key)?)
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            return self.reject("host certificates are not supported".to_string());
+        };
+        let label = host_label(&self.host, self.port);
+        match check_known_hosts_path(&self.host, self.port, key, &self.known_hosts) {
+            Ok(true) => Ok(true),
+            Ok(false) => match self.policy {
+                HostKeyPolicy::AcceptNew | HostKeyPolicy::No => {
+                    learn_known_hosts_path(&self.host, self.port, key, &self.known_hosts)?;
+                    Ok(true)
+                }
+                _ => self.reject(format!(
+                    "no host key is known for {label} in {}; {}",
+                    self.known_hosts,
+                    describe_key(key)
+                )),
+            },
+            Err(russh::keys::Error::KeyChanged { .. }) if self.policy == HostKeyPolicy::No => {
+                Ok(true)
             }
-            russh::keys::PublicKeyOrCertificate::Certificate(_) => Ok(false),
+            Err(russh::keys::Error::KeyChanged { line }) => self.reject(format!(
+                "REMOTE HOST IDENTIFICATION HAS CHANGED for {label}: {} does not match {}:{line}",
+                describe_key(key),
+                self.known_hosts
+            )),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -119,13 +203,27 @@ struct AuthSpec {
 }
 
 impl AuthSpec {
+    /// Pool-key component: a digest of every credential, so a pooled session
+    /// is only reused by callers presenting the same credentials.
     fn fingerprint(&self) -> String {
-        format!(
-            "agent={};key={};pw={}",
-            self.use_agent,
-            self.key_path.as_deref().unwrap_or(""),
-            self.password.is_some(),
-        )
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for part in [
+            Some(if self.use_agent { "agent" } else { "" }),
+            self.key_path.as_deref(),
+            self.key_passphrase.as_deref(),
+            self.password.as_deref(),
+        ] {
+            let bytes = part.map(str::as_bytes).unwrap_or_default();
+            hasher.update([part.is_some() as u8]);
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -250,12 +348,15 @@ fn sftp_pool() -> &'static Pool {
 
 async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
     let auth = conn.auth();
+    let policy = HostKeyPolicy::parse(&conn.host_key_policy)?;
     let key = format!(
-        "{}@{}:{}#{}",
+        "{}@{}:{}#{}#{}#{}",
         conn.user,
         conn.host,
         conn.port,
-        auth.fingerprint()
+        auth.fingerprint(),
+        conn.host_key_policy.to_ascii_lowercase(),
+        conn.known_hosts
     );
     {
         let guard = sftp_pool().lock().unwrap();
@@ -265,14 +366,24 @@ async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
     }
 
     let config = Arc::new(client::Config::default());
+    let rejected = Arc::new(Mutex::new(None));
     let handler = Handler {
         host: conn.host.clone(),
         port: conn.port,
-        strict_host_key: conn.strict_host_key,
+        policy,
+        known_hosts: conn.known_hosts.clone(),
+        rejected: rejected.clone(),
+        seen: Arc::new(Mutex::new(None)),
     };
-    let mut handle = client::connect(config, (conn.host.as_str(), conn.port), handler)
-        .await
-        .map_err(|e| format!("ssh connect {}:{}: {e}", conn.host, conn.port))?;
+    let mut handle = match client::connect(config, (conn.host.as_str(), conn.port), handler).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            if let Some(reason) = rejected.lock().unwrap().take() {
+                return Err(format!("Host key verification failed: {reason}"));
+            }
+            return Err(format!("ssh connect {}:{}: {e}", conn.host, conn.port));
+        }
+    };
     authenticate(&mut handle, &conn.user, &auth).await?;
     let channel = handle
         .channel_open_session()
@@ -318,7 +429,8 @@ pub fn ssh_read<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -328,7 +440,8 @@ pub fn ssh_read<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -352,7 +465,8 @@ pub fn ssh_read_range<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -362,7 +476,8 @@ pub fn ssh_read_range<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -397,7 +512,8 @@ pub fn ssh_write<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -407,7 +523,8 @@ pub fn ssh_write<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -443,7 +560,8 @@ pub fn ssh_write_chunk<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -453,7 +571,8 @@ pub fn ssh_write_chunk<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -487,7 +606,8 @@ pub fn ssh_exists<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -497,7 +617,8 @@ pub fn ssh_exists<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -520,7 +641,8 @@ pub fn ssh_stat<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -530,7 +652,8 @@ pub fn ssh_stat<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -552,7 +675,8 @@ pub fn ssh_lstat<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -562,7 +686,8 @@ pub fn ssh_lstat<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -590,7 +715,8 @@ pub fn ssh_setstat<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -600,7 +726,8 @@ pub fn ssh_setstat<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -632,7 +759,8 @@ pub fn ssh_list<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -642,7 +770,8 @@ pub fn ssh_list<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     type Entry = (
         String,
@@ -688,7 +817,8 @@ pub fn ssh_mkdir<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -698,7 +828,8 @@ pub fn ssh_mkdir<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -730,7 +861,8 @@ pub fn ssh_rmdir<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -740,7 +872,8 @@ pub fn ssh_rmdir<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -762,7 +895,8 @@ pub fn ssh_unlink<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -772,7 +906,8 @@ pub fn ssh_unlink<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -795,7 +930,8 @@ pub fn ssh_rename<'py>(
     key_path: Option<String>,
     key_passphrase: Option<String>,
     use_agent: bool,
-    strict_host_key: bool,
+    host_key_policy: String,
+    known_hosts: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conn = conn!(
         host,
@@ -805,7 +941,8 @@ pub fn ssh_rename<'py>(
         key_path,
         key_passphrase,
         use_agent,
-        strict_host_key
+        host_key_policy,
+        known_hosts
     );
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
@@ -819,10 +956,18 @@ pub fn ssh_rename<'py>(
 /// (HostName, Port, User, first IdentityFile). Replaces the asyncssh config
 /// parser so SSHPath needs no Python SSH library at runtime.
 #[pyfunction]
+#[allow(clippy::type_complexity)]
 pub fn ssh_resolve_config(
     host: String,
     config_paths: Vec<String>,
-) -> PyResult<(Option<String>, Option<u16>, Option<String>, Option<String>)> {
+) -> PyResult<(
+    Option<String>,
+    Option<u16>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
     let mut combined = String::new();
     for path in &config_paths {
         if let Ok(content) = std::fs::read_to_string(path) {
@@ -831,7 +976,7 @@ pub fn ssh_resolve_config(
         }
     }
     if combined.trim().is_empty() {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None, None, None, None));
     }
     let mut reader = std::io::BufReader::new(std::io::Cursor::new(combined.into_bytes()));
     let config = SshConfig::default()
@@ -842,5 +987,65 @@ pub fn ssh_resolve_config(
         .identity_file
         .and_then(|files| files.into_iter().next())
         .map(|p| p.to_string_lossy().into_owned());
-    Ok((params.host_name, params.port, params.user, identity))
+    let first = |field: &str| {
+        params
+            .unsupported_fields
+            .get(field)
+            .and_then(|args| args.first())
+            .cloned()
+    };
+    Ok((
+        params.host_name,
+        params.port,
+        params.user,
+        identity,
+        first("stricthostkeychecking"),
+        first("userknownhostsfile"),
+    ))
+}
+
+/// True when `known_hosts` records any key for `host:port`.
+#[pyfunction]
+pub fn ssh_known_host(host: String, port: u16, known_hosts: String) -> PyResult<bool> {
+    known_host_keys_path(&host, port, &known_hosts)
+        .map(|keys| !keys.is_empty())
+        .map_err(err)
+}
+
+/// Connect without authenticating and return the server's host key as
+/// `(description, openssh_public_key)` for an interactive trust prompt.
+#[pyfunction]
+pub fn ssh_scan_host_key(py: Python<'_>, host: String, port: u16) -> PyResult<Bound<'_, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let seen = Arc::new(Mutex::new(None));
+        let handler = Handler {
+            host: host.clone(),
+            port,
+            policy: HostKeyPolicy::Disabled,
+            known_hosts: String::new(),
+            rejected: Arc::new(Mutex::new(None)),
+            seen: seen.clone(),
+        };
+        let config = Arc::new(client::Config::default());
+        let connected = client::connect(config, (host.as_str(), port), handler).await;
+        drop(connected);
+        let key =
+            seen.lock().unwrap().take().ok_or_else(|| {
+                PyRuntimeError::new_err(format!("ssh {host}:{port}: no host key"))
+            })?;
+        let openssh = key.to_openssh().map_err(err)?;
+        Ok((describe_key(&key), openssh))
+    })
+}
+
+/// Append `host:port`'s key (OpenSSH public-key format) to `known_hosts`.
+#[pyfunction]
+pub fn ssh_learn_host_key(
+    host: String,
+    port: u16,
+    public_key: String,
+    known_hosts: String,
+) -> PyResult<()> {
+    let key = PublicKey::from_openssh(&public_key).map_err(err)?;
+    learn_known_hosts_path(&host, port, &key, &known_hosts).map_err(err)
 }

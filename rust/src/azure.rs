@@ -1129,8 +1129,10 @@ pub fn az_is_dir_batch<'py>(
 
 /// Generate a presigned URL for an Azure blob using a Service SAS token.
 ///
-/// If `sas_token` is already provided, it is simply appended to the blob URL.
-/// Otherwise, `account_key` is used to generate a new Service SAS.
+/// The SAS is signed with `account_key`, scoped to this blob, `method` and
+/// `expires`. A configured `sas_token` is a credential that may grant far
+/// more (other blobs, write access, a longer lifetime), so it is never handed
+/// out as a presigned URL.
 #[pyfunction]
 pub fn az_presign(
     endpoint: String,
@@ -1151,21 +1153,18 @@ pub fn az_presign(
         format!("{}/{}/{}", base, container, blob_path)
     };
 
-    // If SAS token already exists, just append it
-    if let Some(ref sas) = sas_token {
-        if !sas.is_empty() {
-            let sep = if blob_url.contains('?') { "&" } else { "?" };
-            return Ok(format!("{}{}{}", blob_url, sep, sas));
-        }
-    }
-
     let key_str = account_key
         .as_ref()
         .filter(|k| !k.is_empty())
         .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "presign requires account_key or an existing sas_token",
-            )
+            let hint = if sas_token.as_deref().is_some_and(|s| !s.is_empty()) {
+                "; the configured SAS token is a credential and is not shared"
+            } else {
+                ""
+            };
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "presign requires account_key to sign a blob-scoped SAS{hint}"
+            ))
         })?;
 
     let key_bytes = B64

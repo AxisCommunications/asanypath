@@ -41,6 +41,10 @@ def _clear_env_caches(monkeypatch):
     # ~/.ssh/config or ~/.netrc unless they opt in explicitly.
     monkeypatch.setenv("SSH_CONFIG", "")
     monkeypatch.setenv("NETRC", "/nonexistent/netrc")
+    # Nor the dev's Artifactory service (CI has none): tests that need a
+    # base URL set it themselves.
+    monkeypatch.delenv("ARTIFACTORY_BASE_URL", raising=False)
+    monkeypatch.delenv("ART_BASE_URL", raising=False)
 
     GCSPath._env_config = None
     AzurePath._env_config = None
