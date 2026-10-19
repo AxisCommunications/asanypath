@@ -737,18 +737,13 @@ def test_auth_show(runner, args):
     assert result.exit_code == 0
 
 
-def test_auth_show_masking(runner):
+def test_auth_show_masking(runner, monkeypatch):
     """Verify tokens are masked in output."""
-    import os
-
-    os.environ["ARTIFACTORY_IDENTITY_TOKEN"] = "secret123456"
-    try:
-        result = runner.invoke(cli, ["auth", "show", "art://art.com"])
-        assert result.exit_code == 0
-        assert "sece*" not in result.output
-        assert "ARTIFACTORY_IDENTITY_TOKEN" in result.output
-    finally:
-        del os.environ["ARTIFACTORY_IDENTITY_TOKEN"]
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "secret123456")
+    result = runner.invoke(cli, ["auth", "show", "art://art.com"])
+    assert result.exit_code == 0
+    assert "sece*" not in result.output
+    assert "ARTIFACTORY_IDENTITY_TOKEN" in result.output
 
 
 # ---------------------------------------------------------------------------

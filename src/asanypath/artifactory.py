@@ -104,11 +104,15 @@ class ArtifactoryPath(CloudPathMixin):
     """
 
     protocol: str = "art"
+    _options_bound_to_authority = True
     _supports_range_read: bool = True
     # Artifactory has no multipart API: objects at/above this size stream a single
     # PUT body from disk (bounded memory) instead of buffering the whole object.
     _STREAM_THRESHOLD = UPLOAD_CHUNK_SIZE
     _copy_batch_fn = staticmethod(art_copy_batch)
+    # Tokens per service (``art:<host>/artifactory``), mirroring the keyring so
+    # repeated constructions skip it. Never applied to a different service.
+    _service_tokens: dict[str, str] = {}
 
     @staticmethod
     def _batcher_key_fn(base_url: str, token: str, **_kw) -> str:
@@ -148,23 +152,26 @@ class ArtifactoryPath(CloudPathMixin):
         from asanypath import _credstore
 
         cred_key = f"art:{self._base_url}"
-        self._token = token or self.env_config.token
-        if not self._token:
-            self._token = _credstore.load(cred_key)
-        if not self._token:
-            self._token = _jfrog_conf_token(self._base_url)
+        known = ArtifactoryPath._service_tokens
+        if token:
+            # Persist user-supplied tokens once per service, not per derived path.
+            if known.get(cred_key) != token:
+                _credstore.save(cred_key, token)
+                known[cred_key] = token
+            self._token = token
+            self._init_options = {"token": token}
+        else:
+            self._token = self.env_config.token or known.get(cred_key)
+            if not self._token:
+                self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._base_url)
+                if self._token:
+                    known[cred_key] = self._token
         if not self._token:
             raise ValueError(
                 "Artifactory token required via 'token' parameter, "
                 "ARTIFACTORY_IDENTITY_TOKEN environment variable, the JFrog CLI config "
                 "(~/.jfrog/jfrog-cli.conf), or a previously cached token (see keyring)."
             )
-        # Promote the resolved token into the class-level cache so derived
-        # instances (parent, /, iterdir children, ...) inherit it without
-        # re-hitting the keyring. Persist only user-supplied tokens.
-        self.env_config.token = self._token
-        if token:
-            _credstore.save(cred_key, token)
         # Cached folder hint — set by iterdir() to avoid redundant API calls
         self._is_folder: bool | None = None
         self._cached_info: dict | None = None
@@ -308,8 +315,10 @@ class ArtifactoryPath(CloudPathMixin):
         )
         base = str(self).rstrip("/")
         for uri, is_folder in results:
-            child_name = uri.rsplit("/", 1)[-1]
-            yield self._child(f"{base}/{child_name}", _is_folder=is_folder)
+            child_name = uri.rstrip("/").rsplit("/", 1)[-1]
+            child = self._confined_child(f"{base}/{child_name}", _is_folder=is_folder)
+            if child is not None:
+                yield child
 
     async def _list_containers(self) -> list[str] | None:
         """List repositories when at the server root (``art://<host>/artifactory/``).

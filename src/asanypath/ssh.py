@@ -66,7 +66,7 @@ from asanypath_native import (
 )
 from yarl import URL
 
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -177,6 +177,7 @@ class SSHPath(CloudPathMixin):
     """Async SFTP path backed by a native russh client."""
 
     protocol: str = "ssh"
+    _options_bound_to_authority = True
     _supports_range_read: bool = True
     _conditional_range_read: bool = False
     # Bytes per streamed chunk; objects below one chunk write in a single call.
@@ -220,20 +221,15 @@ class SSHPath(CloudPathMixin):
         self._resolved_user = r_user if r_user is not None else cfg.user
         # ssh_config IdentityFile, used for native key auth when no explicit key.
         self._config_identity = r_identity
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, ...) inherit them — mirrors S3/GCS.
-        if host:
-            cfg.host = host
-        if port:
-            cfg.port = port
-        if username:
-            cfg.user = username
-        if password is not None:
-            cfg.password = password
-        if client_keys is not None:
-            cfg.client_keys = keys
+        self._init_options = _explicit(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            client_keys=client_keys,
+        )
         if known_hosts is not _UNSET:
-            cfg.known_hosts = known_hosts
+            self._init_options["known_hosts"] = known_hosts
 
     def __repr__(self) -> str:
         typed = (self._host, self._port, self._user)
@@ -648,7 +644,9 @@ class SSHPath(CloudPathMixin):
             attrs = SimpleNamespace(
                 size=size, mtime=mtime, atime=atime, uid=uid, gid=gid, permissions=permissions
             )
-            yield self._child(str(self._path / name), _cached_attrs=attrs)
+            child = self._confined_child(str(self._path / name), _cached_attrs=attrs)
+            if child is not None:
+                yield child
 
     async def walk(
         self,

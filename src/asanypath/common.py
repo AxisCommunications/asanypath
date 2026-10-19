@@ -10,7 +10,7 @@ import fnmatch
 import re
 from os import PathLike, getenv, sep
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
@@ -92,6 +92,14 @@ class CommonPurePathMixin:
         "art": ("ARTIFACTORY_BASE_URL", "ART_BASE_URL"),
     }
 
+    # Explicit constructor options (credentials, endpoint, ...) that derived
+    # paths (``/``, ``parent``, ``with_name``, ...) carry over. Backends set
+    # this per instance; it is never shared between independent paths.
+    _init_options: dict[str, Any] = {}
+    # True when the options authenticate against the host named in the URL,
+    # so they must not follow a derived path to a different authority.
+    _options_bound_to_authority: bool = False
+
     def __init__(
         self,
         part: str | Path | AioPath | CommonPurePathMixin | None = None,
@@ -121,6 +129,16 @@ class CommonPurePathMixin:
         # presigned URLs) — yarl would otherwise percent-decode them and break
         # the signature.
         self._path = URL(joined, encoded="?" in joined)
+
+    def _derive(self, *parts: Any) -> Self:
+        """Build a path from *parts* that keeps this path's explicit options."""
+        options = self._init_options
+        if options and self._options_bound_to_authority:
+            probe = object.__new__(type(self))
+            CommonPurePathMixin.__init__(probe, *parts)
+            if probe._path.raw_authority != self._path.raw_authority:
+                options = {}
+        return type(self)(*parts, **options)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}('{self}')"
@@ -168,11 +186,11 @@ class CommonPurePathMixin:
         else:
             raise UnsupportedProtocolError(f"Cannot join {self.protocol} path with {other}")
 
-        return type(self)(str(self), *other)
+        return self._derive(str(self), *other)
 
     def __rtruediv__(self, other: T | str | PathLike[str]) -> Self:
-        if not isinstance(other, cls := type(self)):
-            other = cls(other)
+        if not isinstance(other, type(self)):
+            other = self._derive(other)
         return other / self
 
     def absolute(self) -> Self:
@@ -208,7 +226,7 @@ class CommonPurePathMixin:
 
     def is_relative_to(self, other: str | PathLike[str]) -> bool:
         try:
-            self.relative_to(other)
+            self._relative_part(other)
             return True
         except ValueError:
             return False
@@ -229,7 +247,7 @@ class CommonPurePathMixin:
 
     def _parent(self, idx: int = 1) -> Self:
         remaining = self.parts[:-idx] or [self.drive]
-        return type(self)(*remaining)
+        return self._derive(*remaining)
 
     parent = property(_parent)
 
@@ -247,21 +265,25 @@ class CommonPurePathMixin:
                 parts = [p for p in str(self._path).split(SCHEME_SEP)[1].split(OS_SEP) if p]
         return (*drive, *parts)
 
-    def relative_to(self, other: str | PathLike[str], *, walk_up: bool = False) -> Self:
+    def _relative_part(self, other: str | PathLike[str], *, walk_up: bool = False) -> Any:
+        """Return the part of this path below *other*, without building a path."""
         try:
             if self.protocol == "file":
-                return type(self)(self._path.relative_to(other))
+                return self._path.relative_to(other)
             if not (str(self).startswith(str(other)) or walk_up):
                 raise ValueError
-            other = type(self)(other).absolute()
+            other = self._derive(other).absolute()
             if not str(self).startswith(str(other)):
                 raise ValueError
-            return type(self)(str(self).replace(str(other), ""))
+            return str(self).replace(str(other), "")
         except ValueError:
             raise ValueError(
                 f"{self} is not in the subpath of {other}"
                 "OR one path is relative and the other is absolute."
             ) from None
+
+    def relative_to(self, other: str | PathLike[str], *, walk_up: bool = False) -> Self:
+        return self._derive(self._relative_part(other, walk_up=walk_up))
 
     @property
     def root(self) -> str:
@@ -291,10 +313,10 @@ class CommonPurePathMixin:
         return self.parent / name
 
     def with_parent(self, parent: str | PathLike[str] | Self) -> Self:
-        return type(self)(parent) / self.name
+        return self._derive(parent) / self.name
 
     def with_segments(self, *pathsegments: str | PathLike[str] | Self) -> Self:
-        return type(self)(*pathsegments)
+        return self._derive(*pathsegments)
 
     def with_stem(self, stem: str) -> Self:
         return self.parent / (stem + self.suffix)

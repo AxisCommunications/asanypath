@@ -64,7 +64,7 @@ from typing import IO, TYPE_CHECKING, TypeVar, cast
 import aioftp
 from yarl import URL
 
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -159,6 +159,7 @@ class FTPPath(CloudPathMixin):
     """Async FTP path backed by :mod:`aioftp`."""
 
     protocol: str = "ftp"
+    _options_bound_to_authority = True
     _tls: bool = False
     _default_port: int = 21
     _supports_range_read: bool = False
@@ -200,14 +201,9 @@ class FTPPath(CloudPathMixin):
             # the interactive prompt can supply one.
             self._password = None
         self._account = account if account is not None else netrc_account
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, ...) inherit them.
-        if host:
-            cfg.host = host
-        if port:
-            cfg.port = port
-        if username:
-            cfg.user = username
+        self._init_options = _explicit(
+            host=host, port=port, username=username, password=password, account=account
+        )
 
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
@@ -521,7 +517,9 @@ class FTPPath(CloudPathMixin):
         except aioftp.StatusCodeError as e:
             raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
         for entry_path, _info in entries:
-            yield self._child(str(self._path / entry_path.name))
+            child = self._confined_child(str(self._path / entry_path.name))
+            if child is not None:
+                yield child
 
     async def walk(
         self,

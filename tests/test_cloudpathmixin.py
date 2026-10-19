@@ -420,7 +420,11 @@ def cloud_path(request):
 class TestCloudPathShared:
     """Test CloudPathMixin concrete methods via real backend instances."""
 
-    def test_home(self, cloud_path):
+    def test_home(self, cloud_path, monkeypatch):
+        # home() is a fresh path on another host; it must not reuse the
+        # fixture's token, so provide an ambient one.
+        monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient-token")
+        type(cloud_path)._env_config = None
         h = type(cloud_path).home()
         assert expanduser("~") in h.as_posix()
 
@@ -811,7 +815,7 @@ class TestIterdirCache:
         cache_key = p._listing_cache_key()
         type(p)._listing_cache[cache_key] = (
             time.monotonic(),
-            ["s3://bucket/a.txt", "s3://bucket/b.txt"],
+            [f"{p}/a.txt", f"{p}/b.txt"],
         )
         results = [child async for child in p.iterdir()]
         assert len(results) == 2

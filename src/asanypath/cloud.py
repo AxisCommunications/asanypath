@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import inspect
 import io
+import logging
 import os
 import tempfile
 import time
@@ -20,7 +22,7 @@ from os import PathLike
 from os.path import expanduser
 from pathlib import Path
 from types import SimpleNamespace
-from typing import IO, TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal, cast
 
 import msgspec
 
@@ -43,6 +45,13 @@ from asanypath._transfer import (
 from asanypath.batcher import H2_BATCH_THRESHOLD, MicroBatcher, make_batcher
 from asanypath.common import SCHEME_SEP, CommonPurePathMixin
 from asanypath.options import SPOOL_MAX_SIZE, AccessPolicy, AccessPolicyPatch, BackendOptions
+
+logger = logging.getLogger(__name__)
+
+
+def _explicit(**options: Any) -> dict[str, Any]:
+    """Keep the constructor options the caller actually passed."""
+    return {name: value for name, value in options.items() if value is not None}
 
 
 class CloudPathMixin(CommonPurePathMixin):
@@ -165,6 +174,43 @@ class CloudPathMixin(CommonPurePathMixin):
         Subclasses that store path-derived attributes override this.
         """
 
+    def _identity_parts(self) -> tuple:
+        """Values that select the credentials and endpoint this path uses."""
+        try:
+            env = sorted(vars(self.env_config).items())
+        except NotImplementedError:
+            env = []
+        return (type(self).__name__, sorted(self._init_options.items()), env)
+
+    def _identity_fingerprint(self) -> str:
+        """Stable digest of :meth:`_identity_parts`, safe to persist."""
+        return hashlib.sha256(repr(self._identity_parts()).encode()).hexdigest()
+
+    def _is_direct_child(self, child: CloudPathMixin) -> bool:
+        """True when *child* names an entry directly inside this path.
+
+        Listing entries come from the server; names such as ``..`` or ones
+        that normalize to another prefix must not be treated as children.
+        """
+        parent, path = cast(URL, self._path), cast(URL, child._path)
+        child_path = path.path.rstrip("/")
+        if not parent.raw_authority and not parent.path.strip("/"):
+            return bool(path.raw_authority) and not child_path
+        head, _, name = child_path.rpartition("/")
+        return (
+            path.raw_authority == parent.raw_authority
+            and head == parent.path.rstrip("/")
+            and name not in ("", ".", "..")
+        )
+
+    def _confined_child(self, uri: str, **attrs: object) -> Self | None:
+        """Spawn a listing child, or ``None`` (logged) if it escapes this path."""
+        child = self._child(uri, **attrs)
+        if self._is_direct_child(child):
+            return child
+        logger.warning("Skipping listing entry %r: not a direct child of %s", uri, self)
+        return None
+
     def _child(self, uri: str, **attrs: object) -> Self:
         """Spawn an ``iterdir``/listing child from a canonical URI and attach
         attributes already known from the listing (cached stat, folder hint,
@@ -275,7 +321,8 @@ class CloudPathMixin(CommonPurePathMixin):
         if cache_enabled(use_cache):
             from asanypath.cache import get_cache
 
-            return await get_cache().get_or_fetch(str(self), self._read_bytes_uncached)
+            key = f"{self}#{self._identity_fingerprint()}"
+            return await get_cache().get_or_fetch(key, self._read_bytes_uncached)
         return await self._read_bytes_uncached()
 
     async def _read_bytes_uncached(self) -> bytes:
@@ -570,8 +617,8 @@ class CloudPathMixin(CommonPurePathMixin):
     # ------------------------------------------------------------------
 
     def _listing_cache_key(self) -> str:
-        """Cache key for this path's directory listing."""
-        return str(self)
+        """Cache key for this path's directory listing, scoped to its identity."""
+        return f"{self}#{self._identity_fingerprint()}"
 
     async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
         """Iterate over directory contents with TTL caching.
@@ -588,7 +635,8 @@ class CloudPathMixin(CommonPurePathMixin):
                 ts, uris = entry
                 if (time.monotonic() - ts) < self.listing_cache_ttl:
                     for uri in uris:
-                        yield self._child(uri)
+                        if (child := self._confined_child(uri)) is not None:
+                            yield child
                     return
 
         uris = await self._fetch_listing()
@@ -597,7 +645,8 @@ class CloudPathMixin(CommonPurePathMixin):
             cache[cache_key] = (time.monotonic(), uris)
 
         for uri in uris:
-            yield self._child(uri)
+            if (child := self._confined_child(uri)) is not None:
+                yield child
 
     def chmod(self, mode: int, *, follow_symlinks: bool = True) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support chmod")
@@ -667,7 +716,7 @@ class CloudPathMixin(CommonPurePathMixin):
         return self
 
     def samefile(self, other_path: str | PathLike[str]) -> bool:
-        return str(self.resolve()) == str(type(self)(other_path).resolve())
+        return str(self.resolve()) == str(self._derive(other_path).resolve())
 
     def symlink_to(
         self,
@@ -712,7 +761,7 @@ class CloudPathMixin(CommonPurePathMixin):
         | None = None,
     ) -> Self:
         """Rename/move object via copy + delete."""
-        dst = type(self)(target)
+        dst = self._derive(target)
 
         async def _copy_file() -> int:
             if not needs_copy:

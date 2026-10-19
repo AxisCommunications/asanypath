@@ -52,6 +52,7 @@ def _clear_env_caches(monkeypatch):
         FTPPath._env_config = None
         FTPSPath._env_config = None
     _BASE_URL_PREFIX_CACHE.clear()
+    ArtifactoryPath._service_tokens.clear()
     yield
     GCSPath._env_config = None
     AzurePath._env_config = None
@@ -63,6 +64,7 @@ def _clear_env_caches(monkeypatch):
         FTPPath._env_config = None
         FTPSPath._env_config = None
     _BASE_URL_PREFIX_CACHE.clear()
+    ArtifactoryPath._service_tokens.clear()
 
 
 def pytest_configure(config):

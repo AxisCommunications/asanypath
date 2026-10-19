@@ -96,7 +96,9 @@ class MicroBatcher:
 
     async def _submit(self, spec: _OpSpec, kwargs: dict) -> Any:
         item = kwargs.pop(spec.item_key)
-        key = f"{spec.op}|{spec.key_fn(**kwargs)}"
+        # The flush reuses one caller's kwargs for the whole batch, so only
+        # calls with identical kwargs (credentials included) may share it.
+        key = f"{spec.op}|{spec.key_fn(**kwargs)}|{sorted(kwargs.items())!r}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         pending = self._pending.setdefault(key, [])
         pending.append((item, fut))

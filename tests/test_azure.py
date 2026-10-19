@@ -287,26 +287,21 @@ class TestAzurePath(testbase):
     async def test_rmdir(self, p):
         # Non-recursive rmdir on non-empty dir raises OSError
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = ["az://container/blob/child.txt"]
+        mock_batcher.list.return_value = [f"{p}/child.txt"]
         with patch.object(AzurePath, "_get_batcher", return_value=mock_batcher):
             with pytest.raises(OSError, match="not empty"):
                 await p.rmdir()
 
     async def test_glob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "az://container/path/file.txt",
-            "az://container/path/other.md",
-        ]
+        mock_batcher.list.return_value = [f"{p.parent}/file.txt", f"{p.parent}/other.md"]
         with patch.object(AzurePath, "_get_batcher", return_value=mock_batcher):
             results = [c async for c in p.parent.glob("*.txt")]
         assert len(results) == 1
 
     async def test_rglob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "az://container/path/file.txt",
-        ]
+        mock_batcher.list.return_value = [f"{p.parent}/file.txt"]
         mock_batcher.exists.return_value = False
         with (
             patch.object(AzurePath, "_get_batcher", return_value=mock_batcher),
