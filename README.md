@@ -82,6 +82,13 @@ with path.open("rb") as f:
 Files smaller than the buffer size are fetched in one shot automatically.
 Supported on S3, GCS, Azure, and Artifactory.
 
+HTTP and HTTPS paths also support read-only `open("rb")` and `open("r")`
+with both context-manager styles. These download the entire response on entry
+and return a seekable in-memory handle, so servers do not need to support HEAD
+or range requests. Text mode accepts `encoding`, `errors`, and `newline`.
+Existing HTTP authentication and read-cache settings apply; anonymous URLs
+require no token.
+
 ### Service endpoints
 
 S3, GCS, Azure and Artifactory paths expose a read-only `endpoint_url` property:

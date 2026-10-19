@@ -1300,7 +1300,18 @@ class _CloudFile:
     # handles (e.g. sharded writers) can't accumulate whole objects in memory.
     _SPOOL_MAX_SIZE = SPOOL_MAX_SIZE  # resident bytes per open write handle before spilling
 
-    def __init__(self, path, mode, buffering, encoding, errors, newline, backend_options=None):
+    def __init__(
+        self,
+        path,
+        mode,
+        buffering,
+        encoding,
+        errors,
+        newline,
+        backend_options=None,
+        *,
+        range_read=True,
+    ):
         self._path = path
         self._mode = mode
         self._buffering = buffering
@@ -1308,6 +1319,7 @@ class _CloudFile:
         self._errors = errors
         self._newline = newline
         self._backend_options = backend_options
+        self._range_read = range_read
         self._buf: IO[bytes] | None = None
         self._text_wrapper: io.TextIOWrapper | None = None
         self._reader: io.BufferedReader | None = None
@@ -1391,7 +1403,7 @@ class _CloudFile:
         self._sync = True
         runner = _SyncRunner.get()
         if "r" in self._mode:
-            if self._path._supports_range_read:
+            if self._range_read and self._path._supports_range_read:
                 try:
                     native_kwargs = runner.run(self._path._get_native_kwargs())
                     headers = runner.run(
@@ -1436,7 +1448,7 @@ class _CloudFile:
     async def __aenter__(self):
         self._sync = False
         if "r" in self._mode:
-            if self._path._supports_range_read:
+            if self._range_read and self._path._supports_range_read:
                 try:
                     native_kwargs = await self._path._get_native_kwargs()
                     headers = await self._path._get_batcher().head(
