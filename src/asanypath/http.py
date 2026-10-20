@@ -26,9 +26,10 @@ from asanypath_native import (
     http_put,
     http_scrape_links,
 )
+from yarl import URL
 
 from asanypath._transfer import RangeNotSupportedError
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _service_origin
 
 logger = logging.getLogger(__name__)
 
@@ -246,9 +247,11 @@ class HTTPPath(CloudPathMixin):
     def _merge_headers(
         self,
         user_headers: dict[str, str] | list[tuple[str, str]] | None,
+        *,
+        with_auth: bool = True,
     ) -> list[tuple[str, str]] | None:
-        """Merge auth headers with user-supplied headers."""
-        auth = self._auth_headers()
+        """Merge auth headers (unless *with_auth* is false) with user-supplied headers."""
+        auth = self._auth_headers() if with_auth else []
         if not user_headers and not auth:
             return None
         merged = list(auth)
@@ -277,13 +280,22 @@ class HTTPPath(CloudPathMixin):
 
         Args:
             method: HTTP verb.
-            url: Target URL. Defaults to str(self).
+            url: Target URL. Defaults to str(self). Env credentials are only
+                added when it has this path's origin (scheme, host and port).
             headers: Extra headers (merged with auth headers).
             data: Raw body bytes for PUT/POST/PATCH.
             json: JSON-serializable object (sets Content-Type and body).
         """
+        own = str(self)
+        with_auth = True
         if url is None:
-            url = str(self)
+            url = own
+        elif url != own:
+            # Send the URL exactly as checked: yarl rejects authorities other
+            # parsers would read differently; pre-encoded queries (presigned
+            # URLs) are kept as-is, like in ``__init__``.
+            url = str(URL(url, encoded="?" in url))
+            with_auth = _service_origin(url) == _service_origin(own)
         if http_request is None:
             raise ImportError(
                 "http_request not available; upgrade asanypath-native to use request()"
@@ -292,7 +304,7 @@ class HTTPPath(CloudPathMixin):
             data = msgspec.json.encode(json)
             headers = dict(headers) if isinstance(headers, dict) else dict(headers or [])
             headers.setdefault("content-type", "application/json")
-        merged = self._merge_headers(headers)
+        merged = self._merge_headers(headers, with_auth=with_auth)
         status_code, body, resp_headers = await http_request(
             method,
             url,

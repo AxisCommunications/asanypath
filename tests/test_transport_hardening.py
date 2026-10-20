@@ -112,3 +112,38 @@ async def test_download_cache_files_are_private(tmp_path, monkeypatch):
     assert stat.S_IMODE(store.stat().st_mode) == 0o700
     for entry in store.iterdir():
         assert stat.S_IMODE(entry.stat().st_mode) == 0o600, entry.name
+
+
+async def test_request_to_another_origin_gets_no_env_credentials(redirect_servers, monkeypatch):
+    origin, seen = redirect_servers
+    other = f"http://127.0.0.1:{origin.rsplit(':', 1)[1]}"
+    monkeypatch.setenv("HTTP_AUTH_URL", origin)
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "secret-token")
+    monkeypatch.setenv("HTTP_AUTH_HEADER", "x-api-key")
+    api = HTTPPath(f"{origin}/api")
+
+    await api.request("GET")
+    await api.request("GET", url=f"{origin}/target")
+    await api.request("GET", url=other.replace("127.0.0.1", "localhost") + "/target")
+
+    assert [h.get("x-api-key") for h in seen["origin"]] == ["secret-token", "secret-token", None]
+
+
+async def test_request_keeps_pre_encoded_query_strings(monkeypatch):
+    sent = {}
+
+    async def fake_request(method, url, **kwargs):
+        sent["url"] = url
+        return 200, b"", {}
+
+    monkeypatch.setattr("asanypath.http.http_request", fake_request)
+    url = "https://svc.example/x?X-Amz-Signature=ab%2Fcd"
+
+    await HTTPPath("https://svc.example/").request("GET", url=url)
+
+    assert sent["url"] == url
+
+
+async def test_request_rejects_ambiguous_authority():
+    with pytest.raises(ValueError, match="backslash"):
+        await HTTPPath("https://svc.example/").request("GET", url="http://evil\\@svc.example/x")
