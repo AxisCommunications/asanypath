@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use russh::client::{self, Handle};
 #[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
@@ -35,9 +35,12 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
 }
 
 // ---------------------------------------------------------------------------
-// Internal connection descriptor (built from the flat per-op kwargs)
+// Connection descriptor, parsed from the ``**self._native_kwargs`` every
+// SSHPath op spreads into its native call.
 // ---------------------------------------------------------------------------
 
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
 struct ConnParams {
     host: String,
     port: u16,
@@ -50,26 +53,20 @@ struct ConnParams {
     known_hosts: String,
 }
 
-/// Build a `ConnParams` from the flat connection kwargs spread by
-/// `SSHPath._native_kwargs`. Repeated verbatim at the top of each op.
-macro_rules! conn {
-    ($host:ident, $port:ident, $user:ident, $password:ident, $key_path:ident,
-     $key_passphrase:ident, $use_agent:ident, $host_key_policy:ident, $known_hosts:ident) => {
-        ConnParams {
-            host: $host,
-            port: $port,
-            user: $user,
-            password: $password,
-            key_path: $key_path,
-            key_passphrase: $key_passphrase,
-            use_agent: $use_agent,
-            host_key_policy: $host_key_policy,
-            known_hosts: $known_hosts,
-        }
-    };
-}
+const CONN_FIELDS: usize = 9;
 
 impl ConnParams {
+    fn from_kwargs(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let kwargs = kwargs.ok_or_else(|| PyTypeError::new_err("missing SSH connection kwargs"))?;
+        if kwargs.len() != CONN_FIELDS {
+            return Err(PyTypeError::new_err(format!(
+                "expected {CONN_FIELDS} SSH connection kwargs, got {}",
+                kwargs.len()
+            )));
+        }
+        kwargs.extract()
+    }
+
     fn auth(&self) -> AuthSpec {
         AuthSpec {
             password: self.password.clone(),
@@ -445,31 +442,13 @@ pub fn ssh_disconnect_all() {
 
 /// Read a remote file fully. Returns bytes.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_read<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let data = session.sftp.read(&path).await.map_err(err)?;
@@ -479,33 +458,15 @@ pub fn ssh_read<'py>(
 
 /// Read a byte range [start, end] (inclusive). Returns bytes (short at EOF).
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, start, end, **conn))]
 pub fn ssh_read_range<'py>(
     py: Python<'py>,
     path: String,
     start: u64,
     end: u64,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let mut file = session.sftp.open(&path).await.map_err(err)?;
@@ -527,32 +488,14 @@ pub fn ssh_read_range<'py>(
 
 /// Write bytes to a remote file (create + truncate). Returns the byte count.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, data, **conn))]
 pub fn ssh_write<'py>(
     py: Python<'py>,
     path: String,
     data: Vec<u8>,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let n = data.len();
@@ -574,33 +517,15 @@ pub fn ssh_write<'py>(
 /// resets the file; later chunks open with APPEND so no offset tracking is
 /// needed. Returns the byte count written.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, data, truncate, **conn))]
 pub fn ssh_write_chunk<'py>(
     py: Python<'py>,
     path: String,
     data: Vec<u8>,
     truncate: bool,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let n = data.len();
@@ -622,31 +547,13 @@ pub fn ssh_write_chunk<'py>(
 
 /// Check whether a remote path exists.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_exists<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let exists = session.sftp.try_exists(&path).await.map_err(err)?;
@@ -657,31 +564,13 @@ pub fn ssh_exists<'py>(
 /// Return (size, mtime, atime, uid, gid, permissions) for a remote path.
 /// Fields are `None` when the server omits them — mirrors asyncssh SFTPAttrs.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_stat<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let md = session.sftp.metadata(&path).await.map_err(err)?;
@@ -691,31 +580,13 @@ pub fn ssh_stat<'py>(
 
 /// Like `ssh_stat` but does not follow symlinks (SFTP `lstat`).
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_lstat<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let md = session.sftp.symlink_metadata(&path).await.map_err(err)?;
@@ -726,6 +597,7 @@ pub fn ssh_lstat<'py>(
 /// Set remote file metadata (SFTP `setstat`). Only the provided fields are
 /// changed — covers chmod (permissions), chown (uid/gid) and utime (atime/mtime).
 #[pyfunction]
+#[pyo3(signature = (path, permissions, uid, gid, atime, mtime, **conn))]
 #[allow(clippy::too_many_arguments)]
 pub fn ssh_setstat<'py>(
     py: Python<'py>,
@@ -735,27 +607,9 @@ pub fn ssh_setstat<'py>(
     gid: Option<u32>,
     atime: Option<u32>,
     mtime: Option<u32>,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         let attrs = FileAttributes {
@@ -775,31 +629,13 @@ pub fn ssh_setstat<'py>(
 /// (name, size, mtime, atime, uid, gid, permissions) per entry — the same
 /// attribute shape as `ssh_stat`, so children can cache them without a restat.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_list<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     type Entry = (
         String,
         Option<u64>,
@@ -832,32 +668,14 @@ pub fn ssh_list<'py>(
 
 /// Create a remote directory (optionally creating parents).
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, parents, **conn))]
 pub fn ssh_mkdir<'py>(
     py: Python<'py>,
     path: String,
     parents: bool,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         if parents {
@@ -877,31 +695,13 @@ pub fn ssh_mkdir<'py>(
 
 /// Remove an empty remote directory.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_rmdir<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         session.sftp.remove_dir(&path).await.map_err(err)?;
@@ -911,31 +711,13 @@ pub fn ssh_rmdir<'py>(
 
 /// Remove a remote file.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, **conn))]
 pub fn ssh_unlink<'py>(
     py: Python<'py>,
     path: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         session.sftp.remove_file(&path).await.map_err(err)?;
@@ -945,32 +727,14 @@ pub fn ssh_unlink<'py>(
 
 /// Rename a remote path.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (src, dst, **conn))]
 pub fn ssh_rename<'py>(
     py: Python<'py>,
     src: String,
     dst: String,
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    key_path: Option<String>,
-    key_passphrase: Option<String>,
-    use_agent: bool,
-    host_key_policy: String,
-    known_hosts: String,
+    conn: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let conn = conn!(
-        host,
-        port,
-        user,
-        password,
-        key_path,
-        key_passphrase,
-        use_agent,
-        host_key_policy,
-        known_hosts
-    );
+    let conn = ConnParams::from_kwargs(conn)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let session = session_for(&conn).await.map_err(PyRuntimeError::new_err)?;
         session.sftp.rename(&src, &dst).await.map_err(err)?;
