@@ -549,9 +549,103 @@ def test_env_token_is_bound_to_the_configured_base_url(monkeypatch):
         ArtifactoryPath("art://attacker.example/artifactory/repo/f")
 
 
-def test_env_token_without_base_url_applies_to_any_host(monkeypatch):
+def test_env_token_without_base_url_is_not_sent(monkeypatch, caplog):
     monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient")
     monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
     monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
+    monkeypatch.setattr("asanypath.cloud._UNSCOPED_WARNED", set())
 
-    assert ArtifactoryPath("art://any.example/artifactory/repo/f")._token == "ambient"
+    with pytest.raises(ValueError, match="token required"):
+        ArtifactoryPath("art://any.example/artifactory/repo/f")
+    with pytest.raises(ValueError, match="token required"):
+        ArtifactoryPath("art://other.example/artifactory/repo/f")
+
+    warnings = [r for r in caplog.records if "ARTIFACTORY_IDENTITY_TOKEN is ignored" in r.message]
+    assert len(warnings) == 1 and "ARTIFACTORY_BASE_URL" in warnings[0].message
+
+
+# ---------------------------------------------------------------------------
+# Ambient HTTP credentials
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def http_env(monkeypatch):
+    for name in ("HTTP_AUTH_USER", "HTTP_AUTH_PASSWORD", "HTTP_AUTH_HEADER", "HTTP_AUTH_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "service-token")
+    monkeypatch.setattr("asanypath.cloud._UNSCOPED_WARNED", set())
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    ("service", "url", "sent"),
+    [
+        ("https://svc.example", "https://svc.example/data/x", True),
+        ("https://svc.example/api", "https://SVC.example:443/other", True),
+        ("http://svc.example:8080", "http://svc.example:8080/x", True),
+        ("https://svc.example", "http://svc.example/x", False),
+        ("https://svc.example", "https://svc.example:8443/x", False),
+        ("https://svc.example", "https://attacker.example/x", False),
+        ("https://svc.example", "https://svc.example.attacker.example/x", False),
+    ],
+)
+def test_http_env_credentials_only_for_their_origin(http_env, service, url, sent):
+    from asanypath.http import HTTPPath, HTTPSPath
+
+    http_env.setenv("HTTP_AUTH_URL", service)
+    cls = HTTPSPath if url.startswith("https") else HTTPPath
+
+    assert bool(cls(url)._auth_headers()) is sent
+
+
+def test_http_env_credentials_without_service_are_not_sent(http_env, caplog):
+    from asanypath.http import HTTPSPath
+
+    assert HTTPSPath("https://svc.example/x")._auth_headers() == []
+    assert HTTPSPath("https://other.example/x")._auth_headers() == []
+    warnings = [r for r in caplog.records if "HTTP_AUTH_* is ignored" in r.message]
+    assert len(warnings) == 1 and "HTTP_AUTH_URL" in warnings[0].message
+
+
+def test_http_auth_decision_follows_environment_changes(http_env):
+    from asanypath.http import HTTPSPath
+
+    path = HTTPSPath("https://svc.example/x")
+    http_env.setenv("HTTP_AUTH_URL", "https://svc.example")
+    assert path._auth_headers()
+    http_env.setenv("HTTP_AUTH_URL", "https://elsewhere.example")
+    assert path._auth_headers() == []
+
+
+@pytest.mark.parametrize("value", ["disabled", "maybe", "none"])
+def test_ssh_config_unknown_host_key_policy_fails_closed(ssh_env, monkeypatch, value):
+    monkeypatch.setenv("SSH_CONFIG", "/cfg")
+    monkeypatch.setattr(
+        "asanypath.ssh.ssh_resolve_config",
+        lambda host, paths: (None, None, None, None, value, None),
+    )
+
+    assert SSHPath("ssh://u@host.example/f")._native_kwargs["host_key_policy"] == "yes"
+
+
+def test_ssh_config_known_hosts_tokens_are_expanded(ssh_env, monkeypatch):
+    monkeypatch.setenv("SSH_CONFIG", "/cfg")
+    monkeypatch.setattr(
+        "asanypath.ssh.ssh_resolve_config",
+        lambda host, paths: ("real.example", 2222, "deploy", None, None, "%d/kh-%r@%h-%p%%"),
+    )
+
+    native = SSHPath("ssh://alias/f")._native_kwargs
+
+    assert native["known_hosts"] == str(ssh_env / "kh-deploy@real.example-2222%")
+
+
+@pytest.mark.parametrize("host", ["a,b", "a b", "*.example", "a\nb", "[a]", ""])
+def test_ssh_host_keys_are_only_recorded_for_plain_host_names(tmp_path, host):
+    from asanypath_native import ssh_learn_host_key
+
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
+    with pytest.raises(RuntimeError, match="not a plain host name"):
+        ssh_learn_host_key(host, 22, key, str(tmp_path / "kh"))
+    assert not (tmp_path / "kh").exists()

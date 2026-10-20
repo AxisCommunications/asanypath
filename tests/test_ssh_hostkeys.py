@@ -125,3 +125,25 @@ async def test_pooled_session_is_not_reused_with_other_credentials(home, server)
 
     with pytest.raises(RuntimeError, match="auth"):
         await _read(home, server, secret="wrong", known_hosts=())
+
+
+async def test_changed_key_with_checking_off_refuses_password_auth(home, server, host_key):
+    pinned = home / "pinned"
+    other = asyncssh.generate_private_key("ssh-ed25519")
+    pinned.write_text(_known_hosts_line(server, other))
+    (home / "ssh_config").write_text(
+        f"Host 127.0.0.1\n  StrictHostKeyChecking no\n  UserKnownHostsFile {pinned}\n"
+    )
+
+    with pytest.raises(RuntimeError, match="password authentication is disabled"):
+        await _read(home, server)
+
+
+async def test_unknown_host_with_checking_off_is_recorded(home, server, host_key):
+    pinned = home / "pinned"
+    (home / "ssh_config").write_text(
+        f"Host 127.0.0.1\n  StrictHostKeyChecking no\n  UserKnownHostsFile {pinned}\n"
+    )
+
+    assert await _read(home, server) == b"payload"
+    assert pinned.read_text().strip() == _known_hosts_line(server, host_key).strip()

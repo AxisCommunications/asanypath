@@ -96,6 +96,10 @@ class TestHTTPResponse:
 
 
 class TestHTTPPathAuth:
+    @pytest.fixture(autouse=True)
+    def _auth_service(self, monkeypatch):
+        monkeypatch.setenv("HTTP_AUTH_URL", "http://example.com")
+
     @pytest.mark.parametrize(
         "env_token, input_headers, check",
         [

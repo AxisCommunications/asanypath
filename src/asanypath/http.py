@@ -161,8 +161,11 @@ class HTTPPath(CloudPathMixin):
     - HTTP_AUTH_USER + HTTP_AUTH_PASSWORD → Basic auth
     - HTTP_AUTH_TOKEN → Bearer token (or custom header via HTTP_AUTH_HEADER)
 
-    Auth headers are automatically injected into all requests (read_bytes,
-    write_bytes, exists, etc.) and into the explicit request() method.
+    Auth headers are injected into all requests (read_bytes, write_bytes,
+    exists, etc.) and into the explicit request() method, but only for URLs
+    on the origin (scheme, host and port) given by ``HTTP_AUTH_URL``, the
+    service the credentials belong to. Without it, env credentials are never
+    sent.
 
     Directory listing (``iterdir``/``walk``/``glob``) defaults to a generic
     ``a[href]`` scrape (``listing="auto"``) which works for Python's
@@ -212,10 +215,30 @@ class HTTPPath(CloudPathMixin):
         return self._listing, self._listing_attr or "href"
 
     def _auth_headers(self) -> list[tuple[str, str]]:
-        """Return auth headers for this path. Override for per-instance auth."""
-        return _build_auth_headers()
+        """Return auth headers for this path. Override for per-instance auth.
 
-    _IDENTITY_ENV = ("HTTP_AUTH_USER", "HTTP_AUTH_PASSWORD", "HTTP_AUTH_TOKEN", "HTTP_AUTH_HEADER")
+        Env credentials are only sent to the origin in ``HTTP_AUTH_URL``;
+        the decision is memoized until the environment changes.
+        """
+        env = self._identity_env()
+        memo = self.__dict__.get("_auth_memo")
+        if memo is not None and memo[0] == env and memo[1] is self._path:
+            return memo[2]
+        headers = _build_auth_headers()
+        if headers and not self._ambient_credentials_allowed(
+            env[-1], str(self), credential="HTTP_AUTH_*", setting="HTTP_AUTH_URL"
+        ):
+            headers = []
+        self._auth_memo = (env, self._path, headers)
+        return headers
+
+    _IDENTITY_ENV = (
+        "HTTP_AUTH_USER",
+        "HTTP_AUTH_PASSWORD",
+        "HTTP_AUTH_TOKEN",
+        "HTTP_AUTH_HEADER",
+        "HTTP_AUTH_URL",
+    )
 
     def _identity_env(self) -> tuple:
         return tuple(map(getenv, self._IDENTITY_ENV))

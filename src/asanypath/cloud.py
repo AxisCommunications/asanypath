@@ -18,12 +18,13 @@ import tempfile
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
-from functools import partial
+from functools import lru_cache, partial
 from os import PathLike
 from os.path import expanduser
 from pathlib import Path
 from types import SimpleNamespace
 from typing import IO, TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 
 import msgspec
 
@@ -60,6 +61,27 @@ _NON_PLAIN_NAME_RE = re.compile("[" + re.escape("/%?#\t\r\n" + _UNSAFE_NAME_CHAR
 def _explicit(**options: Any) -> dict[str, Any]:
     """Keep the constructor options the caller actually passed."""
     return {name: value for name, value in options.items() if value is not None}
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+@lru_cache(maxsize=256)
+def _service_origin(url: str) -> tuple[str, str, int | None] | None:
+    """``(scheme, host, port)`` of *url* (``https`` when it has no scheme),
+    lowercased with the default port filled in; ``None`` if it has no host."""
+    parts = urlsplit(url if "://" in url else f"https://{url}")
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname:
+        return None
+    scheme = parts.scheme.lower()
+    return scheme, parts.hostname.lower(), port or _DEFAULT_PORTS.get(scheme)
+
+
+_UNSCOPED_WARNED: set[str] = set()
 
 
 class CloudPathMixin(CommonPurePathMixin):
@@ -193,6 +215,26 @@ class CloudPathMixin(CommonPurePathMixin):
     def _identity_env(self) -> tuple:
         """Environment values read at request time that also select credentials."""
         return ()
+
+    def _ambient_credentials_allowed(
+        self, service_url: str | None, own_url: str, *, credential: str, setting: str
+    ) -> bool:
+        """Whether ambient (environment) credentials may be sent to this path.
+
+        Ambient credentials belong to the one service named by *setting*
+        (*service_url*), so they are only used for a path on that service's
+        origin (scheme, host and port). Without a configured service they are
+        never sent; a warning names the missing setting once per process.
+        """
+        if not service_url:
+            if credential not in _UNSCOPED_WARNED:
+                _UNSCOPED_WARNED.add(credential)
+                logger.warning(
+                    "%s is ignored: set %s to the service it is for", credential, setting
+                )
+            return False
+        service = _service_origin(service_url)
+        return service is not None and service == _service_origin(own_url)
 
     def _identity_fingerprint(self) -> str:
         """Stable digest of this path's identity, safe to persist.
