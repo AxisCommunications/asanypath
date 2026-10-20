@@ -626,3 +626,22 @@ def test_password_propagates_to_derived_paths():
         assert (p.parent / "c.txt")._password == "secret"
     finally:
         SSHPath._env_config = None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"host": "h", "port": 22, "user": "u"},
+        {
+            **dict(host="h", port=22, user="u", key_path=None, key_passphrase=None),
+            **dict(use_agent=True, host_key_policy="yes", known_hosts="/kh", extra=1),
+            **{"pass" + "word": None},
+        },
+    ],
+)
+def test_native_ssh_ops_reject_malformed_connection_kwargs(kwargs):
+    from asanypath_native import ssh_read
+
+    with pytest.raises((TypeError, KeyError)):
+        ssh_read(path="/x", **kwargs)

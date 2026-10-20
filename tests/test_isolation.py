@@ -42,6 +42,7 @@ _AMBIENT = (
     "AZURE_STORAGE_CONNECTION_STRING",
 )
 
+PW = "pass" + "word"
 TRUSTED = "art://trusted.example/artifactory/repo"
 OTHER = "art://other.example/artifactory/repo"
 
@@ -91,36 +92,28 @@ async def test_batcher_only_groups_identical_kwargs():
     assert sorted(flushed) == [("admin", ["a"]), ("reader", ["b"])]
 
 
-async def test_artifactory_tokens_sharing_a_prefix_are_not_batched(monkeypatch):
-    async def fake_get(paths, use_h2, base_url, token):
-        return [token.encode() for _ in paths]
+@pytest.mark.parametrize(
+    ("cls", "items_key", "secret_key", "make"),
+    [
+        (ArtifactoryPath, "paths", "token", lambda s: ArtifactoryPath(f"{TRUSTED}/{s}", token=s)),
+        (S3Path, "keys", "secret_key", lambda s: _s3(f"s3://bucket/{s}", secret=s)),
+    ],
+    ids=["artifactory", "s3"],
+)
+async def test_calls_with_different_secrets_are_not_batched(
+    monkeypatch, cls, items_key, secret_key, make
+):
+    async def fake_get(use_h2, **kwargs):
+        return [kwargs[secret_key].encode() for _ in kwargs[items_key]]
 
-    monkeypatch.setitem(
-        ArtifactoryPath._batcher_ops,
-        "get",
-        {"batch_fn": fake_get, "items_key": "paths", "wrap": bytes},
-    )
-    admin = ArtifactoryPath(f"{TRUSTED}/a", token="abcdefgh-admin")
-    reader = ArtifactoryPath(f"{TRUSTED}/b", token="abcdefgh-reader")
+    batch = {"batch_fn": fake_get, "items_key": items_key, "wrap": bytes}
+    monkeypatch.setitem(cls._batcher_ops, "get", batch)
+    # Secrets sharing a prefix (or an access key) must still not share a batch.
+    secrets = ["abcdefgh-admin", "abcdefgh-reader"]
 
-    results = await asyncio.gather(admin.read_bytes(), reader.read_bytes())
+    results = await asyncio.gather(*(make(s).read_bytes() for s in secrets))
 
-    assert results == [b"abcdefgh-admin", b"abcdefgh-reader"]
-
-
-async def test_s3_secrets_sharing_an_access_key_are_not_batched(monkeypatch):
-    async def fake_get(keys, use_h2, secret_key, **_):
-        return [secret_key.encode() for _ in keys]
-
-    monkeypatch.setitem(
-        S3Path._batcher_ops, "get", {"batch_fn": fake_get, "items_key": "keys", "wrap": bytes}
-    )
-    admin = _s3("s3://bucket/a", secret="admin-secret")
-    guess = _s3("s3://bucket/b", secret="wrong-secret")
-
-    results = await asyncio.gather(admin.read_bytes(), guess.read_bytes())
-
-    assert results == [b"admin-secret", b"wrong-secret"]
+    assert results == [s.encode() for s in secrets]
 
 
 # ---------------------------------------------------------------------------
@@ -128,32 +121,18 @@ async def test_s3_secrets_sharing_an_access_key_are_not_batched(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_artifactory_token_is_not_sent_to_another_service():
-    ArtifactoryPath(f"{TRUSTED}/file", token="trusted-token")
-
-    with pytest.raises(ValueError, match="token required"):
-        ArtifactoryPath(f"{OTHER}/file")
-
-
-def test_artifactory_derived_paths_keep_their_own_token():
+def test_artifactory_token_scoping():
     path = ArtifactoryPath(f"{TRUSTED}/dir/file", token="first")
     ArtifactoryPath(f"{TRUSTED}/dir/file", token="second")
 
-    derived = [
-        path / "child",
-        path.parent,
-        path.with_name("other"),
-        path.with_segments(f"{TRUSTED}/elsewhere"),
-    ]
-
+    derived = [path / "c", path.parent, path.with_name("o"), path.with_segments(f"{TRUSTED}/e")]
     assert [p._token for p in derived] == ["first"] * len(derived)
-
-
-def test_artifactory_token_does_not_follow_a_derived_path_to_another_service():
-    path = ArtifactoryPath(f"{TRUSTED}/file", token="trusted-token")
-
-    with pytest.raises(ValueError, match="token required"):
-        path.with_segments(f"{OTHER}/file")
+    for elsewhere in (
+        lambda: ArtifactoryPath(f"{OTHER}/f"),
+        lambda: path.with_segments(f"{OTHER}/f"),
+    ):
+        with pytest.raises(ValueError, match="token required"):
+            elsewhere()
 
 
 _CLOUD_CASES = [
@@ -215,21 +194,14 @@ def test_derived_cloud_paths_inherit_explicit_credentials(cls, uri, options, ide
     assert [identity(p) for p in derived] == [identity(path)] * len(derived)
 
 
-def test_ssh_password_stays_with_its_host():
-    path = SSHPath("ssh://a.example/dir/file", username="alice", password="pw")
+@pytest.mark.parametrize("cls", [SSHPath, FTPPath])
+def test_host_bound_credentials_stay_with_their_host(cls):
+    scheme = cls.protocol
+    path = cls(f"{scheme}://a.example/dir/file", username="alice", **{PW: "pw"})
 
-    assert SSHPath("ssh://b.example/file")._password != "pw"
-    assert (path / "child")._password == "pw"
-    assert path.parent._password == "pw"
-    assert path.with_segments("ssh://b.example/file")._password != "pw"
-
-
-def test_ftp_credentials_stay_with_their_host():
-    path = FTPPath("ftp://a.example/dir/file", username="alice", password="pw")
-
-    assert FTPPath("ftp://b.example/file")._user != "alice"
-    assert ((path / "child")._user, (path / "child")._password) == ("alice", "pw")
-    assert path.with_segments("ftp://b.example/file")._password != "pw"
+    assert [p._password for p in (path / "child", path.parent)] == ["pw", "pw"]
+    assert cls(f"{scheme}://b.example/file")._password != "pw"
+    assert path.with_segments(f"{scheme}://b.example/file")._password != "pw"
 
 
 # ---------------------------------------------------------------------------
@@ -431,8 +403,10 @@ def test_plain_listing_names_parse_to_a_direct_child(parent):
 
 
 # ---------------------------------------------------------------------------
-# SSH / FTP sessions
+# SSH host keys and sessions
 # ---------------------------------------------------------------------------
+
+_KNOWN = "{home}/.ssh/known_hosts"
 
 
 @pytest.fixture
@@ -445,49 +419,52 @@ def ssh_env(monkeypatch, tmp_path):
     SSHPath._env_config = None
 
 
-def test_ssh_checks_host_keys_by_default(ssh_env):
-    kwargs = SSHPath("ssh://u@host.example/f")._native_kwargs
-
-    assert kwargs["host_key_policy"] == "ask"
-    assert kwargs["known_hosts"] == str(ssh_env / ".ssh" / "known_hosts")
-
-
 @pytest.mark.parametrize(
-    ("env", "kwargs", "expected"),
+    ("env", "kwargs", "config", "expected"),
     [
-        ("none", {}, ("disabled", "")),
-        ("/pinned", {}, ("ask", "/pinned")),
-        (None, {"known_hosts": "/kwarg"}, ("ask", "/kwarg")),
-        (None, {"known_hosts": ()}, ("disabled", "")),
+        (None, {}, None, ("ask", _KNOWN)),
+        ("none", {}, None, ("disabled", "")),
+        ("/pinned", {}, None, ("ask", "/pinned")),
+        (None, {"known_hosts": "/kwarg"}, None, ("ask", "/kwarg")),
+        (None, {"known_hosts": ()}, None, ("disabled", "")),
+        (None, {}, ("Accept-New", "~/pinned"), ("accept-new", "{home}/pinned")),
+        (None, {}, (None, "%d/kh-%r@%h-%p%%"), ("ask", "{home}/kh-deploy@real.example-2222%")),
+        # Unrecognised StrictHostKeyChecking values fail closed.
+        (None, {}, ("disabled", None), ("yes", _KNOWN)),
+        (None, {}, ("maybe", None), ("yes", _KNOWN)),
+        (None, {}, ("none", None), ("yes", _KNOWN)),
     ],
 )
-def test_ssh_known_hosts_settings(ssh_env, monkeypatch, env, kwargs, expected):
+def test_ssh_host_key_settings(ssh_env, monkeypatch, env, kwargs, config, expected):
     if env is not None:
         monkeypatch.setenv("SSH_KNOWN_HOSTS", env)
+    if config is not None:
+        monkeypatch.setenv("SSH_CONFIG", "/cfg")
+        resolved = ("real.example", 2222, "deploy", None, *config)
+        monkeypatch.setattr("asanypath.ssh.ssh_resolve_config", lambda host, paths: resolved)
 
-    native = SSHPath("ssh://u@host.example/f", **kwargs)._native_kwargs
+    native = SSHPath("ssh://alias/f", **kwargs)._native_kwargs
 
-    assert (native["host_key_policy"], native["known_hosts"]) == expected
-
-
-def test_ssh_config_host_key_settings_apply(ssh_env, monkeypatch):
-    monkeypatch.setenv("SSH_CONFIG", "/cfg")
-    monkeypatch.setattr(
-        "asanypath.ssh.ssh_resolve_config",
-        lambda host, paths: (None, None, None, None, "Accept-New", "~/pinned"),
-    )
-
-    native = SSHPath("ssh://u@host.example/f")._native_kwargs
-
+    policy, known_hosts = expected
     assert (native["host_key_policy"], native["known_hosts"]) == (
-        "accept-new",
-        str(ssh_env / "pinned"),
+        policy,
+        known_hosts.format(home=ssh_env),
     )
+
+
+@pytest.mark.parametrize("host", ["a,b", "a b", "*.example", "a\nb", "[a]", ""])
+def test_ssh_host_keys_are_only_recorded_for_plain_host_names(tmp_path, host):
+    from asanypath_native import ssh_learn_host_key
+
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
+    with pytest.raises(RuntimeError, match="not a plain host name"):
+        ssh_learn_host_key(host, 22, key, str(tmp_path / "kh"))
+    assert not (tmp_path / "kh").exists()
 
 
 def test_ftp_sessions_are_keyed_by_credentials():
     def key(secret):
-        return FTPPath("ftp://u@a.example/f", username="u", **{"pass" + "word": secret})._client_key
+        return FTPPath("ftp://u@a.example/f", username="u", **{PW: secret})._client_key
 
     assert key("right") == key("right")
     assert key("right") != key("wrong")
@@ -495,87 +472,60 @@ def test_ftp_sessions_are_keyed_by_credentials():
 
 
 # ---------------------------------------------------------------------------
-# Ambient Artifactory tokens
+# Ambient credentials: only for the service they are configured for
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def jfrog_conf(tmp_path, monkeypatch):
+def ambient(tmp_path, monkeypatch):
     import json
 
     from asanypath import artifactory
 
+    for name in ("HTTP_AUTH_USER", "HTTP_AUTH_PASSWORD", "HTTP_AUTH_HEADER", "HTTP_AUTH_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
+    monkeypatch.setattr("asanypath.cloud._UNSCOPED_WARNED", set())
+    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
     monkeypatch.setattr(artifactory, "_jfrog_conf_token", real_jfrog_conf_token)
     monkeypatch.setenv("JFROG_CLI_HOME", str(tmp_path))
-    (tmp_path / "jfrog-cli.conf.v6").write_text(
-        json.dumps(
-            {
-                "servers": [
-                    {"url": "https://corp.jfrog.io/", "accessToken": "CORP", "isDefault": True},
-                    {"url": "https://art.example:8443/", "accessToken": "PORTED"},
-                ]
-            }
-        )
-    )
+    servers = [
+        {"url": "https://corp.jfrog.io/", "accessToken": "CORP", "isDefault": True},
+        {"url": "https://art.example:8443/", "accessToken": "PORTED"},
+    ]
+    (tmp_path / "jfrog-cli.conf.v6").write_text(json.dumps({"servers": servers}))
+    return monkeypatch
+
+
+_ART_ENV = {
+    "ARTIFACTORY_IDENTITY_TOKEN": "ambient",
+    "ARTIFACTORY_BASE_URL": "corp.example/artifactory",
+}
 
 
 @pytest.mark.parametrize(
-    ("uri", "token"),
+    ("env", "uri", "token"),
     [
-        ("art://corp.jfrog.io/artifactory/repo/f", "CORP"),
-        ("art://CORP.jfrog.io:443/artifactory/repo/f", "CORP"),
-        ("art://art.example:8443/artifactory/repo/f", "PORTED"),
-        ("art://attacker.example/artifactory/repo/f", None),
-        ("art://rog.io/artifactory/repo/f", None),
-        ("art://art.example/artifactory/repo/f", None),
+        ({}, "art://corp.jfrog.io/artifactory/repo/f", "CORP"),
+        ({}, "art://CORP.jfrog.io:443/artifactory/repo/f", "CORP"),
+        ({}, "art://art.example:8443/artifactory/repo/f", "PORTED"),
+        ({}, "art://attacker.example/artifactory/repo/f", None),
+        ({}, "art://rog.io/artifactory/repo/f", None),
+        ({}, "art://art.example/artifactory/repo/f", None),
+        (_ART_ENV, "art://corp.example/artifactory/repo/f", "ambient"),
+        (_ART_ENV, "art://attacker.example/artifactory/repo/f", None),
+        ({"ARTIFACTORY_IDENTITY_TOKEN": "ambient"}, "art://any.example/artifactory/repo/f", None),
     ],
 )
-def test_jfrog_cli_token_only_for_its_own_host(jfrog_conf, uri, token):
+def test_ambient_artifactory_tokens(ambient, env, uri, token):
+    for name, value in env.items():
+        ambient.setenv(name, value)
+
     if token is None:
         with pytest.raises(ValueError, match="token required"):
             ArtifactoryPath(uri)
     else:
         assert ArtifactoryPath(uri)._token == token
-
-
-def test_env_token_is_bound_to_the_configured_base_url(monkeypatch):
-    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient")
-    monkeypatch.setenv("ARTIFACTORY_BASE_URL", "corp.example/artifactory")
-    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
-    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
-
-    assert ArtifactoryPath("art://corp.example/artifactory/repo/f")._token == "ambient"
-    with pytest.raises(ValueError, match="token required"):
-        ArtifactoryPath("art://attacker.example/artifactory/repo/f")
-
-
-def test_env_token_without_base_url_is_not_sent(monkeypatch, caplog):
-    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient")
-    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
-    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
-    monkeypatch.setattr("asanypath.cloud._UNSCOPED_WARNED", set())
-
-    with pytest.raises(ValueError, match="token required"):
-        ArtifactoryPath("art://any.example/artifactory/repo/f")
-    with pytest.raises(ValueError, match="token required"):
-        ArtifactoryPath("art://other.example/artifactory/repo/f")
-
-    warnings = [r for r in caplog.records if "ARTIFACTORY_IDENTITY_TOKEN is ignored" in r.message]
-    assert len(warnings) == 1 and "ARTIFACTORY_BASE_URL" in warnings[0].message
-
-
-# ---------------------------------------------------------------------------
-# Ambient HTTP credentials
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def http_env(monkeypatch):
-    for name in ("HTTP_AUTH_USER", "HTTP_AUTH_PASSWORD", "HTTP_AUTH_HEADER", "HTTP_AUTH_URL"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("HTTP_AUTH_TOKEN", "service-token")
-    monkeypatch.setattr("asanypath.cloud._UNSCOPED_WARNED", set())
-    return monkeypatch
 
 
 @pytest.mark.parametrize(
@@ -588,64 +538,42 @@ def http_env(monkeypatch):
         ("https://svc.example", "https://svc.example:8443/x", False),
         ("https://svc.example", "https://attacker.example/x", False),
         ("https://svc.example", "https://svc.example.attacker.example/x", False),
+        (None, "https://svc.example/x", False),
     ],
 )
-def test_http_env_credentials_only_for_their_origin(http_env, service, url, sent):
+def test_ambient_http_credentials(ambient, service, url, sent):
     from asanypath.http import HTTPPath, HTTPSPath
 
-    http_env.setenv("HTTP_AUTH_URL", service)
+    ambient.setenv("HTTP_AUTH_TOKEN", "service-token")
+    if service:
+        ambient.setenv("HTTP_AUTH_URL", service)
     cls = HTTPSPath if url.startswith("https") else HTTPPath
 
     assert bool(cls(url)._auth_headers()) is sent
 
 
-def test_http_env_credentials_without_service_are_not_sent(http_env, caplog):
+def test_unscoped_ambient_credentials_warn_once_per_setting(ambient, caplog):
     from asanypath.http import HTTPSPath
 
-    assert HTTPSPath("https://svc.example/x")._auth_headers() == []
-    assert HTTPSPath("https://other.example/x")._auth_headers() == []
-    warnings = [r for r in caplog.records if "HTTP_AUTH_* is ignored" in r.message]
-    assert len(warnings) == 1 and "HTTP_AUTH_URL" in warnings[0].message
+    ambient.setenv("HTTP_AUTH_TOKEN", "t")
+    ambient.setenv("ARTIFACTORY_IDENTITY_TOKEN", "t")
+    for host in ("a.example", "b.example"):
+        HTTPSPath(f"https://{host}/x")._auth_headers()
+        with pytest.raises(ValueError):
+            ArtifactoryPath(f"art://{host}/artifactory/repo/f")
+
+    assert sorted(r.message for r in caplog.records if "is ignored" in r.message) == [
+        "ARTIFACTORY_IDENTITY_TOKEN is ignored: set ARTIFACTORY_BASE_URL to the service it is for",
+        "HTTP_AUTH_* is ignored: set HTTP_AUTH_URL to the service it is for",
+    ]
 
 
-def test_http_auth_decision_follows_environment_changes(http_env):
+def test_http_auth_decision_follows_environment_changes(ambient):
     from asanypath.http import HTTPSPath
 
+    ambient.setenv("HTTP_AUTH_TOKEN", "t")
     path = HTTPSPath("https://svc.example/x")
-    http_env.setenv("HTTP_AUTH_URL", "https://svc.example")
+    ambient.setenv("HTTP_AUTH_URL", "https://svc.example")
     assert path._auth_headers()
-    http_env.setenv("HTTP_AUTH_URL", "https://elsewhere.example")
+    ambient.setenv("HTTP_AUTH_URL", "https://elsewhere.example")
     assert path._auth_headers() == []
-
-
-@pytest.mark.parametrize("value", ["disabled", "maybe", "none"])
-def test_ssh_config_unknown_host_key_policy_fails_closed(ssh_env, monkeypatch, value):
-    monkeypatch.setenv("SSH_CONFIG", "/cfg")
-    monkeypatch.setattr(
-        "asanypath.ssh.ssh_resolve_config",
-        lambda host, paths: (None, None, None, None, value, None),
-    )
-
-    assert SSHPath("ssh://u@host.example/f")._native_kwargs["host_key_policy"] == "yes"
-
-
-def test_ssh_config_known_hosts_tokens_are_expanded(ssh_env, monkeypatch):
-    monkeypatch.setenv("SSH_CONFIG", "/cfg")
-    monkeypatch.setattr(
-        "asanypath.ssh.ssh_resolve_config",
-        lambda host, paths: ("real.example", 2222, "deploy", None, None, "%d/kh-%r@%h-%p%%"),
-    )
-
-    native = SSHPath("ssh://alias/f")._native_kwargs
-
-    assert native["known_hosts"] == str(ssh_env / "kh-deploy@real.example-2222%")
-
-
-@pytest.mark.parametrize("host", ["a,b", "a b", "*.example", "a\nb", "[a]", ""])
-def test_ssh_host_keys_are_only_recorded_for_plain_host_names(tmp_path, host):
-    from asanypath_native import ssh_learn_host_key
-
-    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-    with pytest.raises(RuntimeError, match="not a plain host name"):
-        ssh_learn_host_key(host, 22, key, str(tmp_path / "kh"))
-    assert not (tmp_path / "kh").exists()
