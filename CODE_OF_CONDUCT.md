@@ -8,5 +8,5 @@ confidential information are not acceptable.
 
 Project maintainers may remove, edit, or reject contributions and comments that
 do not follow this code of conduct. Report conduct concerns through the private
-security-reporting route in [SECURITY.md](SECURITY.md). Reports will be handled
+security-reporting route in the [security policy](https://github.com/AxisCommunications/asanypath/security/policy). Reports will be handled
 as confidentially as practical.
