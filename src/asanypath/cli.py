@@ -2606,6 +2606,18 @@ def auth_show(path: str | None):
         console.print(
             f"  ARTIFACTORY_IDENTITY_TOKEN: {mask_token(getenv('ARTIFACTORY_IDENTITY_TOKEN'))}"
         )
+        base_url = getenv("ARTIFACTORY_BASE_URL") or getenv("ART_BASE_URL") or "(not set)"
+        console.print(f"  ARTIFACTORY_BASE_URL: {base_url}")
+
+    # HTTP env vars (only sent to HTTP_AUTH_URL's origin)
+    if scheme is None or scheme in ("http", "https"):
+        console.print("\n[cyan]HTTP(S):[/cyan]")
+        console.print(f"  HTTP_AUTH_URL: {getenv('HTTP_AUTH_URL', '(not set)')}")
+        console.print(f"  HTTP_AUTH_USER: {getenv('HTTP_AUTH_USER', '(not set)')}")
+        console.print(
+            f"  HTTP_AUTH_PASSWORD: {'(set)' if getenv('HTTP_AUTH_PASSWORD') else '(not set)'}"
+        )
+        console.print(f"  HTTP_AUTH_TOKEN: {mask_token(getenv('HTTP_AUTH_TOKEN'))}")
 
     # SSH env vars + ssh_config
     if scheme is None or scheme == "ssh":

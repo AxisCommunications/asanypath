@@ -423,8 +423,7 @@ class TestCloudPathShared:
     def test_home(self, cloud_path, monkeypatch):
         # home() is a fresh path on another host; it must not reuse the
         # fixture's token, so provide an ambient one.
-        monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient-token")
-        type(cloud_path)._env_config = None
+        monkeypatch.setattr(type(cloud_path), "_env_token", lambda self: "ambient", raising=False)
         h = type(cloud_path).home()
         assert expanduser("~") in h.as_posix()
 

@@ -129,6 +129,15 @@ fn describe_key(key: &PublicKey) -> String {
     )
 }
 
+/// Host names that can be written to known_hosts as-is: no separators,
+/// patterns or markers that would make the entry match other hosts.
+fn is_plain_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+}
+
 struct Handler {
     host: String,
     port: u16,
@@ -138,6 +147,9 @@ struct Handler {
     rejected: Arc<Mutex<Option<String>>>,
     /// The server key, kept for `ssh_scan_host_key`.
     seen: Arc<Mutex<Option<PublicKey>>>,
+    /// Set when `StrictHostKeyChecking no` let a changed key through; like
+    /// OpenSSH, password authentication is then refused.
+    key_changed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Handler {
@@ -167,6 +179,10 @@ impl client::Handler for Handler {
         match check_known_hosts_path(&self.host, self.port, key, &self.known_hosts) {
             Ok(true) => Ok(true),
             Ok(false) => match self.policy {
+                HostKeyPolicy::AcceptNew | HostKeyPolicy::No if !is_plain_host(&self.host) => self
+                    .reject(format!(
+                        "refusing to record a host key for {label:?}: not a plain host name"
+                    )),
                 HostKeyPolicy::AcceptNew | HostKeyPolicy::No => {
                     learn_known_hosts_path(&self.host, self.port, key, &self.known_hosts)?;
                     Ok(true)
@@ -178,6 +194,8 @@ impl client::Handler for Handler {
                 )),
             },
             Err(russh::keys::Error::KeyChanged { .. }) if self.policy == HostKeyPolicy::No => {
+                self.key_changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(true)
             }
             Err(russh::keys::Error::KeyChanged { line }) => self.reject(format!(
@@ -367,6 +385,7 @@ async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
 
     let config = Arc::new(client::Config::default());
     let rejected = Arc::new(Mutex::new(None));
+    let key_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handler = Handler {
         host: conn.host.clone(),
         port: conn.port,
@@ -374,6 +393,7 @@ async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
         known_hosts: conn.known_hosts.clone(),
         rejected: rejected.clone(),
         seen: Arc::new(Mutex::new(None)),
+        key_changed: key_changed.clone(),
     };
     let mut handle = match client::connect(config, (conn.host.as_str(), conn.port), handler).await {
         Ok(handle) => handle,
@@ -384,6 +404,13 @@ async fn session_for(conn: &ConnParams) -> Result<Arc<SftpConn>, String> {
             return Err(format!("ssh connect {}:{}: {e}", conn.host, conn.port));
         }
     };
+    if key_changed.load(std::sync::atomic::Ordering::Relaxed) && auth.password.is_some() {
+        return Err(format!(
+            "Host key for {} has changed; password authentication is disabled \
+             to avoid a man-in-the-middle attack (StrictHostKeyChecking no)",
+            host_label(&conn.host, conn.port)
+        ));
+    }
     authenticate(&mut handle, &conn.user, &auth).await?;
     let channel = handle
         .channel_open_session()
@@ -1025,6 +1052,7 @@ pub fn ssh_scan_host_key(py: Python<'_>, host: String, port: u16) -> PyResult<Bo
             known_hosts: String::new(),
             rejected: Arc::new(Mutex::new(None)),
             seen: seen.clone(),
+            key_changed: Default::default(),
         };
         let config = Arc::new(client::Config::default());
         let connected = client::connect(config, (host.as_str(), port), handler).await;
@@ -1046,6 +1074,11 @@ pub fn ssh_learn_host_key(
     public_key: String,
     known_hosts: String,
 ) -> PyResult<()> {
+    if !is_plain_host(&host) {
+        return Err(PyRuntimeError::new_err(format!(
+            "refusing to record a host key for {host:?}: not a plain host name"
+        )));
+    }
     let key = PublicKey::from_openssh(&public_key).map_err(err)?;
     learn_known_hosts_path(&host, port, &key, &known_hosts).map_err(err)
 }

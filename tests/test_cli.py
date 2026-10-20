@@ -746,6 +746,17 @@ def test_auth_show_masking(runner, monkeypatch):
     assert "ARTIFACTORY_IDENTITY_TOKEN" in result.output
 
 
+def test_auth_show_http_hides_secrets(runner, monkeypatch):
+    monkeypatch.setenv("HTTP_AUTH_URL", "https://files.example")
+    monkeypatch.setenv("HTTP_AUTH_PASSWORD", "hunter2-password")
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "token-123456789")
+    result = runner.invoke(cli, ["auth", "show", "https://files.example/x"])
+    assert result.exit_code == 0
+    assert "HTTP_AUTH_URL: https://files.example" in result.output
+    assert "hunter2" not in result.output
+    assert "123456789" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # cp / mv – single-argument default destination (real filesystem)
 # ---------------------------------------------------------------------------

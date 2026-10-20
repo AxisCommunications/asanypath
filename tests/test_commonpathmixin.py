@@ -64,8 +64,7 @@ def ambient_token(monkeypatch):
     Host-bound backends never carry explicit credentials to a different
     host, so such paths resolve credentials from the environment.
     """
-    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "ambient-token")
-    ArtifactoryPath._env_config = None
+    monkeypatch.setattr(ArtifactoryPath, "_env_token", lambda self: "ambient-token")
 
 
 @pytest.fixture(params=_CASES)

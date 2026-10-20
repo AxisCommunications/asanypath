@@ -63,6 +63,7 @@ def redirect_servers():
 @pytest.mark.parametrize("header", ["authorization", "x-api-key"])
 async def test_cross_origin_redirect_drops_auth_headers(redirect_servers, monkeypatch, header):
     origin, seen = redirect_servers
+    monkeypatch.setenv("HTTP_AUTH_URL", origin)
     monkeypatch.setenv("HTTP_AUTH_TOKEN", "secret-token")
     monkeypatch.setenv("HTTP_AUTH_HEADER", header)
 
@@ -74,6 +75,7 @@ async def test_cross_origin_redirect_drops_auth_headers(redirect_servers, monkey
 
 async def test_same_origin_redirect_keeps_auth_headers(redirect_servers, monkeypatch):
     origin, seen = redirect_servers
+    monkeypatch.setenv("HTTP_AUTH_URL", origin)
     monkeypatch.setenv("HTTP_AUTH_TOKEN", "secret-token")
     monkeypatch.setenv("HTTP_AUTH_HEADER", "x-api-key")
 

@@ -47,6 +47,8 @@ layer. Call :func:`disconnect_all` to close everything (tests/shutdown).
 from __future__ import annotations
 
 import asyncio
+import getpass
+import re
 import stat as stat_module
 import sys
 from collections.abc import AsyncIterator
@@ -190,6 +192,8 @@ def _resolve_alias(
 
 _TRUSTED_HOSTS: set[tuple[str, int, str]] = set()
 _TRUST_LOCKS: dict[tuple[str, int, str], asyncio.Lock] = {}
+# ssh_config StrictHostKeyChecking values (OpenSSH also accepts true/false).
+_HOST_KEY_POLICIES = frozenset({"yes", "ask", "accept-new", "no", "off", "true", "false"})
 
 
 async def _confirm_unknown_host(host: str, port: int, known_hosts: str) -> None:
@@ -373,19 +377,45 @@ class SSHPath(CloudPathMixin):
         }
 
     def _host_key_kwargs(self) -> dict:
-        """Native host-key settings, following OpenSSH (see module docstring)."""
+        """Native host-key settings, following OpenSSH (see module docstring).
+
+        Fixed per instance, so computed once (and inherited by listing children).
+        """
+        cached = self.__dict__.get("_host_key_settings")
+        if cached is not None:
+            return cached
         if self._known_hosts == ():
-            return {"host_key_policy": "disabled", "known_hosts": ""}
-        known_hosts = (
-            (self._known_hosts if isinstance(self._known_hosts, str) else None)
-            or getattr(self, "_config_known_hosts", None)
-            or "~/.ssh/known_hosts"
-        )
-        policy = getattr(self, "_config_strict_host_key_checking", None) or "ask"
-        return {
-            "host_key_policy": policy.lower(),
-            "known_hosts": str(Path(known_hosts).expanduser()),
+            settings = {"host_key_policy": "disabled", "known_hosts": ""}
+        else:
+            known_hosts = (
+                (self._known_hosts if isinstance(self._known_hosts, str) else None)
+                or self._expand_ssh_tokens(getattr(self, "_config_known_hosts", None))
+                or "~/.ssh/known_hosts"
+            )
+            policy = (getattr(self, "_config_strict_host_key_checking", None) or "ask").lower()
+            settings = {
+                # Unrecognised values fail closed, as OpenSSH refuses them.
+                "host_key_policy": policy if policy in _HOST_KEY_POLICIES else "yes",
+                "known_hosts": str(Path(known_hosts).expanduser()),
+            }
+        self._host_key_settings = settings
+        return settings
+
+    def _expand_ssh_tokens(self, value: str | None) -> str | None:
+        """Expand the ssh_config ``%`` tokens that make sense for a path:
+        ``%d`` home, ``%u`` local user, ``%h`` host, ``%p`` port, ``%r`` remote
+        user and ``%%``. Others are left as-is."""
+        if not value or "%" not in value:
+            return value
+        tokens = {
+            "%": "%",
+            "d": str(Path.home()),
+            "u": getpass.getuser(),
+            "h": self._resolved_host or "",
+            "p": str(self._resolved_port or 22),
+            "r": self._resolved_user or "",
         }
+        return re.sub(r"%(.)", lambda m: tokens.get(m.group(1), m.group(0)), value)
 
     async def _get_native_kwargs(self) -> dict:
         kwargs = self._native_kwargs

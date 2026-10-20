@@ -236,20 +236,25 @@ For backends whose credentials authenticate against the host in the URL
 different host. Listing results are only yielded when they name a direct child
 of the listed path.
 
-Ambient credentials are scoped the same way:
+Ambient (environment) credentials belong to one configured service and are only
+sent to that service's origin (scheme, host and port). Without a configured
+service they are not sent at all, and a warning names the missing setting:
 
-- **Artifactory:** a JFrog CLI server token is only used for that server's
-  exact host and port. When `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`) is set,
-  `ARTIFACTORY_IDENTITY_TOKEN` is only used for that service.
+- **HTTP(S):** `HTTP_AUTH_USER`/`HTTP_AUTH_PASSWORD` or `HTTP_AUTH_TOKEN`
+  (with optional `HTTP_AUTH_HEADER`) are only used for URLs on the origin of
+  `HTTP_AUTH_URL`, e.g. `HTTP_AUTH_URL=https://files.example.com`. On a
+  redirect to another scheme, host or port, only non-credential headers
+  (`Range`, `Accept`, conditional headers, ...) are forwarded.
+- **Artifactory:** `ARTIFACTORY_IDENTITY_TOKEN` is only used for the service in
+  `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`). A JFrog CLI server token is only
+  used for that server's own origin.
 - **SSH:** host keys are checked like OpenSSH. `StrictHostKeyChecking`
   (`yes`, `ask`, `accept-new`, `no`) and `UserKnownHostsFile` are read from
   ssh_config; the default is `ask` against `~/.ssh/known_hosts`. Interactive
   sessions are prompted for a host with no recorded key; non-interactive ones
-  refuse it. A changed key is refused. Pass `known_hosts=()` (or set
+  refuse it. A changed key is refused, and with `StrictHostKeyChecking no`
+  password authentication is disabled for it. Pass `known_hosts=()` (or set
   `SSH_KNOWN_HOSTS=none`) to disable checking.
-- **HTTP(S):** on a redirect to another scheme, host or port, only
-  non-credential headers (`Range`, `Accept`, conditional headers, ...) are
-  forwarded.
 - **Azure `presign()`** signs a blob-scoped SAS with the account key; a
   configured SAS token is never handed out as a presigned URL.
 
