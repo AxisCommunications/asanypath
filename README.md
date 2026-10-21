@@ -543,6 +543,35 @@ asanypath rm s3://[TAB]                # Lists buckets
 
 Completion respects environment variables for cloud credentials (e.g., `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` for S3). Bearer token auth (for custom endpoints) is not supported in completions; only env var-based auth is used.
 
+### Path options in your own click CLI
+
+`click.Path` validates with `os.stat()`, so with `path_type=AsAnyPath` its
+`exists`, `file_okay` and `dir_okay` checks are skipped for remote URIs
+(`exists=False`) or always fail (`exists=True`). Use `ClickPath` instead
+(requires the `cli` extra):
+
+```python
+import click
+from asanypath.click import ClickPath
+
+@click.command()
+@click.option("--model", type=ClickPath(exists=True, dir_okay=False))
+@click.option("--out", type=ClickPath(file_okay=False))
+def main(model, out):
+    ...  # model and out are sync AsAnyPath objects
+```
+
+`ClickPath` takes the same arguments as `click.Path`; `path_type` defaults to
+`asanypath.sync.AsAnyPath`. Local paths (including `file://` URIs) behave exactly
+like `click.Path`. Remote paths are checked with `exists()`, `is_dir()` and
+`is_file()` while arguments are parsed:
+
+- `file_okay=False` / `dir_okay=False` reject a path only when it is exclusively
+  the disallowed kind; an object-store key can be both a file and a directory.
+- `readable`, `writable`, `executable` and `resolve_path` apply to local paths only.
+- If the backend cannot be queried (credentials, network, unsupported protocol),
+  `exists=True` reports the error and `exists=False` accepts the path unchecked.
+
 ## Benchmarks
 
 Multi-backend benchmark suite in `scripts/bench.py` compares asanypath against
