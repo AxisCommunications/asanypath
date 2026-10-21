@@ -84,6 +84,21 @@ def _service_origin(url: str) -> tuple[str, str, int | None] | None:
 _UNSCOPED_WARNED: set[str] = set()
 
 
+class ServiceEndpointMixin:
+    """Service URL introspection for backends with a separate service endpoint."""
+
+    _endpoint_url: str
+
+    @property
+    def endpoint_url(self) -> str:
+        """Current service base URL, excluding the container and object path.
+
+        Reading this property performs no I/O. S3 may refine its initial
+        default when AWS configuration is resolved during an operation.
+        """
+        return self._endpoint_url
+
+
 class CloudPathMixin(CommonPurePathMixin):
     """Base class for cloud path implementations.
 

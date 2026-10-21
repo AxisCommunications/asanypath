@@ -56,40 +56,95 @@ struct RepoEntry {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ArtCreds {
-    /// Base URL without protocol, e.g. "artifacts.example.com/artifactory"
-    base_url: String,
+    /// Complete service URL, e.g. "https://artifacts.example.com/artifactory".
+    endpoint_url: String,
     token: String,
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::ArtCreds;
+
+    #[test]
+    fn complete_and_legacy_endpoints_build_the_same_urls() {
+        for endpoint in [
+            "example.com/artifactory",
+            "https://example.com/artifactory",
+            "https://example.com/artifactory/",
+        ] {
+            let creds = ArtCreds::new(endpoint.into(), "token".into());
+            assert_eq!(
+                creds.content_url("/repo/key"),
+                "https://example.com/artifactory/repo/key"
+            );
+            assert_eq!(
+                creds.storage_url("/repo/key"),
+                "https://example.com/artifactory/api/storage/repo/key"
+            );
+            assert_eq!(
+                creds.permission_target_url("read all"),
+                "https://example.com/artifactory/api/security/permissions/read%20all"
+            );
+            assert_eq!(
+                creds.path_url("repo/key"),
+                "art://example.com/artifactory/repo/key"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_http_endpoint_is_preserved() {
+        let creds = ArtCreds::new("http://localhost:8080/artifactory".into(), "token".into());
+        assert_eq!(
+            creds.content_url("repo/key"),
+            "http://localhost:8080/artifactory/repo/key"
+        );
+        assert_eq!(
+            creds.path_url("repo/key"),
+            "art://localhost:8080/artifactory/repo/key"
+        );
+    }
 }
 
 impl ArtCreds {
     pub(crate) fn new(base_url: String, token: String) -> Self {
-        Self { base_url, token }
+        // Accept legacy native callers passing a scheme-less base_url.
+        let endpoint_url = if base_url.starts_with("https://") || base_url.starts_with("http://") {
+            base_url
+        } else {
+            format!("https://{}", base_url)
+        };
+        Self {
+            endpoint_url: endpoint_url.trim_end_matches('/').to_string(),
+            token,
+        }
     }
 
     fn auth_headers(&self) -> Vec<(String, String)> {
         bearer_headers(&self.token)
     }
 
-    /// Build the content URL: https://{base_url}/{path}
     fn content_url(&self, path: &str) -> String {
-        format!("https://{}/{}", self.base_url, path.trim_start_matches('/'))
+        format!("{}/{}", self.endpoint_url, path.trim_start_matches('/'))
+    }
+
+    fn path_url(&self, path: &str) -> String {
+        let base = self.endpoint_url.split_once("://").unwrap().1;
+        format!("art://{}/{}", base, path.trim_start_matches('/'))
     }
 
     /// Build the storage API URL: https://{base}/api/storage/{repo_path}
     /// Input path is like "repo/folder/file.txt"
     fn storage_url(&self, path: &str) -> String {
-        // Insert /api/storage/ after the artifactory base
-        // base_url = "host/artifactory", path = "repo/path"
-        // result = "https://host/artifactory/api/storage/repo/path"
-        let base = self.base_url.trim_end_matches('/');
+        let base = &self.endpoint_url;
         let trimmed_path = path.trim_start_matches('/');
-        format!("https://{}/api/storage/{}", base, trimmed_path)
+        format!("{}/api/storage/{}", base, trimmed_path)
     }
 
     fn permission_target_url(&self, name: &str) -> String {
-        let base = self.base_url.trim_end_matches('/');
+        let base = &self.endpoint_url;
         format!(
-            "https://{}/api/security/permissions/{}",
+            "{}/api/security/permissions/{}",
             base,
             urlencoding::encode(name)
         )
@@ -98,10 +153,7 @@ impl ArtCreds {
 
 macro_rules! art_creds {
     ($base_url:expr, $token:expr) => {
-        ArtCreds {
-            base_url: $base_url,
-            token: $token,
-        }
+        ArtCreds::new($base_url, $token)
     };
 }
 
@@ -148,7 +200,7 @@ impl CloudBackend for ArtCreds {
     }
 
     fn error_path(&self, path: &str) -> String {
-        format!("art://{}/{}", self.base_url, path)
+        self.path_url(path)
     }
 
     fn put(
@@ -189,11 +241,11 @@ impl CloudBackend for ArtCreds {
         let options = options.clone();
         async move {
             crate::backend::require_empty_provider(&options)?;
-            let base = self.base_url.trim_end_matches('/');
+            let base = &self.endpoint_url;
             let src_trim = src.trim_start_matches('/');
             let dst_trim = dst.trim_start_matches('/');
             let url = crate::backend::append_query(
-                &format!("https://{}/api/copy/{}?to=/{}", base, src_trim, dst_trim),
+                &format!("{}/api/copy/{}?to=/{}", base, src_trim, dst_trim),
                 &options.query,
             );
             let mut headers = self.auth_headers();
@@ -285,11 +337,7 @@ async fn do_art_storage_info(
         .await
         .map_err(|e| PyRuntimeError::new_err(e))?;
     if !status.is_success() {
-        return Err(status_to_pyerr(
-            status,
-            &format!("art://{}/{}", creds.base_url, path),
-            &body,
-        ));
+        return Err(status_to_pyerr(status, &creds.path_url(path), &body));
     }
     let info: StorageInfo = sonic_rs::from_slice(&body)
         .map_err(|e| PyRuntimeError::new_err(format!("JSON parse error: {e}")))?;
@@ -304,7 +352,7 @@ async fn do_art_list(
     let info = do_art_storage_info(creds, path, use_h2).await?;
     match info.children {
         Some(children) => {
-            let base = format!("art://{}/{}", creds.base_url, path.trim_end_matches('/'));
+            let base = creds.path_url(path.trim_end_matches('/'));
             let results: Vec<(String, bool)> = children
                 .iter()
                 .map(|child| {
@@ -315,16 +363,15 @@ async fn do_art_list(
             Ok(results)
         }
         None => Err(pyo3::exceptions::PyNotADirectoryError::new_err(format!(
-            "Not a directory: 'art://{}/{}'",
-            creds.base_url, path
+            "Not a directory: '{}'",
+            creds.path_url(path)
         ))),
     }
 }
 
 /// List all repositories (GET /api/repositories). Returns bare repository keys.
 async fn do_art_list_repos(creds: &ArtCreds, use_h2: bool) -> Result<Vec<String>, PyErr> {
-    let base = creds.base_url.trim_end_matches('/');
-    let url = format!("https://{}/api/repositories", base);
+    let url = format!("{}/api/repositories", creds.endpoint_url);
     let headers = creds.auth_headers();
     let (status, body) = do_request_light("GET", &url, &headers, None, use_h2)
         .await
@@ -332,7 +379,7 @@ async fn do_art_list_repos(creds: &ArtCreds, use_h2: bool) -> Result<Vec<String>
     if !status.is_success() {
         return Err(status_to_pyerr(
             status,
-            &format!("art://{}", creds.base_url),
+            creds.path_url("").trim_end_matches('/'),
             &body,
         ));
     }

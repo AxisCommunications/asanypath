@@ -39,7 +39,7 @@ from asanypath_native import (
     art_storage_info,
 )
 
-from asanypath.cloud import CloudPathMixin, _service_origin
+from asanypath.cloud import CloudPathMixin, ServiceEndpointMixin, _service_origin
 from asanypath.common import DirEntry
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
@@ -75,7 +75,7 @@ def _jfrog_conf_token(base_url: str) -> str | None:
     return None
 
 
-class ArtifactoryPath(CloudPathMixin):
+class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
     """Async path implementation for JFrog Artifactory with Bearer token auth.
 
     Extends HTTPSPath to add authentication via Authorization: Bearer <token> header
@@ -136,19 +136,11 @@ class ArtifactoryPath(CloudPathMixin):
             ValueError: If token is not provided and ARTIFACTORY_IDENTITY_TOKEN env var is not set.
         """
         super().__init__(*args, **kwargs)
-        # Pre-compute base_url and repo_path for native dispatch
-        raw = str(self)[len("art://") :]  # "host/artifactory/repo/path"
-        idx = raw.find("/artifactory/")
-        if idx >= 0:
-            self._base_url = raw[: idx + len("/artifactory")]
-            self._repo_path = raw[idx + len("/artifactory/") :]
-        else:
-            self._base_url = raw.split("/")[0]
-            self._repo_path = "/".join(raw.split("/")[1:])
+        self._bind_path_attrs()
 
         from asanypath import _credstore
 
-        cred_key = f"art:{self._base_url}"
+        cred_key = f"art:{self._service_key}"
         known = ArtifactoryPath._service_tokens
         if token:
             # Persist user-supplied tokens once per service, not per derived path.
@@ -160,7 +152,7 @@ class ArtifactoryPath(CloudPathMixin):
         else:
             self._token = self._env_token() or known.get(cred_key)
             if not self._token:
-                self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._base_url)
+                self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._service_key)
                 if self._token:
                     known[cred_key] = self._token
         if not self._token:
@@ -190,12 +182,21 @@ class ArtifactoryPath(CloudPathMixin):
         token = self.env_config.token
         if token and self._ambient_credentials_allowed(
             self._resolve_base_url_prefix(),
-            self._base_url,
+            self._service_key,
             credential="ARTIFACTORY_IDENTITY_TOKEN",
             setting="ARTIFACTORY_BASE_URL",
         ):
             return token
         return None
+
+    @property
+    def _service_key(self) -> str:
+        """``host/artifactory``: the service key for the keyring, the JFrog CLI
+        config and token scoping. Derived as before endpoint normalization so
+        stored credentials keep matching."""
+        raw = str(self)[len("art://") :]
+        idx = raw.find("/artifactory/")
+        return raw[: idx + len("/artifactory")] if idx >= 0 else raw.split("/")[0]
 
     @property
     def _item_path(self) -> str:
@@ -204,11 +205,13 @@ class ArtifactoryPath(CloudPathMixin):
     def _bind_path_attrs(self) -> None:
         raw = str(self)[len("art://") :]
         idx = raw.find("/artifactory/")
+        if idx < 0 and raw.rstrip("/").endswith("/artifactory"):
+            idx = len(raw.rstrip("/")) - len("/artifactory")
         if idx >= 0:
-            self._base_url = raw[: idx + len("/artifactory")]
+            self._endpoint_url = "https://" + raw[: idx + len("/artifactory")]
             self._repo_path = raw[idx + len("/artifactory/") :]
         else:
-            self._base_url = raw.split("/")[0]
+            self._endpoint_url = "https://" + raw.split("/")[0]
             self._repo_path = "/".join(raw.split("/")[1:])
         self._is_folder = None
         self._cached_info = None
@@ -216,14 +219,14 @@ class ArtifactoryPath(CloudPathMixin):
     @property
     def _native_kwargs(self) -> dict:
         return {
-            "base_url": self._base_url,
+            "base_url": self._endpoint_url,
             "token": self._token,
         }
 
     def _identity_parts(self) -> tuple:
         # Keep cache identity scoped even when the token came from keyring/JFrog.
         token_fp = hashlib.sha256(self._token.encode()).hexdigest()
-        return (*super()._identity_parts(), self._base_url, token_fp)
+        return (*super()._identity_parts(), self._service_key, token_fp)
 
     # ------------------------------------------------------------------
     # Backend-specific operations
@@ -323,7 +326,7 @@ class ArtifactoryPath(CloudPathMixin):
         batcher = self._get_batcher()
         results = await batcher.list(
             item=self._repo_path,
-            base_url=self._base_url,
+            base_url=self._endpoint_url,
             token=self._token,
         )
         base = str(self).rstrip("/")
@@ -339,21 +342,13 @@ class ArtifactoryPath(CloudPathMixin):
         """List repositories when at the server root (``art://<host>/artifactory/``).
 
         Returns None once a repository is selected, so normal object listing
-        proceeds. Handles both the canonical ``host/artifactory`` base and the
-        shorthand parse where the trailing ``artifactory`` lands in the repo
-        slot.
+        proceeds.
         """
-        base = self._base_url
-        repo = self._repo_path.strip("/")
-        if repo == "artifactory":
-            base = f"{base}/artifactory"
-            repo = ""
-        if repo:
-            return None
-        if not base or base == "artifactory":
+        base = self._endpoint_url
+        if self._repo_path.strip("/"):
             return None
         names = await art_list_repos(base_url=base, token=self._token, use_h2=False)
-        return [f"art://{base}/{name}" for name in names]
+        return [f"art://{base.removeprefix('https://')}/{name}" for name in names]
 
     @staticmethod
     def _parse_art_ts(ts: str | None) -> float | None:
