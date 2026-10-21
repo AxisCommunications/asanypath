@@ -13,3 +13,13 @@ license = "MIT"
 manifest-path = "Cargo.toml"
 module-name = "asanypath_native"
 features = ["pyo3/extension-module"]
+
+[tool.uv]
+# Rebuild local installs when native sources change; the version alone does not.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "asanypath_native.pyi" },
+    { file = "src/**/*.rs" },
+]
