@@ -6,7 +6,7 @@
 
 """Test CommonPurePathMixin shared path operations across all backends."""
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 import pytest
@@ -16,7 +16,9 @@ from asanypath.azure import AzurePath
 from asanypath.common import _get_base_url_prefix
 from asanypath.exceptions import InvalidPathError, UnsupportedProtocolError
 from asanypath.gcs import GCSPath
+from asanypath.local import SyncPath
 from asanypath.s3 import S3Path
+from asanypath.sync import _SyncProxy
 
 # ---------------------------------------------------------------------------
 # Parametrized factory per backend
@@ -326,6 +328,35 @@ class TestCommonPurePath:
         assert p.parent / PurePosixPath("a/b.txt") == p.parent / "a/b.txt"
         with pytest.raises(UnsupportedProtocolError):
             p / PurePosixPath("/abs/path")
+
+    @pytest.mark.parametrize("other", [123, None, b"s3://bucket/nested"])
+    def test_relative_to_non_path_raises_type_error(self, path_and_factory, other):
+        p, _ = path_and_factory
+        with pytest.raises(TypeError, match="should be a str or an os.PathLike"):
+            p.relative_to(other)
+        with pytest.raises(TypeError, match="should be a str or an os.PathLike"):
+            p.is_relative_to(other)
+
+    @pytest.mark.parametrize("other", ["/bucket", Path("/bucket"), SyncPath("/bucket")])
+    def test_relative_to_local_path_raises_value_error(self, path_and_factory, other):
+        p, _ = path_and_factory
+        with pytest.raises(ValueError, match="is not in the subpath"):
+            p.relative_to(other)
+        assert p.is_relative_to(other) is False
+
+    def test_relative_to_other_backend_raises_value_error(self, path_and_factory):
+        p, _ = path_and_factory
+        other_factory, uri = (
+            (_make_gcs, "gs://bucket/nested") if p.protocol == "s3" else (_make_s3, "s3://bucket")
+        )
+        other = other_factory(uri)
+        with pytest.raises(ValueError, match="is not in the subpath"):
+            p.relative_to(other)
+        assert p.is_relative_to(other) is False
+
+    def test_relative_to_sync_proxy(self, path_and_factory):
+        p, _ = path_and_factory
+        assert p.relative_to(_SyncProxy(p.parent)) == PurePosixPath(p.name)
 
     def test_relative_to_raises(self, path_and_factory):
         p, _ = path_and_factory
