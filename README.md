@@ -16,7 +16,7 @@ locally before connecting to a cloud account.
 
 ## Requirements
 
-- Python 3.10 through 3.14.
+- Python 3.10 through 3.15.
 - Access credentials for each cloud service that your application uses.
 
 S3 authentication accepts explicit keys or uses the AWS SDK credential provider
