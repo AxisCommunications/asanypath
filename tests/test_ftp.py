@@ -411,7 +411,31 @@ class TestFTPPath(testbase):
         async for _ in FTPPath("ftp://alice@h/x").walk(on_error=seen.append):
             pass
         assert len(seen) == 1
-        assert isinstance(seen[0], aioftp.StatusCodeError)
+        assert isinstance(seen[0], NotADirectoryError)
+        assert isinstance(seen[0].__cause__, aioftp.StatusCodeError)
+
+    async def test_walk_stays_inside_the_directory(self, client):
+        from pathlib import PurePosixPath
+
+        def list_for(path):
+            if path != "/d":
+                return _AsyncLister([])
+            return _AsyncLister(
+                [
+                    (PurePosixPath("/d/%2E%2E"), {"type": "dir", "modify": ""}),
+                    (PurePosixPath("/d/..\t"), {"type": "dir", "modify": ""}),
+                    (PurePosixPath("/d/ok"), {"type": "file", "modify": ""}),
+                ]
+            )
+
+        client.list.side_effect = list_for
+
+        triples = [t async for t in FTPPath("ftp://alice@host.example/d").walk()]
+
+        roots = [str(root) for root, _, _ in triples]
+        assert roots[0] == "ftp://alice@host.example/d"
+        assert all(r.startswith("ftp://alice@host.example/d/") for r in roots[1:]), roots
+        assert triples[0][2] == ["ok"]
 
     # ---- open() unsupported ----
 
