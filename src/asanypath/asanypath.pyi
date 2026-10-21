@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from os import PathLike, stat_result
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Self, TypeAlias
 
 from anyio import AsyncFile
@@ -79,7 +79,9 @@ class AsAnyPurePath:
     def parents(self) -> tuple[Self, ...]: ...
     @property
     def parts(self) -> tuple[str, ...]: ...
-    def relative_to(self, *other: str | PathLike[str], walk_up: bool = False) -> Self: ...
+    def relative_to(
+        self, *other: str | PathLike[str], walk_up: bool = False
+    ) -> Self | PurePosixPath: ...
     @property
     def root(self) -> str: ...
     @property
