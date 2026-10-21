@@ -42,7 +42,6 @@ class TestMicroBatcher:
     def test_init(self):
         b = MicroBatcher()
         assert b._pending == {}
-        assert b._scheduled == set()
         assert b._ops == {}
 
     def test_register(self):

@@ -737,18 +737,24 @@ def test_auth_show(runner, args):
     assert result.exit_code == 0
 
 
-def test_auth_show_masking(runner):
+def test_auth_show_masking(runner, monkeypatch):
     """Verify tokens are masked in output."""
-    import os
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "secret123456")
+    result = runner.invoke(cli, ["auth", "show", "art://art.com"])
+    assert result.exit_code == 0
+    assert "sece*" not in result.output
+    assert "ARTIFACTORY_IDENTITY_TOKEN" in result.output
 
-    os.environ["ARTIFACTORY_IDENTITY_TOKEN"] = "secret123456"
-    try:
-        result = runner.invoke(cli, ["auth", "show", "art://art.com"])
-        assert result.exit_code == 0
-        assert "sece*" not in result.output
-        assert "ARTIFACTORY_IDENTITY_TOKEN" in result.output
-    finally:
-        del os.environ["ARTIFACTORY_IDENTITY_TOKEN"]
+
+def test_auth_show_http_hides_secrets(runner, monkeypatch):
+    monkeypatch.setenv("HTTP_AUTH_URL", "https://files.example")
+    monkeypatch.setenv("HTTP_AUTH_PASSWORD", "hunter2-password")
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "token-123456789")
+    result = runner.invoke(cli, ["auth", "show", "https://files.example/x"])
+    assert result.exit_code == 0
+    assert "HTTP_AUTH_URL: https://files.example" in result.output
+    assert "hunter2" not in result.output
+    assert "123456789" not in result.output
 
 
 # ---------------------------------------------------------------------------

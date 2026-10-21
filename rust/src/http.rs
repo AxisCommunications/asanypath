@@ -21,7 +21,8 @@ use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
 use pyo3::PyErr;
 use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError, PyRuntimeError};
-use reqwest::{Client, Method, StatusCode};
+use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::{Client, Method, Response, StatusCode, Url};
 
 /// Check whether a reqwest error is transient and worth retrying.
 fn is_retryable(e: &String) -> bool {
@@ -64,6 +65,9 @@ fn base_builder() -> reqwest::ClientBuilder {
         .no_brotli()
         .no_deflate()
         .no_proxy()
+        // Redirects are followed by `send_following_redirects`, which drops
+        // credential-bearing headers when a redirect leaves the origin.
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 pub fn get_client(use_h2: bool) -> &'static Client {
@@ -77,6 +81,118 @@ pub fn get_client(use_h2: bool) -> &'static Client {
                 .expect("failed to build H1 client")
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Redirects and error messages
+// ---------------------------------------------------------------------------
+
+const MAX_REDIRECTS: usize = 10;
+
+/// Request headers that may follow a redirect to another origin. Anything
+/// else (Authorization, API-key headers, signed-request headers, ...) may
+/// carry credentials for the original origin only.
+const CROSS_ORIGIN_HEADERS: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "range",
+    "user-agent",
+];
+
+/// `url` without userinfo, query or fragment, for error messages: SAS
+/// tokens and presigned signatures live in the query string.
+pub fn redact_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => url.split(['?', '#']).next().unwrap_or("").to_string(),
+    }
+}
+
+/// Describe a reqwest error without the request URL it embeds.
+fn error_string(e: reqwest::Error, url: &str) -> String {
+    format!("{} for url ({})", e.without_url(), redact_url(url))
+}
+
+/// Send a request, following redirects the way reqwest would, except that
+/// headers outside `CROSS_ORIGIN_HEADERS` are dropped once a redirect leaves
+/// the original scheme, host and port.
+async fn send_following_redirects(
+    client: &Client,
+    method: Method,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<Bytes>,
+) -> Result<Response, String> {
+    let mut method = method;
+    let mut url = Url::parse(url).map_err(|e| format!("invalid url ({}): {e}", redact_url(url)))?;
+    let origin = url.origin();
+    let mut headers = headers.to_vec();
+    let mut body = body;
+    for _ in 0..=MAX_REDIRECTS {
+        let mut req = client.request(method.clone(), url.clone());
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(b) = body.clone() {
+            req = req.body(b);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| error_string(e, url.as_str()))?;
+        let status = resp.status();
+        let next = match status {
+            StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT => resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|loc| url.join(loc).ok())
+                .filter(|u| matches!(u.scheme(), "http" | "https")),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return Ok(resp);
+        };
+        if matches!(
+            status,
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+        ) && method != Method::HEAD
+        {
+            method = Method::GET;
+            body = None;
+            headers.retain(|(k, _)| {
+                let k = k.to_ascii_lowercase();
+                k != CONTENT_TYPE.as_str()
+                    && k != CONTENT_LENGTH.as_str()
+                    && k != CONTENT_ENCODING.as_str()
+            });
+        }
+        if next.origin() != origin {
+            headers
+                .retain(|(k, _)| CROSS_ORIGIN_HEADERS.contains(&k.to_ascii_lowercase().as_str()));
+        }
+        url = next;
+    }
+    Err(format!(
+        "too many redirects for url ({})",
+        redact_url(url.as_str())
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -98,14 +214,9 @@ pub async fn do_request(
     let body = body_bytes.clone();
 
     (async || {
-        let mut req = client.request(method_parsed.clone(), url);
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        if let Some(b) = body.clone() {
-            req = req.body(b);
-        }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp =
+            send_following_redirects(client, method_parsed.clone(), url, &headers, body.clone())
+                .await?;
         let status = resp.status();
         if is_retryable_status(status) {
             return Err(format!("HTTP {} (retryable)", status.as_u16()));
@@ -115,7 +226,7 @@ pub async fn do_request(
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = resp.bytes().await.map_err(|e| e.to_string())?;
+        let resp_body = resp.bytes().await.map_err(|e| error_string(e, url))?;
         Ok((status, resp_body, resp_headers))
     })
     .retry(retry_backoff())
@@ -138,19 +249,14 @@ pub async fn do_request_light(
     let body = body_bytes.clone();
 
     (async || {
-        let mut req = client.request(method_parsed.clone(), url);
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        if let Some(b) = body.clone() {
-            req = req.body(b);
-        }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp =
+            send_following_redirects(client, method_parsed.clone(), url, &headers, body.clone())
+                .await?;
         let status = resp.status();
         if is_retryable_status(status) {
             return Err(format!("HTTP {} (retryable)", status.as_u16()));
         }
-        let resp_body = resp.bytes().await.map_err(|e| e.to_string())?;
+        let resp_body = resp.bytes().await.map_err(|e| error_string(e, url))?;
         Ok((status, resp_body))
     })
     .retry(retry_backoff())
@@ -185,12 +291,12 @@ pub async fn do_request_stream_file(
         req = req
             .header("content-length", content_length.to_string())
             .body(reqwest::Body::wrap_stream(stream));
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = req.send().await.map_err(|e| error_string(e, url))?;
         let status = resp.status();
         if is_retryable_status(status) {
             return Err(format!("HTTP {} (retryable)", status.as_u16()));
         }
-        let resp_body = resp.bytes().await.map_err(|e| e.to_string())?;
+        let resp_body = resp.bytes().await.map_err(|e| error_string(e, url))?;
         Ok((status, resp_body))
     })
     .retry(retry_backoff())
@@ -250,7 +356,7 @@ async fn _http_request(
         .await
         .map_err(|e| PyRuntimeError::new_err(e))?;
     if !status.is_success() {
-        return Err(status_to_pyerr(status, url, &resp_body));
+        return Err(status_to_pyerr(status, &redact_url(url), &resp_body));
     }
     Ok((resp_body, resp_headers))
 }
@@ -468,7 +574,7 @@ pub fn http_scrape_links(
             .await
             .map_err(|e| PyRuntimeError::new_err(e))?;
         if !status.is_success() {
-            return Err(status_to_pyerr(status, &url, &body));
+            return Err(status_to_pyerr(status, &redact_url(&url), &body));
         }
 
         let html_str = String::from_utf8_lossy(&body).into_owned();

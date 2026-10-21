@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from base64 import b64encode
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -25,9 +26,12 @@ from asanypath_native import (
     http_put,
     http_scrape_links,
 )
+from yarl import URL
 
 from asanypath._transfer import RangeNotSupportedError
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _service_origin
+
+logger = logging.getLogger(__name__)
 
 try:
     from asanypath_native import http_request
@@ -158,8 +162,11 @@ class HTTPPath(CloudPathMixin):
     - HTTP_AUTH_USER + HTTP_AUTH_PASSWORD → Basic auth
     - HTTP_AUTH_TOKEN → Bearer token (or custom header via HTTP_AUTH_HEADER)
 
-    Auth headers are automatically injected into all requests (read_bytes,
-    write_bytes, exists, etc.) and into the explicit request() method.
+    Auth headers are injected into all requests (read_bytes, write_bytes,
+    exists, etc.) and into the explicit request() method, but only for URLs
+    on the origin (scheme, host and port) given by ``HTTP_AUTH_URL``, the
+    service the credentials belong to. Without it, env credentials are never
+    sent.
 
     Directory listing (``iterdir``/``walk``/``glob``) defaults to a generic
     ``a[href]`` scrape (``listing="auto"``) which works for Python's
@@ -209,15 +216,42 @@ class HTTPPath(CloudPathMixin):
         return self._listing, self._listing_attr or "href"
 
     def _auth_headers(self) -> list[tuple[str, str]]:
-        """Return auth headers for this path. Override for per-instance auth."""
-        return _build_auth_headers()
+        """Return auth headers for this path. Override for per-instance auth.
+
+        Env credentials are only sent to the origin in ``HTTP_AUTH_URL``;
+        the decision is memoized until the environment changes.
+        """
+        env = self._identity_env()
+        memo = self.__dict__.get("_auth_memo")
+        if memo is not None and memo[0] == env and memo[1] is self._path:
+            return memo[2]
+        headers = _build_auth_headers()
+        if headers and not self._ambient_credentials_allowed(
+            env[-1], str(self), credential="HTTP_AUTH_*", setting="HTTP_AUTH_URL"
+        ):
+            headers = []
+        self._auth_memo = (env, self._path, headers)
+        return headers
+
+    _IDENTITY_ENV = (
+        "HTTP_AUTH_USER",
+        "HTTP_AUTH_PASSWORD",
+        "HTTP_AUTH_TOKEN",
+        "HTTP_AUTH_HEADER",
+        "HTTP_AUTH_URL",
+    )
+
+    def _identity_env(self) -> tuple:
+        return tuple(map(getenv, self._IDENTITY_ENV))
 
     def _merge_headers(
         self,
         user_headers: dict[str, str] | list[tuple[str, str]] | None,
+        *,
+        with_auth: bool = True,
     ) -> list[tuple[str, str]] | None:
-        """Merge auth headers with user-supplied headers."""
-        auth = self._auth_headers()
+        """Merge auth headers (unless *with_auth* is false) with user-supplied headers."""
+        auth = self._auth_headers() if with_auth else []
         if not user_headers and not auth:
             return None
         merged = list(auth)
@@ -246,13 +280,22 @@ class HTTPPath(CloudPathMixin):
 
         Args:
             method: HTTP verb.
-            url: Target URL. Defaults to str(self).
+            url: Target URL. Defaults to str(self). Env credentials are only
+                added when it has this path's origin (scheme, host and port).
             headers: Extra headers (merged with auth headers).
             data: Raw body bytes for PUT/POST/PATCH.
             json: JSON-serializable object (sets Content-Type and body).
         """
+        own = str(self)
+        with_auth = True
         if url is None:
-            url = str(self)
+            url = own
+        elif url != own:
+            # Send the URL exactly as checked: yarl rejects authorities other
+            # parsers would read differently; pre-encoded queries (presigned
+            # URLs) are kept as-is, like in ``__init__``.
+            url = str(URL(url, encoded="?" in url))
+            with_auth = _service_origin(url) == _service_origin(own)
         if http_request is None:
             raise ImportError(
                 "http_request not available; upgrade asanypath-native to use request()"
@@ -261,7 +304,7 @@ class HTTPPath(CloudPathMixin):
             data = msgspec.json.encode(json)
             headers = dict(headers) if isinstance(headers, dict) else dict(headers or [])
             headers.setdefault("content-type", "application/json")
-        merged = self._merge_headers(headers)
+        merged = self._merge_headers(headers, with_auth=with_auth)
         status_code, body, resp_headers = await http_request(
             method,
             url,
@@ -337,11 +380,15 @@ class HTTPPath(CloudPathMixin):
             headers=self._merge_headers(None),
         )
         for link in urls:
-            yield type(self)(
+            child = type(self)(
                 link,
                 listing=self._listing,
                 listing_attr=self._listing_attr,
             )
+            if self._plain_child_name(link) is not None or self._is_direct_child(child):
+                yield child
+            else:
+                logger.warning("Skipping listing entry %r: not a direct child of %s", link, self)
 
     async def walk(
         self,

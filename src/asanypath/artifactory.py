@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -38,7 +39,7 @@ from asanypath_native import (
     art_storage_info,
 )
 
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _service_origin
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -49,33 +50,27 @@ from asanypath.options import (
 
 
 def _jfrog_conf_token(base_url: str) -> str | None:
-    """Return an access token from the JFrog CLI config matching ``base_url``.
+    """Return an access token from the JFrog CLI config for ``base_url``'s service.
 
-    Reads ``$JFROG_CLI_HOME`` (default ``~/.jfrog``), preferring a server whose
-    configured URL contains the target host, else the default/first server.
+    Reads ``$JFROG_CLI_HOME`` (default ``~/.jfrog``) and only uses a server
+    whose configured URL has exactly this origin (scheme, host and port): a
+    token is never sent to a service it wasn't configured for.
     """
     root = Path(getenv("JFROG_CLI_HOME") or (Path.home() / ".jfrog"))
-    host = base_url.split("/")[0].lower() if base_url else ""
+    target = _service_origin(base_url) if base_url else None
+    if target is None:
+        return None
     for name in ("jfrog-cli.conf.v7", "jfrog-cli.conf.v6", "jfrog-cli.conf.v5", "jfrog-cli.conf"):
         try:
             data = json.loads((root / name).read_text())
         except (OSError, ValueError):
             continue
         servers = data.get("servers") if isinstance(data, dict) else None
-        if not servers:
-            continue
-        match = next(
-            (
-                s
-                for s in servers
-                if host and host in f"{s.get('url', '')}{s.get('artifactoryUrl', '')}".lower()
-            ),
-            None,
-        )
-        if match is None:
-            match = next((s for s in servers if s.get("isDefault")), servers[0])
-        if token := match.get("accessToken"):
-            return token
+        for server in servers or ():
+            urls = (server.get("url"), server.get("artifactoryUrl"))
+            if any(url and _service_origin(url) == target for url in urls):
+                if token := server.get("accessToken"):
+                    return token
     return None
 
 
@@ -88,6 +83,7 @@ class ArtifactoryPath(CloudPathMixin):
     Example:
         ```python
         import asyncio
+        import hashlib
         from asanypath import AsAnyPath
 
         async def main():
@@ -104,11 +100,15 @@ class ArtifactoryPath(CloudPathMixin):
     """
 
     protocol: str = "art"
+    _options_bound_to_authority = True
     _supports_range_read: bool = True
     # Artifactory has no multipart API: objects at/above this size stream a single
     # PUT body from disk (bounded memory) instead of buffering the whole object.
     _STREAM_THRESHOLD = UPLOAD_CHUNK_SIZE
     _copy_batch_fn = staticmethod(art_copy_batch)
+    # Tokens per service (``art:<host>/artifactory``), mirroring the keyring so
+    # repeated constructions skip it. Never applied to a different service.
+    _service_tokens: dict[str, str] = {}
 
     @staticmethod
     def _batcher_key_fn(base_url: str, token: str, **_kw) -> str:
@@ -148,23 +148,26 @@ class ArtifactoryPath(CloudPathMixin):
         from asanypath import _credstore
 
         cred_key = f"art:{self._base_url}"
-        self._token = token or self.env_config.token
-        if not self._token:
-            self._token = _credstore.load(cred_key)
-        if not self._token:
-            self._token = _jfrog_conf_token(self._base_url)
+        known = ArtifactoryPath._service_tokens
+        if token:
+            # Persist user-supplied tokens once per service, not per derived path.
+            if known.get(cred_key) != token:
+                _credstore.save(cred_key, token)
+                known[cred_key] = token
+            self._token = token
+            self._init_options = {"token": token}
+        else:
+            self._token = self._env_token() or known.get(cred_key)
+            if not self._token:
+                self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._base_url)
+                if self._token:
+                    known[cred_key] = self._token
         if not self._token:
             raise ValueError(
                 "Artifactory token required via 'token' parameter, "
                 "ARTIFACTORY_IDENTITY_TOKEN environment variable, the JFrog CLI config "
                 "(~/.jfrog/jfrog-cli.conf), or a previously cached token (see keyring)."
             )
-        # Promote the resolved token into the class-level cache so derived
-        # instances (parent, /, iterdir children, ...) inherit it without
-        # re-hitting the keyring. Persist only user-supplied tokens.
-        self.env_config.token = self._token
-        if token:
-            _credstore.save(cred_key, token)
         # Cached folder hint — set by iterdir() to avoid redundant API calls
         self._is_folder: bool | None = None
         self._cached_info: dict | None = None
@@ -179,6 +182,19 @@ class ArtifactoryPath(CloudPathMixin):
     # ------------------------------------------------------------------
     # CloudPathMixin hooks
     # ------------------------------------------------------------------
+
+    def _env_token(self) -> str | None:
+        """``ARTIFACTORY_IDENTITY_TOKEN``, only for the service named by
+        ``ARTIFACTORY_BASE_URL`` (or ``ART_BASE_URL``)."""
+        token = self.env_config.token
+        if token and self._ambient_credentials_allowed(
+            self._resolve_base_url_prefix(),
+            self._base_url,
+            credential="ARTIFACTORY_IDENTITY_TOKEN",
+            setting="ARTIFACTORY_BASE_URL",
+        ):
+            return token
+        return None
 
     @property
     def _item_path(self) -> str:
@@ -202,6 +218,11 @@ class ArtifactoryPath(CloudPathMixin):
             "base_url": self._base_url,
             "token": self._token,
         }
+
+    def _identity_parts(self) -> tuple:
+        # Keep cache identity scoped even when the token came from keyring/JFrog.
+        token_fp = hashlib.sha256(self._token.encode()).hexdigest()
+        return (*super()._identity_parts(), self._base_url, token_fp)
 
     # ------------------------------------------------------------------
     # Backend-specific operations
@@ -243,7 +264,7 @@ class ArtifactoryPath(CloudPathMixin):
             options_json=options_json,
             **self._native_kwargs,
         )
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def _storage_info(self) -> dict:
         """Fetch item metadata from the Artifactory storage API (cached).
@@ -308,8 +329,10 @@ class ArtifactoryPath(CloudPathMixin):
         )
         base = str(self).rstrip("/")
         for uri, is_folder in results:
-            child_name = uri.rsplit("/", 1)[-1]
-            yield self._child(f"{base}/{child_name}", _is_folder=is_folder)
+            child_name = uri.rstrip("/").rsplit("/", 1)[-1]
+            child = self._confined_child(f"{base}/{child_name}", _is_folder=is_folder)
+            if child is not None:
+                yield child
 
     async def _list_containers(self) -> list[str] | None:
         """List repositories when at the server root (``art://<host>/artifactory/``).

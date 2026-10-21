@@ -126,6 +126,9 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ssh::ssh_rename, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_resolve_config, m)?)?;
     m.add_function(wrap_pyfunction!(ssh::ssh_disconnect_all, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_known_host, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_scan_host_key, m)?)?;
+    m.add_function(wrap_pyfunction!(ssh::ssh_learn_host_key, m)?)?;
     // Unified
     m.add_function(wrap_pyfunction!(backend::range_read, m)?)?;
     Ok(())

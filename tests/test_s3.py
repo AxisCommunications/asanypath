@@ -436,7 +436,7 @@ def test_spawn_inherits_credentials_and_rebinds_path():
         aws_secret_access_key="SECRET",
     )
     child = parent._spawn("s3://bucket/prefix/child.txt")
-    full = S3Path(
+    full = _make_s3path(
         "s3://bucket/prefix/child.txt",
         aws_region="eu-west-1",
         aws_access_key_id="KEYID",

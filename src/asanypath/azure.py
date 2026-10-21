@@ -39,7 +39,7 @@ from asanypath_native import (
 )
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -136,16 +136,12 @@ class AzurePath(CloudPathMixin):
             or cfg.endpoint_url
             or (f"https://{self._account_name}.blob.core.windows.net")
         )
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, etc.) inherit them.
-        if account_name:
-            cfg.account_name = account_name
-        if account_key:
-            cfg.account_key = account_key
-        if sas_token:
-            cfg.sas_token = sas_token
-        if endpoint_url:
-            cfg.endpoint_url = endpoint_url
+        self._init_options = _explicit(
+            endpoint_url=endpoint_url,
+            account_name=account_name,
+            account_key=account_key,
+            sas_token=sas_token,
+        )
 
         # URL format: az://container/blob/path
         self._container = self._path.host or ""
@@ -231,7 +227,7 @@ class AzurePath(CloudPathMixin):
             options_json=options_json,
             **self._native_kwargs,
         )
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has blobs with this prefix)."""
@@ -315,8 +311,9 @@ class AzurePath(CloudPathMixin):
     async def presign(self, *, expires: int = 3600, method: str = "GET") -> str:
         """Generate a presigned URL for this Azure blob using a Service SAS token.
 
-        Requires account_key to be set. If a SAS token is already configured,
-        returns the blob URL with the existing SAS token appended.
+        The SAS is signed with the account key and scoped to this blob,
+        *method* and *expires*. A configured SAS token is never returned: it is
+        a credential that may grant more than this blob.
 
         Args:
             expires: URL validity in seconds (default 3600).
@@ -324,6 +321,9 @@ class AzurePath(CloudPathMixin):
 
         Returns:
             A presigned URL string.
+
+        Raises:
+            ValueError: If no account key is configured.
         """
         return az_presign(
             endpoint=self._endpoint_url,

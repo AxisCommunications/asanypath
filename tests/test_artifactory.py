@@ -140,7 +140,11 @@ class TestArtifactoryPath(testbase):
                 ArtifactoryPath(art_path())
 
     def test_token_from_env_var(self):
-        with patch.dict("os.environ", {"ARTIFACTORY_IDENTITY_TOKEN": "env-token"}):
+        env = {
+            "ARTIFACTORY_IDENTITY_TOKEN": "env-token",
+            "ARTIFACTORY_BASE_URL": "artifactory.example.com/artifactory",
+        }
+        with patch.dict("os.environ", env):
             p = ArtifactoryPath(art_path())
             assert p._token == "env-token"
 
@@ -351,7 +355,8 @@ def test_art_scheme_dispatch():
     from asanypath import AsAnyPath
 
     path_str = "art://example.com/repo/file.txt"
-    with patch.dict("os.environ", {"ARTIFACTORY_IDENTITY_TOKEN": "token"}):
+    env = {"ARTIFACTORY_IDENTITY_TOKEN": "token", "ARTIFACTORY_BASE_URL": "example.com"}
+    with patch.dict("os.environ", env):
         p = AsAnyPath(path_str)
         assert isinstance(p, ArtifactoryPath)
 

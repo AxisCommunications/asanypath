@@ -287,26 +287,21 @@ class TestAzurePath(testbase):
     async def test_rmdir(self, p):
         # Non-recursive rmdir on non-empty dir raises OSError
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = ["az://container/blob/child.txt"]
+        mock_batcher.list.return_value = [f"{p}/child.txt"]
         with patch.object(AzurePath, "_get_batcher", return_value=mock_batcher):
             with pytest.raises(OSError, match="not empty"):
                 await p.rmdir()
 
     async def test_glob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "az://container/path/file.txt",
-            "az://container/path/other.md",
-        ]
+        mock_batcher.list.return_value = [f"{p.parent}/file.txt", f"{p.parent}/other.md"]
         with patch.object(AzurePath, "_get_batcher", return_value=mock_batcher):
             results = [c async for c in p.parent.glob("*.txt")]
         assert len(results) == 1
 
     async def test_rglob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "az://container/path/file.txt",
-        ]
+        mock_batcher.list.return_value = [f"{p.parent}/file.txt"]
         mock_batcher.exists.return_value = False
         with (
             patch.object(AzurePath, "_get_batcher", return_value=mock_batcher),
@@ -459,14 +454,23 @@ async def test_presign_with_account_key():
 
 
 @pytest.mark.asyncio
-async def test_presign_with_existing_sas():
+async def test_presign_never_returns_the_configured_sas():
     p = _make_azure_path(
         "az://container/blob/file.txt",
         account_key=None,
-        sas_token="sv=2023-11-03&sr=c&sig=abc123",
+        sas_token="sv=2023-11-03&sr=c&sp=rwdl&sig=abc123",
     )
-    url = await p.presign()
-    assert url.endswith("?sv=2023-11-03&sr=c&sig=abc123")
+    with pytest.raises(ValueError, match="SAS token is a credential") as excinfo:
+        await p.presign(expires=60)
+    assert "abc123" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_presign_prefers_account_key_over_configured_sas():
+    p = _make_azure_path("az://container/blob/file.txt", sas_token="sv=x&sp=rwdl&sig=abc123")
+    url = await p.presign(expires=60, method="GET")
+    assert "abc123" not in url
+    assert "sr=b" in url and "sp=r" in url
 
 
 @pytest.mark.asyncio

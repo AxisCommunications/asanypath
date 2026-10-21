@@ -420,7 +420,10 @@ def cloud_path(request):
 class TestCloudPathShared:
     """Test CloudPathMixin concrete methods via real backend instances."""
 
-    def test_home(self, cloud_path):
+    def test_home(self, cloud_path, monkeypatch):
+        # home() is a fresh path on another host; it must not reuse the
+        # fixture's token, so provide an ambient one.
+        monkeypatch.setattr(type(cloud_path), "_env_token", lambda self: "ambient", raising=False)
         h = type(cloud_path).home()
         assert expanduser("~") in h.as_posix()
 
@@ -808,11 +811,9 @@ class TestIterdirCache:
         # Pre-populate cache with a recent entry
         import time
 
-        cache_key = p._listing_cache_key()
-        type(p)._listing_cache[cache_key] = (
-            time.monotonic(),
-            ["s3://bucket/a.txt", "s3://bucket/b.txt"],
-        )
+        type(p)._listing_cache[str(p)] = {
+            p._identity_fingerprint(): (time.monotonic(), [f"{p}/a.txt", f"{p}/b.txt"])
+        }
         results = [child async for child in p.iterdir()]
         assert len(results) == 2
         assert results[0].name == "a.txt"

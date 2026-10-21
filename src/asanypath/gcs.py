@@ -44,7 +44,7 @@ from asanypath_native import (
 )
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     GCS_CHUNK_ALIGN,
     UPLOAD_CHUNK_SIZE,
@@ -106,16 +106,12 @@ class GCSPath(CloudPathMixin):
         self._credentials_path = credentials_path or cfg.credentials_path
         self._access_token = access_token or cfg.access_token
         self._endpoint_url = endpoint_url or cfg.endpoint_url
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, etc.) inherit them.
-        if project_id:
-            cfg.project_id = project_id
-        if credentials_path:
-            cfg.credentials_path = credentials_path
-        if access_token:
-            cfg.access_token = access_token
-        if endpoint_url:
-            cfg.endpoint_url = endpoint_url
+        self._init_options = _explicit(
+            endpoint_url=endpoint_url,
+            project_id=project_id,
+            credentials_path=credentials_path,
+            access_token=access_token,
+        )
 
         # URL format: gs://bucket/object/path
         self._bucket = self._path.host or ""
@@ -185,7 +181,7 @@ class GCSPath(CloudPathMixin):
             offset += len(chunk)
 
         await upload_parts(fileobj, size, part_size, upload, parallel=False)
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has objects with this prefix)."""

@@ -52,8 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import hashlib
 import netrc
-import sys
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
@@ -64,7 +64,8 @@ from typing import IO, TYPE_CHECKING, TypeVar, cast
 import aioftp
 from yarl import URL
 
-from asanypath.cloud import CloudPathMixin
+from asanypath._prompt import interactive as _interactive
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -97,16 +98,6 @@ def disconnect_all() -> None:
 
 
 _UNSET = object()
-
-
-def _interactive() -> bool:
-    """Whether the backend may prompt the user for credentials."""
-    if getenv("ASANYPATH_INTERACTIVE") == "0":
-        return False
-    try:
-        return sys.stdin.isatty()
-    except (AttributeError, ValueError):  # pragma: no cover
-        return False  # pragma: no cover
 
 
 async def _prompt_password(label: str) -> str:
@@ -159,6 +150,7 @@ class FTPPath(CloudPathMixin):
     """Async FTP path backed by :mod:`aioftp`."""
 
     protocol: str = "ftp"
+    _options_bound_to_authority = True
     _tls: bool = False
     _default_port: int = 21
     _supports_range_read: bool = False
@@ -200,14 +192,9 @@ class FTPPath(CloudPathMixin):
             # the interactive prompt can supply one.
             self._password = None
         self._account = account if account is not None else netrc_account
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, ...) inherit them.
-        if host:
-            cfg.host = host
-        if port:
-            cfg.port = port
-        if username:
-            cfg.user = username
+        self._init_options = _explicit(
+            host=host, port=port, username=username, password=password, account=account
+        )
 
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
@@ -236,7 +223,10 @@ class FTPPath(CloudPathMixin):
 
     @property
     def _client_key(self) -> tuple:
-        return (self._host, self._port, self._user, self._tls)
+        # Pooled sessions are already logged in, so only callers presenting
+        # the same credentials may share one.
+        secret = repr((self._password, self._account)).encode()
+        return (self._host, self._port, self._user, self._tls, hashlib.sha256(secret).hexdigest())
 
     async def _ensure_client(self) -> aioftp.Client:
         key = self._client_key
@@ -521,7 +511,9 @@ class FTPPath(CloudPathMixin):
         except aioftp.StatusCodeError as e:
             raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
         for entry_path, _info in entries:
-            yield self._child(str(self._path / entry_path.name))
+            child = self._confined_child(str(self._path / entry_path.name))
+            if child is not None:
+                yield child
 
     async def walk(
         self,

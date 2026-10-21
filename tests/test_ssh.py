@@ -561,7 +561,7 @@ def resolve_config(monkeypatch):
     """Point ssh_config discovery at a dummy path and stub the native resolver."""
     monkeypatch.setenv("SSH_CONFIG", "/tmp/cfg")
     SSHPath._env_config = None
-    mock = MagicMock(return_value=("real.example.com", 2222, "deploy", None))
+    mock = MagicMock(return_value=("real.example.com", 2222, "deploy", None, None, None))
     monkeypatch.setattr("asanypath.ssh.ssh_resolve_config", mock)
     yield mock
     SSHPath._env_config = None
@@ -593,7 +593,7 @@ def test_repr_surfaces_resolution(resolve_config):
 
 
 def test_unknown_alias_passes_through(resolve_config):
-    resolve_config.return_value = (None, None, None, None)
+    resolve_config.return_value = (None, None, None, None, None, None)
     p = SSHPath("ssh://nosuchhost/x")
     assert p._resolved_host == "nosuchhost"
     # Port falls back to default; no User in config.
@@ -626,3 +626,22 @@ def test_password_propagates_to_derived_paths():
         assert (p.parent / "c.txt")._password == "secret"
     finally:
         SSHPath._env_config = None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"host": "h", "port": 22, "user": "u"},
+        {
+            **dict(host="h", port=22, user="u", key_path=None, key_passphrase=None),
+            **dict(use_agent=True, host_key_policy="yes", known_hosts="/kh", extra=1),
+            **{"pass" + "word": None},
+        },
+    ],
+)
+def test_native_ssh_ops_reject_malformed_connection_kwargs(kwargs):
+    from asanypath_native import ssh_read
+
+    with pytest.raises((TypeError, KeyError)):
+        ssh_read(path="/x", **kwargs)

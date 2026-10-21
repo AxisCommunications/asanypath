@@ -302,10 +302,7 @@ class TestGCSPath(testbase):
 
     async def test_glob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "gs://bucket/path/file.txt",
-            "gs://bucket/path/other.md",
-        ]
+        mock_batcher.list.return_value = [f"{p.parent}/file.txt", f"{p.parent}/other.md"]
         with (
             patch.object(GCSPath, "_get_batcher", return_value=mock_batcher),
             patch("asanypath.gcs.gcs_is_dir", new=AsyncMock(return_value=False)),
@@ -315,9 +312,7 @@ class TestGCSPath(testbase):
 
     async def test_rglob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "gs://bucket/path/file.txt",
-        ]
+        mock_batcher.list.return_value = [f"{p.parent}/file.txt"]
         mock_batcher.exists.return_value = False
         with (
             patch.object(GCSPath, "_get_batcher", return_value=mock_batcher),

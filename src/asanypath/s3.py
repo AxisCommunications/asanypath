@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -37,7 +38,7 @@ from asanypath_native import (
 from yarl import URL
 
 from asanypath._transfer import upload_parts
-from asanypath.cloud import CloudPathMixin
+from asanypath.cloud import CloudPathMixin, _explicit
 from asanypath.options import (
     S3_MIN_PART_SIZE,
     UPLOAD_CHUNK_SIZE,
@@ -110,20 +111,14 @@ class S3Path(CloudPathMixin):
         self._secret_key = aws_secret_access_key or cfg.aws_secret_access_key
         self._session_token = aws_session_token or cfg.aws_session_token
         self._bucket = cast(URL, self._path)._netloc
-        # Promote explicit params into class cache so derived instances
-        # (parent, /, with_name, etc.) inherit them.
-        if endpoint_url:
-            cfg.endpoint_url = endpoint_url
-        if aws_region:
-            cfg.aws_region = aws_region
-        if aws_access_key_id:
-            cfg.aws_access_key_id = aws_access_key_id
-        if aws_secret_access_key:
-            cfg.aws_secret_access_key = aws_secret_access_key
-        if aws_session_token:
-            cfg.aws_session_token = aws_session_token
-        if profile:
-            cfg.profile = profile
+        self._init_options = _explicit(
+            endpoint_url=endpoint_url,
+            aws_region=aws_region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            profile=profile,
+        )
 
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
@@ -137,9 +132,22 @@ class S3Path(CloudPathMixin):
             profile=None,
         )
 
+    # AWS settings that pick the default credentials when none are explicit.
+    # The native layer caches the resolved AWS config per profile, so only
+    # AWS_PROFILE can switch identity after a path's first request.
+    _IDENTITY_ENV = ("AWS_PROFILE",)
+    _IDENTITY_ENV_AT_FIRST_USE = ("AWS_ACCESS_KEY_ID", "AWS_ROLE_ARN", "AWS_ENDPOINT_URL")
+
     # ------------------------------------------------------------------
     # CloudPathMixin hooks
     # ------------------------------------------------------------------
+
+    def _identity_env(self) -> tuple:
+        return tuple(map(os.environ.get, self._IDENTITY_ENV))
+
+    def _identity_parts(self) -> tuple:
+        env = tuple(map(os.environ.get, self._IDENTITY_ENV_AT_FIRST_USE))
+        return (*super()._identity_parts(), env)
 
     @property
     def _item_path(self) -> str:
@@ -245,7 +253,7 @@ class S3Path(CloudPathMixin):
                 except Exception:
                     logging.getLogger(__name__).exception("Failed to abort S3 multipart upload")
             raise
-        type(self)._listing_cache.pop(self._listing_cache_key(), None)
+        self._invalidate_listing()
 
     async def is_dir(self) -> bool:
         """Check if path is a directorish."""

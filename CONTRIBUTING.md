@@ -36,7 +36,7 @@ document new configuration, credentials, or backend behavior in the README.
 
 Do not include credentials, private endpoints, customer data, or other
 confidential information in issues, commits, tests, or pull requests. Report
-security issues privately as described in [SECURITY.md](SECURITY.md).
+security issues privately as described in the [security policy](https://github.com/AxisCommunications/asanypath/security/policy).
 
 By contributing, you agree that your contributions are licensed under the
 [MIT License](LICENSE).
