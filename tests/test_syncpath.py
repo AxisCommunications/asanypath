@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from asanypath import AccessPolicyPatch, SyncPath
+from asanypath.s3 import S3Path
+from asanypath.sync import _SyncProxy
 from tests.conftest import classtest_factory
 
 testbase = classtest_factory("_TestSyncPath", SyncPath)
@@ -229,6 +231,25 @@ class TestSyncPath(testbase):
         result = p.relative_to("testdir")
         assert result == SyncPath("nested/file.txt")
         assert isinstance(result, SyncPath)
+
+    def test_relative_to_remote_path_raises_value_error(self, p):
+        remote = S3Path(
+            "s3://testdir/nested",
+            endpoint_url="https://s3.amazonaws.com",
+            aws_region="us-east-1",
+            aws_access_key_id="AKID",
+            aws_secret_access_key="SECRET",
+        )
+        for other in (remote, _SyncProxy(remote)):
+            with pytest.raises(ValueError, match="is not in the subpath"):
+                p.relative_to(other)
+            assert p.is_relative_to(other) is False
+
+    def test_relative_to_non_path_raises_type_error(self, p):
+        with pytest.raises(TypeError):
+            p.relative_to(123)
+        with pytest.raises(TypeError):
+            p.is_relative_to(123)
 
     def test_rename(self, tmp):
         f = tmp / "file.txt"

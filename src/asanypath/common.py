@@ -346,11 +346,23 @@ class CommonPurePathMixin:
         """Return the part of this path below *other* as a relative path.
 
         Remote paths are compared segment by segment below the same scheme and
-        bucket/host, so ``s3://b/ab`` is not relative to ``s3://b/a``.
+        bucket/host, so ``s3://b/ab`` is not relative to ``s3://b/a``. As in
+        pathlib, a path that is not below *other* raises ``ValueError`` (also for
+        another backend: a different anchor) and a non-path raises ``TypeError``.
         """
-        if self.protocol == "file":
-            return self._path.relative_to(other)
+        from asanypath.sync import _SyncProxy
+
+        if isinstance(other, _SyncProxy):
+            other = other._async
+        if not isinstance(other, (str, PathLike)):
+            raise TypeError(
+                f"argument should be a str or an os.PathLike object, not {type(other).__name__!r}"
+            )
         error = ValueError(f"{self} is not in the subpath of {other}")
+        if self.protocol == "file":
+            if isinstance(other, CommonPurePathMixin) and other.protocol != "file":
+                raise error  # a remote path has no os.fspath() for pathlib to compare
+            return self._path.relative_to(other)
         base = str(other)
         if not base.lower().startswith(self.protocol + SCHEME_SEP):
             raise error  # relative, or another protocol
