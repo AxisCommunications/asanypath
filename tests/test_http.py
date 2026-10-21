@@ -452,10 +452,82 @@ async def test_not_implemented(method, args):
             await coro_or_gen
 
 
-def test_open_not_implemented():
+@pytest.mark.parametrize("path_type", [HTTPPath, HTTPSPath])
+@pytest.mark.parametrize("mode", ["rb", "br"])
+async def test_open_binary(path_type, mode):
+    p = path_type(f"{path_type.protocol}://example.com/model.pyth?signature=abc%2F123")
+    get = AsyncMock(return_value=b"\x00model\xff")
+    with patch(f"{_HTTP_NATIVE}.http_get", get):
+        async with p.open(mode, buffering=2) as f:
+            assert f.read(2) == b"\x00m"
+            assert f.seekable()
+            f.seek(-1, 2)
+            assert f.tell() == 6
+            assert f.read() == b"\xff"
+        assert f.closed
+    get.assert_awaited_once_with(str(p), headers=p._merge_headers(None))
+
+
+@pytest.mark.parametrize("mode", ["r", "rt", "tr"])
+async def test_open_text(mode):
     p = _hp()
-    with pytest.raises(NotImplementedError, match="does not support open"):
-        p.open()
+    with patch(f"{_HTTP_NATIVE}.http_get", AsyncMock(return_value=b"caf\xe9\r\nnext\rline\xff")):
+        async with p.open(mode, encoding="ascii", errors="replace", newline="") as f:
+            assert f.readline() == "caf\ufffd\r\n"
+        assert f.closed
+        async with p.open(mode, encoding="latin-1") as f:
+            assert f.read() == "caf\xe9\nnext\nline\xff"
+
+
+@pytest.mark.parametrize("mode", ["w", "wb", "a", "ab", "x", "r+", "rb+", "", "rr", "rbt"])
+def test_open_rejects_unsupported_modes(mode):
+    with pytest.raises(ValueError, match="only read modes"):
+        _hp().open(mode)
+
+
+@pytest.mark.parametrize("keyword", ["encoding", "errors", "newline"])
+def test_open_binary_rejects_text_arguments(keyword):
+    with pytest.raises(ValueError, match="binary mode"):
+        _hp().open("rb", **{keyword: "utf-8"})
+
+
+def test_open_rejects_unbuffered_text():
+    with pytest.raises(ValueError, match="unbuffered text"):
+        _hp().open("r", buffering=0)
+
+
+async def test_open_propagates_download_error():
+    with patch(f"{_HTTP_NATIVE}.http_get", AsyncMock(side_effect=PermissionError("HTTP 403"))):
+        with pytest.raises(PermissionError, match="403"):
+            async with _hp().open("rb"):
+                pytest.fail("open must not succeed")
+
+
+async def test_open_closes_on_error():
+    with patch(f"{_HTTP_NATIVE}.http_get", AsyncMock(return_value=b"data")):
+        with pytest.raises(RuntimeError, match="consumer error"):
+            async with _hp().open("rb") as f:
+                raise RuntimeError("consumer error")
+        assert f.closed
+
+
+async def test_open_get_only_server(_head_forbidden_server, monkeypatch):
+    from asanypath import AsAnyPath
+
+    for name in ("HTTP_AUTH_USER", "HTTP_AUTH_PASSWORD", "HTTP_AUTH_TOKEN", "HTTP_AUTH_HEADER"):
+        monkeypatch.delenv(name, raising=False)
+    async with AsAnyPath(_head_forbidden_server).open("rb", buffering=2) as f:
+        assert f.read() == b"hello"
+
+
+def test_sync_open_get_only_server(_head_forbidden_server):
+    from asanypath.sync import AsAnyPath
+
+    with AsAnyPath(_head_forbidden_server).open("rb", buffering=0) as f:
+        assert f.read(2) == b"he"
+        f.seek(0)
+        assert f.read() == b"hello"
+    assert f.closed
 
 
 # ---------------------------------------------------------------------------

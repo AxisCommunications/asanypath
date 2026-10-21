@@ -29,7 +29,7 @@ from asanypath_native import (
 from yarl import URL
 
 from asanypath._transfer import RangeNotSupportedError
-from asanypath.cloud import CloudPathMixin, _service_origin
+from asanypath.cloud import CloudPathMixin, _CloudFile, _service_origin
 
 logger = logging.getLogger(__name__)
 
@@ -442,7 +442,18 @@ class HTTPPath(CloudPathMixin):
         raise NotImplementedError
 
     def open(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
-        raise NotImplementedError(f"{type(self).__name__} does not support open()")
+        """Open a seekable read-only handle with sync or async context management.
+
+        Downloads the response on context entry using read_bytes(), including
+        its authentication and cache settings. No HEAD or range support is required.
+        """
+        if mode not in ("r", "rt", "tr", "rb", "br"):
+            raise ValueError("HTTPPath.open() supports only read modes ('r', 'rt', 'rb')")
+        if "b" in mode and any(value is not None for value in (encoding, errors, newline)):
+            raise ValueError("binary mode doesn't take an encoding, errors or newline argument")
+        if buffering == 0 and "b" not in mode:
+            raise ValueError("can't have unbuffered text I/O")
+        return _CloudFile(self, mode, buffering, encoding, errors, newline, range_read=False)
 
     async def _read_bytes_uncached(self) -> bytes:
         return await http_get(str(self), headers=self._merge_headers(None))
