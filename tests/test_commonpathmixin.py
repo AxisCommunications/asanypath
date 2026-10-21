@@ -6,6 +6,7 @@
 
 """Test CommonPurePathMixin shared path operations across all backends."""
 
+from pathlib import PurePosixPath
 from unittest.mock import patch
 
 import pytest
@@ -279,11 +280,52 @@ class TestCommonPurePath:
         p, factory = path_and_factory
         assert not p.is_relative_to(f"{p.protocol}://totally/different")
 
-    def test_relative_to(self, path_and_factory, ambient_token):
-        p, factory = path_and_factory
-        parent = p.parent
-        rel = p.relative_to(str(parent))
-        assert p.name in str(rel)
+    def test_relative_to(self, path_and_factory):
+        p, _ = path_and_factory
+        rel = p.relative_to(str(p.parent))
+        assert rel == PurePosixPath(p.name)
+        assert isinstance(rel, PurePosixPath)
+        assert p.relative_to(str(p.parent.parent)) == PurePosixPath(*p.parts[-2:])
+        assert p.relative_to(str(p)) == PurePosixPath(".")
+
+    def test_relative_to_path_object(self, path_and_factory):
+        p, _ = path_and_factory
+        assert p.relative_to(p.parent) == PurePosixPath(p.name)
+
+    def test_relative_to_joins_back(self, path_and_factory):
+        p, _ = path_and_factory
+        assert p.parent.parent / p.relative_to(p.parent.parent) == p
+
+    def test_relative_to_respects_segment_boundary(self, path_and_factory):
+        p, _ = path_and_factory
+        prefix = str(p.parent)[:-1]  # e.g. s3://bucket/neste
+        assert not p.is_relative_to(prefix)
+        with pytest.raises(ValueError, match="is not in the subpath"):
+            p.relative_to(prefix)
+
+    def test_relative_to_walk_up(self, path_and_factory):
+        p, _ = path_and_factory
+        sibling = str(p.parent / "sibling")
+        with pytest.raises(ValueError, match="is not in the subpath"):
+            p.relative_to(sibling)
+        assert p.relative_to(sibling, walk_up=True) == PurePosixPath("..", p.name)
+
+    def test_relative_to_other_anchor_raises(self, path_and_factory):
+        p, _ = path_and_factory
+        other_root = f"{p.protocol}://other-{p.parts[1]}/{p.name}"
+        with pytest.raises(ValueError, match="is not in the subpath"):
+            p.relative_to(other_root, walk_up=True)
+
+    def test_relative_to_relative_other_raises(self, path_and_factory):
+        p, _ = path_and_factory
+        with pytest.raises(ValueError, match="is not in the subpath"):
+            p.relative_to(p.name)
+
+    def test_truediv_relative_purepath(self, path_and_factory):
+        p, _ = path_and_factory
+        assert p.parent / PurePosixPath("a/b.txt") == p.parent / "a/b.txt"
+        with pytest.raises(UnsupportedProtocolError):
+            p / PurePosixPath("/abs/path")
 
     def test_relative_to_raises(self, path_and_factory):
         p, _ = path_and_factory
