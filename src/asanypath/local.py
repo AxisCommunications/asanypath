@@ -34,7 +34,7 @@ from asanypath._transfer import (
     run_transfer_sync,
     sync_destination_state,
 )
-from asanypath.common import CommonPurePathMixin
+from asanypath.common import CommonPurePathMixin, DirEntry
 from asanypath.options import (
     AccessAction,
     AccessGrant,
@@ -52,6 +52,30 @@ _SYNC_THRESHOLD = 1 * 1024 * 1024
 # unlike the cloud backends whose CommonPurePathMixin stores a yarl URL.
 S: typing.TypeAlias = "SyncPath"
 T: typing.TypeAlias = "AsyncPath"
+
+
+def _scan_local(path: Path, stat: bool, cast: Callable[[Path], typing.Any]) -> list[DirEntry]:
+    """List *path* in one ``os.scandir`` pass; ``d_type`` gives ``is_dir`` for free."""
+    entries = []
+    with os.scandir(path) as it:
+        for e in it:
+            try:
+                is_dir = e.is_dir()
+            except OSError:
+                is_dir = False
+            try:
+                st = e.stat() if stat else None
+            except OSError:
+                st = None
+            entries.append(
+                DirEntry(
+                    cast(Path(e.path)),
+                    is_dir,
+                    st.st_size if st else None,
+                    st.st_mtime if st else None,
+                )
+            )
+    return entries
 
 
 async def _local_copy_file_async(
@@ -182,6 +206,9 @@ class SyncPath(CommonPurePathMixin):
     def iterdir(self) -> Generator[S]:
         for entry in self._path.iterdir():
             yield self._cast(entry)
+
+    def scandir(self, *, stat: bool = False) -> Generator[DirEntry]:  # type: ignore[override]
+        yield from _scan_local(self._path, stat, self._cast)
 
     def glob(self, *args, **kwargs) -> Generator[S]:
         for item in self._path.glob(*args, **kwargs):
@@ -540,6 +567,9 @@ class AsyncPath(CommonPurePathMixin, AnyIOPath):
     async def iterdir(self) -> AsyncGenerator[T]:
         for entry in self._path.iterdir():
             yield self._cast(entry)
+
+    async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:
+        return await to_thread.run_sync(_scan_local, self._path, stat, self._cast)
 
     async def glob(self, *args, **kwargs) -> AsyncGenerator[T]:
         for item in self._path.glob(*args, **kwargs):

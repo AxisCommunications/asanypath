@@ -16,6 +16,7 @@ use pyo3::prelude::*;
 pub mod backend;
 pub mod cache;
 pub mod http;
+pub mod listing;
 pub mod xml;
 
 pub mod artifactory;
@@ -48,7 +49,6 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(s3::s3_abort_multipart, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_exists_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(s3::s3_is_dir_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_copy_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_list_buckets, m)?)?;
     // GCS
@@ -66,7 +66,6 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gcs::gcs_upload_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_exists_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(gcs::gcs_is_dir_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_copy_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_list_buckets, m)?)?;
     // Azure
@@ -83,7 +82,6 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(azure::az_put_block_list, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_delete_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_exists_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(azure::az_is_dir_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_copy_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_list_containers, m)?)?;
     // Artifactory

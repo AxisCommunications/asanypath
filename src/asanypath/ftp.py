@@ -66,6 +66,7 @@ from yarl import URL
 
 from asanypath._prompt import interactive as _interactive
 from asanypath.cloud import CloudPathMixin, _explicit
+from asanypath.common import DirEntry
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -500,20 +501,33 @@ class FTPPath(CloudPathMixin):
             return
         await self.write_bytes(b"")
 
-    async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
+    async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:
         path = self._item_path
 
         async def _collect(client: aioftp.Client) -> list:
             return [item async for item in client.list(path)]
 
         try:
-            entries = await self._op(_collect)
+            listing = await self._op(_collect)
         except aioftp.StatusCodeError as e:
             raise NotADirectoryError(20, f"Not a directory: '{self}'") from e
-        for entry_path, _info in entries:
+        entries = []
+        for entry_path, info in listing:
             child = self._confined_child(str(self._path / entry_path.name))
-            if child is not None:
-                yield child
+            if child is None:
+                continue
+            kind = info.get("type")
+            size = info.get("size")
+            entries.append(
+                DirEntry(
+                    child,
+                    # Links and unknown types are resolved by a probe.
+                    {"dir": True, "file": False}.get(kind),
+                    int(size) if size is not None else None,
+                    _parse_mlst_mtime(info.get("modify")),
+                )
+            )
+        return entries
 
     async def walk(
         self,
@@ -521,26 +535,15 @@ class FTPPath(CloudPathMixin):
         on_error=None,
         follow_symlinks: bool = False,
     ) -> AsyncIterator[tuple[Self, list[str], list[str]]]:
-        path = self._item_path
-
-        async def _collect(client: aioftp.Client) -> list:
-            return [item async for item in client.list(path)]
-
         try:
-            entries = await self._op(_collect)
-        except aioftp.StatusCodeError as e:
+            entries = await self._list_entries()
+        except NotADirectoryError as e:
             if on_error is not None:
                 on_error(e)
                 return
             raise
-        dirs: list[Self] = []
-        files: list[Self] = []
-        for entry_path, info in entries:
-            child = self / entry_path.name
-            if info.get("type") == "dir":
-                dirs.append(child)
-            else:
-                files.append(child)
+        dirs = [entry.path for entry in entries if entry.is_dir]
+        files = [entry.path for entry in entries if not entry.is_dir]
         if top_down:
             yield self, [d.name for d in dirs], [f.name for f in files]
         for d in dirs:

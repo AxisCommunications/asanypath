@@ -21,9 +21,9 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashSet;
 
 use crate::http::{do_request, do_request_light, status_to_pyerr};
+use crate::listing::{ListEntry, Listing};
 use crate::xml::local_name;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -428,16 +428,9 @@ async fn do_az_is_dir(creds: &AzCreds, prefix: &str, use_h2: bool) -> Result<boo
     Ok(false)
 }
 
-async fn do_az_list(creds: &AzCreds, prefix: &str, use_h2: bool) -> Result<Vec<String>, PyErr> {
-    let current_key = prefix.trim_matches('/').to_string();
-    let search_prefix = if current_key.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", current_key)
-    };
-
-    let mut found_all = HashSet::new();
-    let mut uris = Vec::new();
+async fn do_az_list(creds: &AzCreds, prefix: &str, use_h2: bool) -> Result<Vec<ListEntry>, PyErr> {
+    let mut listing = Listing::new(format!("az://{}", creds.container), prefix);
+    let search_prefix = listing.search_prefix().to_string();
     let mut marker: Option<String> = None;
 
     loop {
@@ -464,100 +457,68 @@ async fn do_az_list(creds: &AzCreds, prefix: &str, use_h2: bool) -> Result<Vec<S
                 &body,
             ));
         }
-
-        // Parse XML
-        let mut reader = Reader::from_reader(body.as_ref());
-        reader.config_mut().trim_text(true);
-        let mut buf = Vec::new();
-        let mut next_marker: Option<String> = None;
-        let mut in_blob_prefix = false;
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
-                    let name = e.name();
-                    let tag = local_name(name.as_ref());
-                    match tag {
-                        "BlobPrefix" => {
-                            in_blob_prefix = true;
-                        }
-                        "Name" => {
-                            let text = reader
-                                .read_text(e.name())
-                                .ok()
-                                .map(|text| text.xml10_content().into_owned())
-                                .unwrap_or_default();
-                            if in_blob_prefix {
-                                let value = text.trim_end_matches('/').to_string();
-                                if !value.is_empty()
-                                    && value != current_key
-                                    && found_all.insert(value.clone())
-                                {
-                                    uris.push(format!("az://{}/{}", creds.container, value));
-                                }
-                            } else {
-                                // Regular blob
-                                let name = &text;
-                                if name.is_empty() || name.trim_end_matches('/') == current_key {
-                                    // skip
-                                } else {
-                                    let relative = if !search_prefix.is_empty()
-                                        && name.starts_with(&search_prefix)
-                                    {
-                                        &name[search_prefix.len()..]
-                                    } else {
-                                        name.as_str()
-                                    };
-                                    let relative = relative.trim_start_matches('/');
-                                    let resolved = if !relative.is_empty() {
-                                        let first = relative.split('/').next().unwrap_or(relative);
-                                        format!("{}{}", search_prefix, first)
-                                    } else {
-                                        name.to_string()
-                                    };
-                                    let value = resolved.trim_end_matches('/').to_string();
-                                    if !value.is_empty()
-                                        && value != current_key
-                                        && found_all.insert(value.clone())
-                                    {
-                                        uris.push(format!("az://{}/{}", creds.container, value));
-                                    }
-                                }
-                            }
-                        }
-                        "NextMarker" => {
-                            let text = reader
-                                .read_text(e.name())
-                                .ok()
-                                .map(|text| text.xml10_content().into_owned())
-                                .unwrap_or_default();
-                            if !text.is_empty() {
-                                next_marker = Some(text);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Event::End(ref e)) => {
-                    let name = e.name();
-                    if local_name(name.as_ref()) == "BlobPrefix" {
-                        in_blob_prefix = false;
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            buf.clear();
-        }
-
-        marker = next_marker;
+        marker = parse_az_listing_page(&body, &mut listing);
         if marker.is_none() {
             break;
         }
     }
 
-    Ok(uris)
+    Ok(listing.finish())
+}
+
+fn parse_az_listing_page(body: &[u8], listing: &mut Listing) -> Option<String> {
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut text = String::new();
+    let mut in_blob = false;
+    let mut in_prefix = false;
+    let mut name = String::new();
+    let mut size = None;
+    let mut modified = None;
+    let mut next_marker = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let tag = e.name();
+                match local_name(tag.as_ref()) {
+                    "Blob" => {
+                        in_blob = true;
+                        name.clear();
+                        size = None;
+                        modified = None;
+                    }
+                    "BlobPrefix" => in_prefix = true,
+                    _ => {}
+                }
+                text.clear();
+            }
+            Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+            Ok(Event::End(e)) => {
+                let tag = e.name();
+                match local_name(tag.as_ref()) {
+                    "Name" if in_prefix => listing.add_prefix(&text),
+                    "Name" if in_blob => name = std::mem::take(&mut text),
+                    "Content-Length" if in_blob => size = text.parse().ok(),
+                    "Last-Modified" if in_blob => modified = Some(std::mem::take(&mut text)),
+                    "Blob" => {
+                        in_blob = false;
+                        listing.add_object(&name, size, modified.take());
+                    }
+                    "BlobPrefix" => in_prefix = false,
+                    "NextMarker" if !text.is_empty() => {
+                        next_marker = Some(std::mem::take(&mut text));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    next_marker
 }
 
 /// List all containers in the account (GET /?comp=list). Returns bare names.
@@ -1096,33 +1057,6 @@ pub fn az_exists_batch<'py>(
     })
 }
 
-#[pyfunction]
-pub fn az_is_dir_batch<'py>(
-    py: Python<'py>,
-    endpoint: String,
-    container: String,
-    prefixes: Vec<String>,
-    account_name: String,
-    account_key: Option<String>,
-    sas_token: Option<String>,
-    use_h2: Option<bool>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let h2 = use_h2.unwrap_or(false);
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let creds = az_creds!(endpoint, container, account_name, account_key, sas_token);
-        let futs: Vec<_> = prefixes
-            .iter()
-            .map(|p| do_az_is_dir(&creds, p, h2))
-            .collect();
-        let results = join_all(futs).await;
-        let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            out.push(r?);
-        }
-        Ok(out)
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Presigned URL generation (Service SAS)
 // ---------------------------------------------------------------------------
@@ -1225,4 +1159,35 @@ fn format_iso8601(secs: u64) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Listing, parse_az_listing_page};
+
+    #[test]
+    fn parses_listing_page_metadata() {
+        let body = br#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ContainerName="c"><Prefix>dir/</Prefix><Blobs>
+  <Blob><Name>dir/a.txt</Name><Properties>
+    <Last-Modified>Tue, 02 Jan 2024 03:04:05 GMT</Last-Modified>
+    <Content-Length>42</Content-Length>
+  </Properties></Blob>
+  <BlobPrefix><Name>dir/sub/</Name></BlobPrefix>
+</Blobs><NextMarker /></EnumerationResults>"#;
+        let mut listing = Listing::new("az://c".into(), "dir");
+        assert_eq!(parse_az_listing_page(body, &mut listing), None);
+        assert_eq!(
+            listing.finish(),
+            vec![
+                (
+                    "az://c/dir/a.txt".into(),
+                    false,
+                    Some(42),
+                    Some("Tue, 02 Jan 2024 03:04:05 GMT".into())
+                ),
+                ("az://c/dir/sub".into(), true, None, None),
+            ]
+        );
+    }
 }

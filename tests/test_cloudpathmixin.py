@@ -15,6 +15,7 @@ import pytest
 from asanypath.artifactory import ArtifactoryPath
 from asanypath.azure import AzurePath
 from asanypath.cloud import CloudPathMixin, _CloudFile, _CloudRawIO
+from asanypath.common import DirEntry
 from asanypath.gcs import GCSPath
 from asanypath.options import AccessPolicyPatch, BackendOptions
 from asanypath.s3 import S3Path
@@ -812,11 +813,21 @@ class TestIterdirCache:
         import time
 
         type(p)._listing_cache[str(p)] = {
-            p._identity_fingerprint(): (time.monotonic(), [f"{p}/a.txt", f"{p}/b.txt"])
+            p._identity_fingerprint(): (
+                time.monotonic(),
+                [
+                    (f"{p}/a.txt", False, 3, "2024-01-02T03:04:05.000Z"),
+                    (f"{p}/b", True, None, None),
+                ],
+            )
         }
         results = [child async for child in p.iterdir()]
         assert len(results) == 2
         assert results[0].name == "a.txt"
+        entries = [e async for e in p.scandir(stat=True)]
+        assert entries[0].is_dir is False and entries[0].size == 3
+        assert entries[0].mtime == 1704164645.0
+        assert entries[1].is_dir is True and entries[1].size is None
         # Clean up
         type(p)._listing_cache.clear()
 
@@ -875,8 +886,8 @@ class TestRglob:
 
 
 class TestWalk:
-    async def test_walk_without_batch_fn(self):
-        """walk() falls back to asyncio.gather(is_dir()) when _is_dir_batch_fn is None."""
+    async def test_walk_probes_unclassified_entries(self):
+        """walk() falls back to is_dir() for entries the listing left unclassified."""
         p = _make_s3()
         child = _make_s3()
         child._path = S3Path(
@@ -886,24 +897,21 @@ class TestWalk:
             aws_access_key_id="AKID",
             aws_secret_access_key="SECRET",
         )._path
+        is_dir = AsyncMock(return_value=False)
 
-        async def fake_iterdir(self_inner, **kw):
-            yield child
+        async def fake_list_entries(self_inner, **kw):
+            return [DirEntry(child)]
 
-        old_batch_fn = type(p)._is_dir_batch_fn
-        type(p)._is_dir_batch_fn = None
-        try:
-            with (
-                patch.object(type(p), "iterdir", fake_iterdir),
-                patch.object(child, "is_dir", new=AsyncMock(return_value=False)),
-            ):
-                results = [r async for r in p.walk()]
-            assert len(results) == 1
-            root, dirs, files = results[0]
-            assert len(files) == 1
-            assert len(dirs) == 0
-        finally:
-            type(p)._is_dir_batch_fn = old_batch_fn
+        with (
+            patch.object(type(p), "_list_entries", fake_list_entries),
+            patch.object(child, "is_dir", new=is_dir),
+        ):
+            results = [r async for r in p.walk()]
+        assert len(results) == 1
+        root, dirs, files = results[0]
+        assert files == ["child.txt"]
+        assert dirs == []
+        is_dir.assert_awaited_once()
 
 
 class TestCloudTextIO:

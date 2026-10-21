@@ -44,8 +44,8 @@ from asanypath._transfer import (
     require_force,
     run_transfer_async,
 )
-from asanypath.batcher import H2_BATCH_THRESHOLD, MicroBatcher, make_batcher
-from asanypath.common import SCHEME_SEP, CommonPurePathMixin
+from asanypath.batcher import MicroBatcher, make_batcher
+from asanypath.common import SCHEME_SEP, CommonPurePathMixin, DirEntry, parse_listing_mtime
 from asanypath.options import SPOOL_MAX_SIZE, AccessPolicy, AccessPolicyPatch, BackendOptions
 
 logger = logging.getLogger(__name__)
@@ -97,21 +97,16 @@ class CloudPathMixin(CommonPurePathMixin):
       ``**_native_kwargs``.
     - ``_batcher_ops`` — dict describing batch operations (passed to
       :func:`make_batcher`).
-
-    Optionally, set the class attribute ``_is_dir_batch_fn`` to a native
-    batch-is-dir coroutine (e.g. ``s3_is_dir_batch``) for an efficient
-    ``walk()`` implementation.  If not set, ``walk()`` falls back to
-    per-entry ``is_dir()`` calls via ``asyncio.gather``.
     """
 
     protocol: str = "cloud"  # Default protocol, should be overridden by subclasses
 
-    # TTL-based listing cache: {uri: {identity: (timestamp, [uri, ...])}}
-    _listing_cache: dict[str, dict[str, tuple[float, list[str]]]] = {}
+    # TTL-based listing cache:
+    # {uri: {identity: (timestamp, [(uri, is_dir, size, modified), ...])}}
+    _listing_cache: dict[
+        str, dict[str, tuple[float, list[tuple[str, bool, int | None, str | None]]]]
+    ] = {}
     listing_cache_ttl: float = 60.0  # seconds; set to 0 to disable
-
-    # Subclasses may set this to a native batch-is-dir function.
-    _is_dir_batch_fn = None
 
     # Declarative batcher configuration — override in subclasses.
     _batcher_key_fn: staticmethod = None  # type: ignore[assignment]
@@ -680,11 +675,11 @@ class CloudPathMixin(CommonPurePathMixin):
             if not missing_ok:  # pragma: no cover
                 raise
 
-    async def _fetch_listing(self) -> list[str]:
-        """Fetch directory listing and return URIs."""
+    async def _fetch_listing(self) -> list[tuple[str, bool, int | None, str | None]]:
+        """Fetch the directory listing as ``(uri, is_dir, size, modified)`` rows."""
         containers = await self._list_containers()
         if containers is not None:
-            return containers
+            return [(uri, True, None, None) for uri in containers]
         try:
             native_kwargs = await self._get_native_kwargs()
             return await self._get_batcher().list(
@@ -713,33 +708,33 @@ class CloudPathMixin(CommonPurePathMixin):
         """Drop this path's cached listing for every identity."""
         type(self)._listing_cache.pop(str(self), None)
 
-    async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
-        """Iterate over directory contents with TTL caching.
+    async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:
+        """List directory entries with TTL caching.
 
         Results are cached for ``listing_cache_ttl`` seconds, per identity.
         Pass ``fresh=True`` to bypass the cache and force a network fetch.
         """
         identity = self._identity_fingerprint()
         cache = type(self)._listing_cache
-
+        rows = None
         if not fresh and self.listing_cache_ttl > 0:
-            entry = cache.get(str(self), {}).get(identity)
-            if entry is not None:
-                ts, uris = entry
-                if (time.monotonic() - ts) < self.listing_cache_ttl:
-                    for uri in uris:
-                        if (child := self._confined_child(uri)) is not None:
-                            yield child
-                    return
+            cached = cache.get(str(self), {}).get(identity)
+            if cached is not None and (time.monotonic() - cached[0]) < self.listing_cache_ttl:
+                rows = cached[1]
+        if rows is None:
+            rows = await self._fetch_listing()
+            if self.listing_cache_ttl > 0:
+                cache.setdefault(str(self), {})[identity] = (time.monotonic(), rows)
+        return [
+            DirEntry(child, is_dir, size, parse_listing_mtime(modified))
+            for uri, is_dir, size, modified in rows
+            if (child := self._confined_child(uri)) is not None
+        ]
 
-        uris = await self._fetch_listing()
-
-        if self.listing_cache_ttl > 0:
-            cache.setdefault(str(self), {})[identity] = (time.monotonic(), uris)
-
-        for uri in uris:
-            if (child := self._confined_child(uri)) is not None:
-                yield child
+    async def iterdir(self, *, fresh: bool = False) -> AsyncIterator[Self]:
+        """Iterate over directory contents (see :meth:`_list_entries` for caching)."""
+        for entry in await self._list_entries(fresh=fresh):
+            yield entry.path
 
     def chmod(self, mode: int, *, follow_symlinks: bool = True) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support chmod")
@@ -1175,33 +1170,21 @@ class CloudPathMixin(CommonPurePathMixin):
     ) -> AsyncIterator[tuple[Self, list[str], list[str]]]:
         """Recursively walk directory tree.
 
-        Uses ``_is_dir_batch_fn`` for an efficient batch check when available,
-        otherwise falls back to per-entry ``is_dir()`` via ``asyncio.gather``.
+        Entries are classified by :meth:`scandir`, so listings that report
+        directory prefixes need no per-entry probes.
         ``follow_symlinks`` is accepted for API parity; cloud objects have no symlinks.
         """
         try:
-            entries = [entry async for entry in self.iterdir()]
+            entries = [entry async for entry in self.scandir()]
         except OSError as e:
             if on_error is not None:
                 on_error(e)
                 return
             raise
-        batch_fn = type(self)._is_dir_batch_fn
-        if entries and batch_fn is not None:
-            prefixes = [e._item_path for e in entries]
-            is_dir_results = await batch_fn(
-                prefixes=prefixes,
-                use_h2=len(prefixes) >= H2_BATCH_THRESHOLD,
-                **(await self._get_native_kwargs()),
-            )
-        elif entries:
-            is_dir_results = await asyncio.gather(*(e.is_dir() for e in entries))
-        else:
-            is_dir_results = []
         dirs: list[Self] = []
         files: list[Self] = []
-        for entry, is_directory in zip(entries, is_dir_results):
-            (dirs if is_directory else files).append(entry)
+        for entry in entries:
+            (dirs if entry.is_dir else files).append(entry.path)
         if top_down:
             yield self, [d.name for d in dirs], [f.name for f in files]
         for d in dirs:

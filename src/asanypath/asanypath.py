@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
+from importlib import import_module
 from os import PathLike, getenv, stat_result
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -23,58 +24,82 @@ from asanypath.exceptions import InvalidPathError
 from asanypath.unsupported import UnsupportedProtocolPath
 
 if TYPE_CHECKING:
+    from asanypath.common import DirEntry
     from asanypath.options import AccessPolicy, AccessPolicyPatch, BackendOptions
 
 
+# Built-in schemes, imported on first lookup so a local path never pays for
+# cloud backends.
+_BUILTIN_PROTOCOLS = {
+    "file": ("asanypath.local", "AsyncPath"),
+    "s3": ("asanypath.s3", "S3Path"),
+    "gs": ("asanypath.gcs", "GCSPath"),
+    "az": ("asanypath.azure", "AzurePath"),
+    "http": ("asanypath.http", "HTTPPath"),
+    "https": ("asanypath.http", "HTTPSPath"),
+    "art": ("asanypath.artifactory", "ArtifactoryPath"),
+    "ssh": ("asanypath.ssh", "SSHPath"),
+    "ftp": ("asanypath.ftp", "FTPPath"),
+    "ftps": ("asanypath.ftp", "FTPSPath"),
+}
+
+
 class _LazyDict(dict):
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending = dict(_BUILTIN_PROTOCOLS)
+
+    def _load(self, key) -> bool:
+        spec = self._pending.pop(key, None)
+        if spec is None:
+            return False
+        try:
+            klass = getattr(import_module(spec[0]), spec[1])
+        except ImportError:  # optional backend dependency not installed
+            return False
+        self.setdefault(key, klass)
+        return True
+
     def _ensure(self):
-        if not self:
-            from asanypath.artifactory import ArtifactoryPath
-            from asanypath.azure import AzurePath
-            from asanypath.gcs import GCSPath
-            from asanypath.http import HTTPPath, HTTPSPath
-            from asanypath.local import AsyncPath
-            from asanypath.s3 import S3Path
+        for key in list(self._pending):
+            self._load(key)
 
-            self.update(
-                file=AsyncPath,
-                s3=S3Path,
-                gs=GCSPath,
-                az=AzurePath,
-                http=HTTPPath,
-                https=HTTPSPath,
-                art=ArtifactoryPath,
-            )
-            try:
-                from asanypath.ssh import SSHPath
-
-                self.update(ssh=SSHPath)
-            except ImportError:
-                pass
-            try:
-                from asanypath.ftp import FTPPath, FTPSPath
-
-                self.update(ftp=FTPPath, ftps=FTPSPath)
-            except ImportError:
-                pass
+    def __setitem__(self, key, value):
+        self._pending.pop(key, None)
+        super().__setitem__(key, value)
 
     def items(self):
         self._ensure()
         return super().items()
 
+    def keys(self):
+        self._ensure()
+        return super().keys()
+
+    def values(self):
+        self._ensure()
+        return super().values()
+
     def __iter__(self):
         self._ensure()
         return super().__iter__()
 
-    def __contains__(self, key):
+    def __len__(self):
         self._ensure()
+        return super().__len__()
+
+    def __contains__(self, key):
+        self._load(key)
         return super().__contains__(key)
 
+    def get(self, key, default=None):
+        self._load(key)
+        return super().get(key, default)
+
     def __missing__(self, key):
-        self._ensure()
-        if key not in self:
-            return UnsupportedProtocolPath
-        return self[key]  # KeyError if truly unknown
+        if self._load(key):
+            return self[key]
+        return UnsupportedProtocolPath
 
 
 PROTOCOL_MAP = _LazyDict()
@@ -364,6 +389,10 @@ class AsAnyPath(AsAnyPurePath):
 
     @abstractmethod
     async def iterdir(self) -> AsyncIterator[Self]:
+        pass
+
+    @abstractmethod
+    async def scandir(self, *, stat: bool = False) -> AsyncIterator[DirEntry]:
         pass
 
     @abstractmethod

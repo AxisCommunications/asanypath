@@ -17,6 +17,7 @@ from click.testing import CliRunner
 
 import asanypath.cli as cli_module
 from asanypath.cli import cli
+from asanypath.common import DirEntry
 
 
 @pytest.fixture
@@ -302,92 +303,40 @@ def test_cat(runner, setup, args, stdin, expected_exit, expected_in):
 # ---------------------------------------------------------------------------
 
 
+def _ls_node(name: str, *children: DirEntry, is_dir: bool = False, size=None, mtime=None):
+    """A listing entry whose path lists *children* via ``scandir``."""
+    node = MagicMock()
+    node.name = name
+    node.__str__.return_value = f"s3://bucket/{name}"
+
+    async def scandir(*, stat=False):
+        for child in children:
+            yield child
+
+    node.scandir = scandir
+    return DirEntry(node, is_dir, size, mtime)
+
+
 def _ls_empty(mock_cls):
-    m = AsyncMock()
-
-    async def empty_iterdir():
-        return
-        yield  # noqa: RET504
-
-    m.iterdir = empty_iterdir
-    mock_cls.return_value = m
+    mock_cls.return_value = _ls_node("").path
 
 
 def _ls_items(mock_cls):
-    m = AsyncMock()
-    item1 = AsyncMock()
-    item1.__str__ = lambda s: "s3://bucket/file1.txt"
-    item1.name = "file1.txt"
-    item2 = AsyncMock()
-    item2.__str__ = lambda s: "s3://bucket/file2.txt"
-    item2.name = "file2.txt"
-
-    async def list_items():
-        yield item1
-        yield item2
-
-    m.iterdir = list_items
-    mock_cls.return_value = m
+    mock_cls.return_value = _ls_node(
+        "", _ls_node("file1.txt", size=12, mtime=0.0), _ls_node("file2.txt")
+    ).path
 
 
 def _ls_tree(mock_cls):
-    root = AsyncMock()
-    dir_item = AsyncMock()
-    dir_item.__str__ = lambda s: "s3://bucket/dir"
-    dir_item.name = "dir"
-    dir_item.stat = AsyncMock(side_effect=NotImplementedError())
-    dir_item.is_dir = AsyncMock(return_value=True)
-    file_item = AsyncMock()
-    file_item.__str__ = lambda s: "s3://bucket/dir/file.txt"
-    file_item.name = "file.txt"
-    file_item.stat = AsyncMock(side_effect=NotImplementedError())
-    file_item.is_dir = AsyncMock(return_value=False)
-
-    async def root_iterdir():
-        yield dir_item
-
-    async def dir_iterdir():
-        yield file_item
-
-    root.iterdir = root_iterdir
-    dir_item.iterdir = dir_iterdir
-    mock_cls.return_value = root
+    mock_cls.return_value = _ls_node(
+        "", _ls_node("dir", _ls_node("file.txt"), is_dir=True), _ls_node("top.txt")
+    ).path
 
 
 def _ls_nested(mock_cls):
-    root, *_ = _make_nested_tree()
-    mock_cls.return_value = root
-
-
-def _make_nested_tree():
-    """Build root -> dir -> nested -> deep.txt mock tree."""
-    root = AsyncMock()
-    dir_item = AsyncMock()
-    dir_item.name = "dir"
-    dir_item.stat = AsyncMock(side_effect=NotImplementedError())
-    dir_item.is_dir = AsyncMock(return_value=True)
-    nested_dir = AsyncMock()
-    nested_dir.name = "nested"
-    nested_dir.stat = AsyncMock(side_effect=NotImplementedError())
-    nested_dir.is_dir = AsyncMock(return_value=True)
-    deep_file = AsyncMock()
-    deep_file.name = "deep.txt"
-    deep_file.stat = AsyncMock(side_effect=NotImplementedError())
-    deep_file.is_dir = AsyncMock(return_value=False)
-
-    async def root_iterdir():
-        yield dir_item
-
-    async def dir_iterdir():
-        yield nested_dir
-
-    async def nested_iterdir():
-        yield deep_file
-
-    root.iterdir = root_iterdir
-    dir_item.iterdir = dir_iterdir
-    nested_dir.iterdir = nested_iterdir
-    return root, dir_item, nested_dir, deep_file
+    deep = _ls_node("deep.txt")
+    nested = _ls_node("nested", deep, is_dir=True)
+    mock_cls.return_value = _ls_node("", _ls_node("dir", nested, is_dir=True)).path
 
 
 @pytest.mark.parametrize(
@@ -398,7 +347,31 @@ def _make_nested_tree():
             _ls_items, ["ls", "s3://bucket/"], 0, ["file1.txt", "file2.txt"], [], None, id="items"
         ),
         pytest.param(
-            _ls_tree, ["ls", "-r", "s3://bucket/"], 0, ["dir", "file.txt"], [], None, id="recursive"
+            _ls_tree,
+            ["ls", "s3://bucket/"],
+            0,
+            ["dir/", "top.txt"],
+            ["file.txt", "├"],
+            None,
+            id="dir_suffix",
+        ),
+        pytest.param(
+            _ls_tree,
+            ["ls", "-r", "s3://bucket/"],
+            0,
+            ["s3://bucket/", "├── dir/", "│   └── file.txt", "└── top.txt"],
+            [],
+            None,
+            id="recursive",
+        ),
+        pytest.param(
+            _ls_items,
+            ["ls", "-l", "s3://bucket/"],
+            0,
+            ["12 ", "file1.txt", "file2.txt"],
+            ["CREATED", "NAME"],
+            None,
+            id="long",
         ),
         pytest.param(
             _ls_nested,

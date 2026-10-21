@@ -13,7 +13,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from os import getenv
 from pathlib import Path
@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Literal
 import msgspec
 
 if TYPE_CHECKING:
-    from typing import Self
+    pass
 
 from asanypath_native import (
     art_copy_batch,
@@ -40,6 +40,7 @@ from asanypath_native import (
 )
 
 from asanypath.cloud import CloudPathMixin, _service_origin
+from asanypath.common import DirEntry
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -315,12 +316,10 @@ class ArtifactoryPath(CloudPathMixin):
         except (FileNotFoundError, PermissionError):
             return False
 
-    async def iterdir(self) -> AsyncIterator[Self]:
+    async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:
         containers = await self._list_containers()
         if containers is not None:
-            for uri in containers:
-                yield self._child(uri)
-            return
+            return [DirEntry(self._child(uri), True) for uri in containers]
         batcher = self._get_batcher()
         results = await batcher.list(
             item=self._repo_path,
@@ -328,11 +327,13 @@ class ArtifactoryPath(CloudPathMixin):
             token=self._token,
         )
         base = str(self).rstrip("/")
+        entries = []
         for uri, is_folder in results:
             child_name = uri.rstrip("/").rsplit("/", 1)[-1]
             child = self._confined_child(f"{base}/{child_name}", _is_folder=is_folder)
             if child is not None:
-                yield child
+                entries.append(DirEntry(child, is_folder))
+        return entries
 
     async def _list_containers(self) -> list[str] | None:
         """List repositories when at the server root (``art://<host>/artifactory/``).

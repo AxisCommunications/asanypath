@@ -33,7 +33,6 @@ from asanypath_native import (
     gcs_head,
     gcs_head_batch,
     gcs_is_dir,
-    gcs_is_dir_batch,
     gcs_list_batch,
     gcs_list_buckets,
     gcs_presign,
@@ -75,7 +74,6 @@ class GCSPath(CloudPathMixin):
     _supports_range_read: bool = True
     # Bytes per resumable chunk; objects below one chunk upload in a single PUT.
     _MULTIPART_PART_SIZE = UPLOAD_CHUNK_SIZE
-    _is_dir_batch_fn = staticmethod(gcs_is_dir_batch)
     _copy_batch_fn = staticmethod(gcs_copy_batch)
 
     @staticmethod

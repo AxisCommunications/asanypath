@@ -57,6 +57,11 @@ def _no_ambient_credentials(monkeypatch):
     monkeypatch.setattr(CloudPathMixin, "_batcher_instances", {})
 
 
+def _rows(*uris: str) -> list[tuple[str, bool, None, None]]:
+    """Listing rows as returned by ``_fetch_listing``: ``(uri, is_dir, size, modified)``."""
+    return [(uri, uri.endswith("/"), None, None) for uri in uris]
+
+
 def _s3(uri: str = "s3://bucket/dir", *, secret: str = "admin-secret", **kwargs) -> S3Path:
     options = dict(
         endpoint_url="https://s3.internal.example",
@@ -211,7 +216,7 @@ def test_host_bound_credentials_stay_with_their_host(cls):
 
 async def test_listing_cache_is_scoped_to_credentials(monkeypatch):
     async def fake_fetch(self):
-        return [f"{self}/{self._secret_key}.txt"]
+        return _rows(f"{self}/{self._secret_key}.txt")
 
     monkeypatch.setattr(S3Path, "_fetch_listing", fake_fetch)
     admin = _s3(secret="admin-secret")
@@ -295,11 +300,11 @@ def test_artifactory_cache_identity_changes_with_implicit_token(monkeypatch):
 )
 async def test_iterdir_skips_entries_outside_the_listed_prefix(entry, monkeypatch, caplog):
     async def fake_fetch(self):
-        return [
+        return _rows(
             f"s3://bucket/allowed/{entry}",
             "s3://bucket/allowed/ok.txt",
             "s3://bucket/allowed/sub/",
-        ]
+        )
 
     monkeypatch.setattr(S3Path, "_fetch_listing", fake_fetch)
 
@@ -314,7 +319,7 @@ async def test_recursive_delete_stays_inside_the_prefix(monkeypatch):
 
     async def fake_fetch(self):
         if str(self) == "s3://bucket/allowed":
-            return ["s3://bucket/allowed/../outside.txt", "s3://bucket/allowed/inside.txt"]
+            return _rows("s3://bucket/allowed/../outside.txt", "s3://bucket/allowed/inside.txt")
         return []
 
     async def fake_unlink(self, missing_ok=False):

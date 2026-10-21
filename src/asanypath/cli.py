@@ -22,29 +22,24 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from os import getenv
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import rich_click as click
+from rich.cells import cell_len
 from rich.console import Console, Group
-from rich.live import Live
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.table import Table
 from rich.text import Text
 
-from asanypath import AsAnyPath
+from asanypath import AsAnyPath, DirEntry
 from asanypath._backend_opts import kwargs_for, parse_options
 from asanypath._transfer import TransferBudget, transfer_scope
 from asanypath._version import __version__
 from asanypath.asanypath import PROTOCOL_MAP
 
+if TYPE_CHECKING:
+    from rich.progress import Progress
+
+# Progress, Live and Table are imported where used so quick commands such as
+# ls start faster.
 console = Console()
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
@@ -92,6 +87,17 @@ def _fmt_bytes_ratio(transferred: float, total: float) -> tuple[str, str]:
 
 
 def _make_overall_progress(*, show_transfer: bool = False) -> Progress:
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
     cols = [
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -118,6 +124,8 @@ def _make_overall_progress(*, show_transfer: bool = False) -> Progress:
 
 
 def _make_file_progress(*, show_transfer: bool = False) -> Progress:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
     cols = [
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -205,6 +213,8 @@ async def _run_concurrent_stream(
     concurrency_floor: int = DEFAULT_CONCURRENCY,
 ) -> tuple[int, list[tuple[str, BaseException]], float]:
     """Run items from an async stream with up to ``concurrency`` workers."""
+    from rich.live import Live
+
     style = (
         "none"
         if verbosity <= 0 or (total is not None and total <= 1)
@@ -437,7 +447,7 @@ LS_COLOR_THEMES: dict[str, dict[str, str]] = {
         "root": "bold cyan",
         "name": "bright_white",
         "size": "magenta",
-        "created": "yellow",
+        "dir": "bold bright_blue",
         "modified": "green",
         "guide": "bright_black",
     },
@@ -445,7 +455,7 @@ LS_COLOR_THEMES: dict[str, dict[str, str]] = {
         "root": "bold bright_cyan",
         "name": "bright_white",
         "size": "bright_blue",
-        "created": "cyan",
+        "dir": "bold blue",
         "modified": "bright_green",
         "guide": "blue",
     },
@@ -453,7 +463,7 @@ LS_COLOR_THEMES: dict[str, dict[str, str]] = {
         "root": "bold bright_yellow",
         "name": "bright_white",
         "size": "bright_magenta",
-        "created": "bright_red",
+        "dir": "bold bright_yellow",
         "modified": "bright_yellow",
         "guide": "bright_black",
     },
@@ -471,6 +481,31 @@ LS_DEPTH_GRADIENTS: dict[str, tuple[str, ...]] = {
         "bright_magenta",
     ),
 }
+
+
+def _columns(names: list[Text], width: int, gap: int = 2) -> Text:
+    """Lay out *names* column-major in as many columns as fit *width*, like ``ls``."""
+    lens = [cell_len(n.plain) for n in names]
+    count = len(names)
+    rows, widths = count, [max(lens, default=0)]
+    for ncols in range(min(count, max(1, width // (min(lens, default=1) + gap))), 1, -1):
+        nrows = -(-count // ncols)
+        cols = [max(lens[c * nrows : (c + 1) * nrows]) for c in range(-(-count // nrows))]
+        if sum(cols) + gap * (len(cols) - 1) <= width:
+            rows, widths = nrows, cols
+            break
+    out = Text()
+    for r in range(rows):
+        if r:
+            out.append("\n")
+        for c, col_width in enumerate(widths):
+            i = c * rows + r
+            if i >= count:
+                break
+            out.append(names[i])
+            if c < len(widths) - 1 and i + rows < count:
+                out.append(" " * (col_width - lens[i] + gap))
+    return out
 
 
 def mask_token(token: str | None, max_visible: int = 4) -> str:
@@ -950,6 +985,8 @@ def cli():
 @cli.command(short_help="List supported protocols", context_settings=CONTEXT_SETTINGS)
 def protocols():
     """Show all supported URI protocols and their implementations."""
+    from rich.table import Table
+
     protocol_descriptions = {
         "art": "JFrog Artifactory repositories",
         "az": "Azure Blob Storage containers",
@@ -1281,8 +1318,9 @@ def cat(path: str, token: str | None, binary: bool):
     type=click.IntRange(min=1),
     help="Max recursion depth (implies -r)",
 )
+@click.option("--long", "-l", "long_format", is_flag=True, help="Show size and modification time")
 @click.option(
-    "--long", "-l", "long_format", is_flag=True, help="Show size/created/modified metadata"
+    "--all", "-a", "show_all", is_flag=True, help="Include entries whose names start with '.'"
 )
 @click.option(
     "--simple", "-1", "simple", is_flag=True, help="Output one path per line (for piping)"
@@ -1308,6 +1346,7 @@ def ls(
     recursive: bool,
     depth: int | None,
     long_format: bool,
+    show_all: bool,
     simple: bool,
     color: str,
     listing: str | None,
@@ -1315,7 +1354,8 @@ def ls(
 ):
     """List directory contents.
 
-    Defaults to the current directory if no PATH is given.
+    Defaults to the current directory if no PATH is given. Like ``ls``,
+    names starting with '.' are hidden unless -a/--all is given.
     Use -1/--simple for plain one-path-per-line output suitable for piping.
 
     Examples:
@@ -1362,140 +1402,88 @@ def ls(
                 style = depth_gradient[min(depth, len(depth_gradient) - 1)]
                 return f"bold {style}" if bold else style
 
-            async def _entry_metadata(item: AsAnyPath) -> dict[str, str]:
-                if not long_format:
-                    return {"size": "", "created": "", "modified": ""}
-                size_val = ""
-                created_val = ""
-                modified_val = ""
-
-                try:
-                    st = await item.stat()
-                    st_size = getattr(st, "st_size", None)
-                    st_ctime = getattr(st, "st_ctime", None)
-                    st_mtime = getattr(st, "st_mtime", None)
-
-                    if isinstance(st_size, int):
-                        size_val = str(st_size)
-                    if isinstance(st_ctime, (int, float)):
-                        created_val = datetime.fromtimestamp(st_ctime).strftime("%Y-%m-%d %H:%M:%S")
-                    if isinstance(st_mtime, (int, float)):
-                        modified_val = datetime.fromtimestamp(st_mtime).strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                except Exception:
-                    pass
-
-                return {
-                    "size": size_val,
-                    "created": created_val,
-                    "modified": modified_val,
-                }
-
-            async def _children(path_obj: AsAnyPath) -> list[AsAnyPath]:
-                return sorted([child async for child in path_obj.iterdir()], key=lambda x: x.name)
+            tree_mode = recursive_depth != 0
+            list_limit = asyncio.Semaphore(16)
 
             async def _collect(
                 path_obj: AsAnyPath, depth: int = 0, branch_state: tuple[bool, ...] = ()
-            ):
-                children = await _children(path_obj)
-                for index, child in enumerate(children):
-                    is_last = index == len(children) - 1
-                    state = branch_state + (is_last,)
-                    child_is_dir: bool | None = None
-                    should_descend = recursive_depth != 0 and (
-                        recursive_depth < 0 or depth + 1 < recursive_depth
+            ) -> list[tuple[DirEntry, tuple[bool, ...]]]:
+                async with list_limit:
+                    entries = sorted(
+                        [
+                            e
+                            async for e in path_obj.scandir(stat=long_format)
+                            if show_all or not e.path.name.startswith(".")
+                        ],
+                        key=lambda e: e.path.name,
                     )
-                    if should_descend or getattr(child, "protocol", None) == "s3":
-                        try:
-                            child_is_dir = await child.is_dir()
-                        except Exception:
-                            child_is_dir = None
+                states = [branch_state + (i == len(entries) - 1,) for i in range(len(entries))]
+                subtrees: dict[int, list] = {}
+                if tree_mode and (recursive_depth < 0 or depth + 1 < recursive_depth):
+                    dirs = [i for i, e in enumerate(entries) if e.is_dir]
+                    found = await asyncio.gather(
+                        *(_collect(entries[i].path, depth + 1, states[i]) for i in dirs)
+                    )
+                    subtrees = dict(zip(dirs, found))
+                rows = []
+                for i, entry in enumerate(entries):
+                    rows.append((entry, states[i]))
+                    rows.extend(subtrees.get(i, ()))
+                return rows
 
-                    metadata = await _entry_metadata(child)
-                    yield {
-                        "item": child,
-                        "is_dir": child_is_dir,
-                        "metadata": metadata,
-                        "branch_state": state,
-                    }
-                    if should_descend and child_is_dir:
-                        async for row in _collect(child, depth + 1, state):
-                            yield row
-
-            def _tree_text(name: str, branch_state: tuple[bool, ...], is_dir: bool | None) -> Text:
-                if not branch_state:
-                    return Text(name, style=depth_sty(0, bold=bool(is_dir)) or sty("name"))
-
+            def _name_text(entry: DirEntry, branch_state: tuple[bool, ...]) -> Text:
+                name = entry.path.name + ("/" if entry.is_dir else "")
+                if not tree_mode:
+                    return Text(name, style=sty("dir") if entry.is_dir else sty("name"))
                 text = Text()
                 for depth_index, ancestor_is_last in enumerate(branch_state[:-1], start=1):
                     if ancestor_is_last:
                         text.append("    ")
                     else:
                         text.append("│   ", style=depth_sty(depth_index) or sty("guide"))
-
                 branch_depth = len(branch_state)
                 branch_glyph = "└── " if branch_state[-1] else "├── "
                 text.append(branch_glyph, style=depth_sty(branch_depth) or sty("guide"))
-                text.append(name, style=depth_sty(branch_depth, bold=bool(is_dir)) or sty("name"))
+                text.append(
+                    name, style=depth_sty(branch_depth, bold=bool(entry.is_dir)) or sty("name")
+                )
                 return text
 
-            rows = [row async for row in _collect(p)]
-            found_any = bool(rows)
-
-            if not found_any:
+            rows = await _collect(p)
+            if not rows:
                 # No results is a non-match: exit non-zero like grep/aws s3 ls.
                 return 1
 
             if simple:
-                for row in rows:
-                    click.echo(str(row["item"]))
+                click.echo("\n".join(str(entry.path) for entry, _ in rows))
                 return 0
 
-            table = Table(
-                box=None,
-                show_edge=False,
-                pad_edge=False,
-                expand=False,
-                padding=(0, 1),
-            )
-            table.add_column("NAME", style=sty("name"), header_style=sty("name"), no_wrap=True)
+            names = [_name_text(entry, state) for entry, state in rows]
+            out = Text()
+            if tree_mode:
+                out.append(path, style=sty("root"))
+                out.append("\n")
             if long_format:
-                table.add_column(
-                    "SIZE",
-                    style=sty("size"),
-                    header_style=sty("size"),
-                    justify="right",
-                    no_wrap=True,
-                )
-                table.add_column(
-                    "CREATED",
-                    style=sty("created"),
-                    header_style=sty("created"),
-                    justify="right",
-                    no_wrap=True,
-                )
-                table.add_column(
-                    "MODIFIED",
-                    style=sty("modified"),
-                    header_style=sty("modified"),
-                    justify="right",
-                    no_wrap=True,
-                )
-
-            console.print(Text(path, style=sty("root")))
-            for row in rows:
-                cols = [_tree_text(row["item"].name, row["branch_state"], row["is_dir"])]
-                if long_format:
-                    cols.extend(
-                        [
-                            row["metadata"]["size"],
-                            row["metadata"]["created"],
-                            row["metadata"]["modified"],
-                        ]
+                sizes = ["" if e.size is None else str(e.size) for e, _ in rows]
+                size_width = max(map(len, sizes))
+                for (entry, _), size, name in zip(rows, sizes, names):
+                    modified = (
+                        datetime.fromtimestamp(entry.mtime).strftime("%Y-%m-%d %H:%M:%S")
+                        if entry.mtime is not None
+                        else ""
                     )
-                table.add_row(*cols)
-            console.print(table)
+                    out.append(size.rjust(size_width), style=sty("size"))
+                    out.append(" ")
+                    out.append(modified.ljust(19), style=sty("modified"))
+                    out.append(" ")
+                    out.append(name)
+                    out.append("\n")
+            elif tree_mode or not console.is_terminal:
+                out.append(Text("\n").join(names))
+            else:
+                out.append(_columns(names, console.width))
+            out.rstrip()
+            console.print(out, soft_wrap=True)
 
             return 0
         except NotImplementedError:

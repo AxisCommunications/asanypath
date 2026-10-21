@@ -90,10 +90,10 @@ class TestS3Path(testbase):
 
     async def test_glob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
+        mock_batcher.list.return_value = _rows(
             "s3://mybucket/nested/file.txt",
             "s3://mybucket/nested/other.md",
-        ]
+        )
         with patch.object(S3Path, "_get_batcher", return_value=mock_batcher):
             results = [c async for c in p.parent.glob("*.txt")]
         assert len(results) == 1
@@ -160,7 +160,7 @@ class TestS3Path(testbase):
     async def test_iterdir(self, dir_path, list_return, expected_strs):
         d = _make_s3path(dir_path)
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = list_return
+        mock_batcher.list.return_value = _rows(*list_return)
         with patch.object(S3Path, "_get_batcher", return_value=mock_batcher):
             results = [str(x) async for x in d.iterdir()]
         for expected in expected_strs:
@@ -242,13 +242,8 @@ class TestS3Path(testbase):
 
     async def test_rglob(self, p):
         mock_batcher = AsyncMock()
-        mock_batcher.list.return_value = [
-            "s3://mybucket/nested/file.txt",
-        ]
-        with (
-            patch.object(S3Path, "_get_batcher", return_value=mock_batcher),
-            patch.object(S3Path, "_is_dir_batch_fn", new=AsyncMock(return_value=[False])),
-        ):
+        mock_batcher.list.return_value = _rows("s3://mybucket/nested/file.txt")
+        with patch.object(S3Path, "_get_batcher", return_value=mock_batcher):
             results = [c async for c in p.parent.rglob("*.txt")]
         assert len(results) == 1
 
@@ -287,22 +282,14 @@ class TestS3Path(testbase):
         root = _make_s3path("s3://mybucket/root")
         mock_batcher = AsyncMock()
         mock_batcher.list.side_effect = [
-            ["s3://mybucket/root/file.txt", "s3://mybucket/root/sub"],
-            ["s3://mybucket/root/sub/deep.txt"],
-        ]
-        with (
-            patch.object(S3Path, "_get_batcher", return_value=mock_batcher),
-            patch.object(
-                type(root),
-                "_is_dir_batch_fn",
-                new=AsyncMock(
-                    side_effect=[
-                        [False, True],
-                        [False],
-                    ]
-                ),
+            _rows(
+                "s3://mybucket/root/file.txt",
+                "s3://mybucket/root/sub",
+                dirs=("s3://mybucket/root/sub",),
             ),
-        ):
+            _rows("s3://mybucket/root/sub/deep.txt"),
+        ]
+        with patch.object(S3Path, "_get_batcher", return_value=mock_batcher):
             entries = [(root_p, dirs[:], files[:]) async for root_p, dirs, files in root.walk()]
 
         assert entries[0][0] == root
@@ -315,17 +302,14 @@ class TestS3Path(testbase):
         root = _make_s3path("s3://mybucket/root")
         mock_batcher = AsyncMock()
         mock_batcher.list.side_effect = [
-            ["s3://mybucket/root/file.txt", "s3://mybucket/root/sub"],
-            ["s3://mybucket/root/sub/deep.txt"],
-        ]
-        with (
-            patch.object(S3Path, "_get_batcher", return_value=mock_batcher),
-            patch.object(
-                type(root),
-                "_is_dir_batch_fn",
-                new=AsyncMock(side_effect=[[False, True], [False]]),
+            _rows(
+                "s3://mybucket/root/file.txt",
+                "s3://mybucket/root/sub",
+                dirs=("s3://mybucket/root/sub",),
             ),
-        ):
+            _rows("s3://mybucket/root/sub/deep.txt"),
+        ]
+        with patch.object(S3Path, "_get_batcher", return_value=mock_batcher):
             roots = [root_p async for root_p, _, _ in root.walk(top_down=False)]
         # Bottom-up: deepest directory yielded before its parent.
         assert roots[0] == _make_s3path("s3://mybucket/root/sub")
@@ -336,10 +320,9 @@ class TestS3Path(testbase):
 
         async def boom(self_inner, **kw):
             raise PermissionError("denied")
-            yield  # pragma: no cover
 
         seen = []
-        with patch.object(S3Path, "iterdir", boom):
+        with patch.object(S3Path, "_list_entries", boom):
             entries = [t async for t in root.walk(on_error=seen.append)]
         assert entries == []
         assert len(seen) == 1
@@ -380,6 +363,11 @@ class TestS3Path(testbase):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _rows(*uris: str, dirs: tuple[str, ...] = ()) -> list[tuple]:
+    """Native list rows: (uri, is_dir, size, modified)."""
+    return [(u, u in dirs, None, None) for u in uris]
 
 
 def _make_s3path(path: str = "s3://mybucket/mykey", **kwargs) -> S3Path:
