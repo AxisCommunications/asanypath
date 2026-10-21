@@ -222,6 +222,40 @@ async def test_exists():
         assert await p.exists() is True
 
 
+def _http_exists_for(*urls):
+    """Stub ``http_exists`` answering True only for *urls*."""
+
+    async def fake(url, headers=None):
+        return url in urls
+
+    return fake
+
+
+@pytest.mark.parametrize(
+    ("existing", "listing", "expected"),
+    [
+        ({"http://h/f"}, "auto", True),
+        ({"http://h/f/"}, "auto", True),
+        (set(), "auto", False),
+        ({"http://h/f/"}, None, False),
+    ],
+    ids=["resource", "directory_listing", "missing", "no_listing_no_probe"],
+)
+async def test_exists_covers_resources_and_directories(existing, listing, expected):
+    with patch(f"{_HTTP_NATIVE}.http_exists", new=_http_exists_for(*existing)):
+        assert await HTTPPath("http://h/f", listing=listing).exists() is expected
+
+
+@pytest.mark.parametrize(
+    ("existing", "expected"),
+    [({"http://h/f"}, True), ({"http://h/f", "http://h/f/"}, False), (set(), False)],
+    ids=["resource", "directory", "missing"],
+)
+async def test_is_file(existing, expected):
+    with patch(f"{_HTTP_NATIVE}.http_exists", new=_http_exists_for(*existing)):
+        assert await HTTPPath("http://h/f").is_file() is expected
+
+
 def test_presigned_url_query_preserved():
     """Percent-encoded query chars (e.g. AWS SigV4 %2F) must survive construction."""
     url = (

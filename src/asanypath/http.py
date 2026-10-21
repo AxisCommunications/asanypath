@@ -314,7 +314,10 @@ class HTTPPath(CloudPathMixin):
         return HTTPResponse(status_code=status_code, body=body, headers=resp_headers)
 
     async def exists(self) -> bool:
-        return await http_exists(str(self), headers=self._merge_headers(None))
+        """True for a resource or a directory listing, like a local path."""
+        if await http_exists(str(self), headers=self._merge_headers(None)):
+            return True
+        return self._resolve_listing() is not None and await self._probe_dir_slash()
 
     async def _probe_dir_slash(self) -> bool:
         """Probe ``url + "/"`` via HEAD; on success, mark self as directory."""
@@ -346,11 +349,9 @@ class HTTPPath(CloudPathMixin):
     async def is_file(self) -> bool:
         if self._resolve_listing() is None:
             raise ValueError("HTTPPath.is_file() called with listing=None")
-        if self._trailing_slash:
+        if self._trailing_slash or await self._probe_dir_slash():
             return False
-        if await self._probe_dir_slash():  # pragma: no cover
-            return False  # pragma: no cover
-        return await self.exists()  # pragma: no cover
+        return await http_exists(str(self), headers=self._merge_headers(None))
 
     async def iterdir(self) -> AsyncIterator[Self]:
         """Yield child paths by scraping links from this URL.

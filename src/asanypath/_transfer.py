@@ -384,14 +384,16 @@ def run_sync_maybe(value: Any) -> Any:
 
 
 async def async_destination_state(src: Any, dst: Any) -> tuple[bool, bool, bool]:
-    """Return ``(needs_copy, same_path, destination_exists)``."""
+    """Return ``(needs_copy, same_path, destination_exists)``.
+
+    Only an existing *file* at ``dst`` counts: one cheap check (a HEAD on
+    object stores, which treat any non-empty prefix as a directory).
+    """
     same_path = str(src) == str(dst)
     if same_path:
         return (False, True, True)
-    if not await dst.exists():
+    if not await dst.is_file():
         return (True, False, False)
-    if await dst.is_dir():
-        raise IsADirectoryError(21, f"Is a directory: '{dst}'")
 
     try:
         src_checksums = _normalized_checksums(await src.checksums())
@@ -409,14 +411,12 @@ async def async_destination_state(src: Any, dst: Any) -> tuple[bool, bool, bool]
 
 
 def sync_destination_state(src: Any, dst: Any) -> tuple[bool, bool, bool]:
-    """Return ``(needs_copy, same_path, destination_exists)``."""
+    """Return ``(needs_copy, same_path, destination_exists)``; see the async variant."""
     same_path = str(src) == str(dst)
     if same_path:
         return (False, True, True)
-    if not run_sync_maybe(dst.exists()):
+    if not run_sync_maybe(dst.is_file()):
         return (True, False, False)
-    if run_sync_maybe(dst.is_dir()):
-        raise IsADirectoryError(21, f"Is a directory: '{dst}'")
 
     src_checksums = _normalized_checksums(src.checksums())
     dst_checksums = _normalized_checksums(run_sync_maybe(dst.checksums()))

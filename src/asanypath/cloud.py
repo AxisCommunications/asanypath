@@ -398,19 +398,29 @@ class CloudPathMixin(CommonPurePathMixin):
     # Generic batcher-backed I/O (shared across all cloud backends)
     # ------------------------------------------------------------------
 
-    async def exists(self) -> bool:
-        """Check if object exists."""
+    async def _object_exists(self) -> bool:
+        """True when an object is stored at this key."""
         native_kwargs = await self._get_native_kwargs()
         return await self._get_batcher().exists(
             item=self._item_path,
             **native_kwargs,
         )
 
+    async def exists(self) -> bool:
+        """True for an object or a directory, like a local path.
+
+        Object stores have no directory entries: a non-empty prefix is a
+        directory. It is only listed when no object is stored at the key.
+        """
+        return await self._object_exists() or await self.is_dir()
+
     async def is_file(self) -> bool:
-        """True if the path points to an object (not a directory prefix)."""
-        if not await self.exists():
-            return False
-        return not await self.is_dir()
+        """True when an object is stored at this key.
+
+        On object stores a key can also be a non-empty prefix, so
+        :meth:`is_file` and :meth:`is_dir` may both be true.
+        """
+        return await self._object_exists()
 
     async def read_bytes(self, *, use_cache: bool | None = None) -> bytes:
         """Read object content as bytes.

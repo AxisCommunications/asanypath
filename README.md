@@ -683,7 +683,11 @@ All path implementations support:
 - `download(dst, resume, chunk_size)` — stream an object to a local file, resuming an interrupted transfer
 - `read_bytes()` / `write_bytes(data)` — `read_bytes(use_cache=True)` serves from / stores in the opt-in [download cache](#download-caching-opt-in)
 - `read_text(encoding)` / `write_text(data, encoding)` — `read_text` also accepts `use_cache`
-- `exists()` / `is_file()` / `is_dir()`
+- `exists()` / `is_file()` / `is_dir()` — `exists()` is true for files and directories,
+  like a local path. On object stores (S3, GCS, Azure) a non-empty prefix is a
+  directory, looked up only when no object exists at the key; a key can be both an
+  object and a prefix, so `is_file()` and `is_dir()` may both be true. Empty
+  directories don't exist there (`mkdir()` is a no-op).
 - `stat()` / `checksums()` (cloud backends)
 - `mkdir(parents, exist_ok)` / `touch(exist_ok)`
 - `unlink(missing_ok)` / `rmdir(recursive)`

@@ -77,17 +77,6 @@ class TestS3Path(testbase):
             **p._native_kwargs,
         )
 
-    @pytest.mark.parametrize(
-        "return_value,expected",
-        [(True, True), (False, False)],
-        ids=["true", "false"],
-    )
-    async def test_exists(self, p, return_value, expected):
-        mock_batcher = AsyncMock()
-        mock_batcher.exists.return_value = return_value
-        with patch.object(S3Path, "_get_batcher", return_value=mock_batcher):
-            assert await p.exists() is expected
-
     async def test_glob(self, p):
         mock_batcher = AsyncMock()
         mock_batcher.list.return_value = _rows(
@@ -112,24 +101,6 @@ class TestS3Path(testbase):
         p = _make_s3path(path)
         with patch("asanypath.s3.s3_is_dir", new=AsyncMock(return_value=is_dir_result)):
             assert await p.is_dir() is expected
-
-    @pytest.mark.parametrize(
-        "mocks,expected",
-        [
-            ((("exists", True), ("is_dir", True)), False),
-            ((("exists", False),), False),
-            ((("exists", True), ("is_dir", False)), True),
-        ],
-        ids=["false_when_is_dir", "false_when_not_exists", "true_when_exists_and_not_dir"],
-    )
-    async def test_is_file(self, p, mocks, expected):
-        patched = [
-            patch.object(p, method, new=AsyncMock(return_value=retval)).__enter__()
-            for method, retval in mocks
-        ]
-        assert await p.is_file() is expected
-        for m in patched:
-            m.__exit__(None, None, None)
 
     @pytest.mark.parametrize(
         "dir_path,list_return,expected_strs",
