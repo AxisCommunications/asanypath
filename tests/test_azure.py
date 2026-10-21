@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
@@ -103,35 +102,6 @@ class TestAzurePath(testbase):
         mock.assert_awaited_once_with(
             acl_json=msgspec.json.encode(native_acl).decode(), **p._native_kwargs
         )
-
-    @pytest.mark.parametrize(
-        "return_value,expected",
-        [(True, True), (False, False)],
-        ids=["true", "false"],
-    )
-    async def test_exists(self, p, return_value, expected):
-        mock_batcher = MagicMock()
-        mock_batcher.exists = AsyncMock(return_value=return_value)
-        with patch.object(AzurePath, "_get_batcher", return_value=mock_batcher):
-            assert await p.exists() is expected
-
-    @pytest.mark.parametrize(
-        "exists_val,is_dir_val,expected",
-        [
-            (True, False, True),
-            (False, False, False),
-            (True, True, False),
-        ],
-        ids=["true_when_exists_and_not_dir", "false_when_not_exists", "false_when_is_dir"],
-    )
-    async def test_is_file(self, p, exists_val, is_dir_val, expected):
-        patches = [patch.object(p, "exists", new=AsyncMock(return_value=exists_val))]
-        if exists_val:
-            patches.append(patch.object(p, "is_dir", new=AsyncMock(return_value=is_dir_val)))
-        with contextlib.ExitStack() as stack:
-            for p_ in patches:
-                stack.enter_context(p_)
-            assert await p.is_file() is expected
 
     @pytest.mark.parametrize(
         "return_value,expected",

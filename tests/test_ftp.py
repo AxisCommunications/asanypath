@@ -324,6 +324,7 @@ class TestFTPPath(testbase):
 
     async def test_rename_same_host(self, client):
         client.exists.return_value = False
+        client.is_file.return_value = False
         renamed = await _ftp().rename("ftp://alice:pw@host.example:21/home/alice/new.txt")
         client.rename.assert_awaited_once_with("/home/alice/file.txt", "/home/alice/new.txt")
         assert isinstance(renamed, FTPPath)

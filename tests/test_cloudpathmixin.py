@@ -421,6 +421,34 @@ def cloud_path(request):
 class TestCloudPathShared:
     """Test CloudPathMixin concrete methods via real backend instances."""
 
+    @pytest.mark.parametrize(
+        ("object_exists", "is_dir", "expected", "listed"),
+        [(True, None, True, False), (False, True, True, True), (False, False, False, True)],
+        ids=["object", "non_empty_prefix", "missing"],
+    )
+    async def test_exists_covers_objects_and_directories(
+        self, cloud_path, object_exists, is_dir, expected, listed
+    ):
+        cls = type(cloud_path)
+        with (
+            patch.object(cls, "_object_exists", new=AsyncMock(return_value=object_exists)),
+            patch.object(cls, "is_dir", new=AsyncMock(return_value=is_dir)) as is_dir_mock,
+        ):
+            assert await cloud_path.exists() is expected
+        assert is_dir_mock.await_count == int(listed)
+
+    @pytest.mark.parametrize("object_exists", [True, False])
+    async def test_is_file_is_an_object_even_when_also_a_directory(self, cloud_path, object_exists):
+        if isinstance(cloud_path, ArtifactoryPath):
+            pytest.skip("Artifactory has real folders")
+        cls = type(cloud_path)
+        with (
+            patch.object(cls, "_object_exists", new=AsyncMock(return_value=object_exists)),
+            patch.object(cls, "is_dir", new=AsyncMock(return_value=True)) as is_dir_mock,
+        ):
+            assert await cloud_path.is_file() is object_exists
+        is_dir_mock.assert_not_awaited()
+
     def test_home(self, cloud_path, monkeypatch):
         # home() is a fresh path on another host; it must not reuse the
         # fixture's token, so provide an ambient one.
@@ -573,8 +601,7 @@ class TestCopyCallbacks:
 
         with (
             patch.object(src, "is_dir", new=AsyncMock(return_value=False)),
-            patch.object(dst, "exists", new=AsyncMock(return_value=True)),
-            patch.object(dst, "is_dir", new=AsyncMock(return_value=False)),
+            patch.object(dst, "is_file", new=AsyncMock(return_value=True)),
             patch.object(src, "checksums", new=AsyncMock(return_value={"sha256": "src"})),
             patch.object(dst, "checksums", new=AsyncMock(return_value={"sha256": "dst"})),
             patch.object(type(dst), "write_bytes", new=AsyncMock()) as write_bytes,
@@ -596,8 +623,7 @@ class TestCopyCallbacks:
 
         with (
             patch.object(src, "is_dir", new=AsyncMock(return_value=False)),
-            patch.object(dst, "exists", new=AsyncMock(return_value=True)),
-            patch.object(dst, "is_dir", new=AsyncMock(return_value=False)),
+            patch.object(dst, "is_file", new=AsyncMock(return_value=True)),
             patch.object(src, "checksums", new=AsyncMock(return_value={"sha256": "same"})),
             patch.object(dst, "checksums", new=AsyncMock(return_value={"sha256": "same"})),
             patch.object(type(dst), "write_bytes", new=AsyncMock()) as write_bytes,
@@ -618,8 +644,7 @@ class TestCopyCallbacks:
 
         with (
             patch.object(src, "is_dir", new=AsyncMock(return_value=False)),
-            patch.object(dst, "exists", new=AsyncMock(return_value=True)),
-            patch.object(dst, "is_dir", new=AsyncMock(return_value=False)),
+            patch.object(dst, "is_file", new=AsyncMock(return_value=True)),
             patch.object(src, "checksums", new=AsyncMock(return_value={"sha256": "src"})),
             patch.object(dst, "checksums", new=AsyncMock(return_value={"sha256": "dst"})),
             patch.object(S3Path, "_copy_batch_fn", AsyncMock()) as copy_fn,
