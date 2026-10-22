@@ -137,6 +137,11 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
         """
         super().__init__(*args, **kwargs)
         self._bind_path_attrs()
+        if not self._service_key:
+            raise ValueError(
+                "Artifactory path needs a host (art://<host>/artifactory/...), "
+                "or set ARTIFACTORY_BASE_URL to use art:// shorthand."
+            )
 
         from asanypath import _credstore
 

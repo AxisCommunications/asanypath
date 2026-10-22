@@ -361,6 +361,40 @@ def test_art_scheme_dispatch():
         assert isinstance(p, ArtifactoryPath)
 
 
+@pytest.mark.parametrize("setting", ["ARTIFACTORY_BASE_URL", "ART_BASE_URL"])
+async def test_bare_scheme_is_configured_service_root(monkeypatch, setting):
+    """``art://`` is the configured service root: env token allowed, repos listed."""
+    from asanypath import AsAnyPath
+    from asanypath.common import _BASE_URL_PREFIX_CACHE
+
+    _BASE_URL_PREFIX_CACHE.clear()
+    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
+    monkeypatch.setenv(setting, "https://artifactory.example.com/artifactory/")
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "env-token")
+    try:
+        root = AsAnyPath("art://")
+        assert str(root) == "art://artifactory.example.com/artifactory"
+        assert root._token == "env-token"
+        with patch(
+            "asanypath.artifactory.art_list_repos",
+            new=AsyncMock(return_value=["generic"]),
+        ) as mock:
+            assert [str(x) async for x in root.iterdir()] == [
+                "art://artifactory.example.com/artifactory/generic"
+            ]
+        assert mock.await_args.kwargs["base_url"] == "https://artifactory.example.com/artifactory"
+    finally:
+        _BASE_URL_PREFIX_CACHE.clear()
+
+
+def test_bare_scheme_without_base_url_names_the_setting(monkeypatch):
+    from asanypath.common import _BASE_URL_PREFIX_CACHE
+
+    _BASE_URL_PREFIX_CACHE.clear()
+    with pytest.raises(ValueError, match="ARTIFACTORY_BASE_URL"):
+        ArtifactoryPath("art://", token="tok")
+
+
 # ----------------------------------------------------------------------
 # Credstore wiring
 # ----------------------------------------------------------------------
