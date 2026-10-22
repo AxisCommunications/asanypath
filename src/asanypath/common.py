@@ -472,6 +472,7 @@ class CommonPurePathMixin:
 
         Example with ARTIFACTORY_BASE_URL=artifacts.example.com/artifactory:
         art://repo/path -> art://artifacts.example.com/artifactory/repo/path
+        art:// -> art://artifacts.example.com/artifactory
         """
         if self.protocol == "file":
             return part
@@ -494,6 +495,9 @@ class CommonPurePathMixin:
         normalized = scheme_re.sub(f"{self.protocol}{SCHEME_SEP}", part, count=1)
         normalized_rest = normalized.split(SCHEME_SEP, 1)[1].lstrip("/")
         base_prefix = base_prefix.rstrip("/")
+        if not normalized_rest:
+            # The bare root (e.g. ``art://``) is the configured service root.
+            return f"{self.protocol}{SCHEME_SEP}{base_prefix}"
         if normalized_rest == base_prefix or normalized_rest.startswith(f"{base_prefix}/"):
             return normalized
 
