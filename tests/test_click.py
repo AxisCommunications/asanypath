@@ -14,10 +14,11 @@ from click.shell_completion import get_completion_class
 from click.testing import CliRunner
 
 import asanypath.click
-from asanypath.click import BashComplete, ClickPath
+from asanypath.click import BashComplete, ClickPath, _maybe_rewrite_scp_style
 from asanypath.common import DirEntry
 from asanypath.local import SyncPath
 from asanypath.s3 import S3Path
+from asanypath.ssh import SSHPath
 from asanypath.sync import AsAnyPath
 
 
@@ -374,3 +375,85 @@ def test_bash_source_calls_complete_exe():
     source = script.source()
     assert "_PROG_COMPLETE=bash_complete /opt/prog)" in source
     assert "complete -o nosort -F _prog_completion prog" in source
+
+
+# --- scp-style host:path ---------------------------------------------------------------
+
+
+@pytest.fixture
+def ssh_alias(tmp_path, monkeypatch):
+    """An ssh config where ``prod-1`` and ``cvat`` are aliases."""
+    cfg = tmp_path / "ssh_config"
+    cfg.write_text("Host prod-1 cvat\n  HostName 10.0.0.5\n  Port 2222\n")
+    monkeypatch.setenv("SSH_CONFIG", str(cfg))
+    monkeypatch.setattr(SSHPath, "_env_config", None)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # Absolute paths are kept; relative and empty ones start in the remote home.
+        ("prod-1:/var/log", "ssh://prod-1/var/log"),
+        ("alice@prod-1:/var/log", "ssh://alice@prod-1/var/log"),
+        ("prod-1:", "ssh://prod-1/~/"),
+        ("alice@prod-1:", "ssh://alice@prod-1/~/"),
+        ("prod-1:foo/bar", "ssh://prod-1/~/foo/bar"),
+        # Not scp-style, or not a configured alias: unchanged.
+        ("unknownhost:/path", "unknownhost:/path"),
+        ("s3://bucket/key", "s3://bucket/key"),
+        ("ssh://h/x", "ssh://h/x"),
+        ("/abs/path", "/abs/path"),
+        ("./rel:path", "./rel:path"),
+        ("C:/data", "C:/data"),
+        ("plain.txt", "plain.txt"),
+    ],
+)
+def test_scp_style_rewrite(ssh_alias, value, expected):
+    assert _maybe_rewrite_scp_style(value) == expected
+
+
+def test_scp_style_needs_an_ssh_config(monkeypatch):
+    monkeypatch.setenv("SSH_CONFIG", "")
+    assert _maybe_rewrite_scp_style("prod-1:/var/log") == "prod-1:/var/log"
+
+
+def test_scp_style_value_is_an_ssh_path(ssh_alias, monkeypatch):
+    async def exists(self):
+        return True
+
+    monkeypatch.setattr(SSHPath, "exists", exists)
+    result, paths = invoke(ClickPath(path_type=str), "prod-1:/var/log", "alice@cvat:logs")
+    assert result.exit_code == 0, result.output
+    assert paths == ("ssh://prod-1/var/log", "ssh://alice@cvat/~/logs")
+
+
+def test_scp_style_unknown_host_is_not_rewritten(ssh_alias):
+    result, paths = invoke(ClickPath(path_type=str), "other:file")
+    assert result.exit_code == 0, result.output
+    assert not paths[0].startswith("ssh:")
+
+
+@pytest.mark.parametrize(
+    "incomplete,uri,expected",
+    [
+        ("cvat:", "ssh://cvat/~/", ["cvat:docs/", "cvat:notes.txt"]),
+        ("cvat:d", "ssh://cvat/~/", ["cvat:docs/"]),
+        ("u@cvat:/srv/", "ssh://u@cvat/srv/", ["u@cvat:/srv/docs/", "u@cvat:/srv/notes.txt"]),
+    ],
+)
+def test_complete_scp_style(ssh_alias, fake_listing, incomplete, uri, expected):
+    listings, listed = fake_listing
+    listings[uri] = [("docs", True), ("notes.txt", False)]
+    assert [value for value, _ in complete(ClickPath(), incomplete)] == expected
+    assert listed == [uri]
+
+
+def test_complete_unknown_host_is_local(ssh_alias, fake_listing):
+    _, listed = fake_listing
+    assert complete(ClickPath(), "other:") == [("other:", "file")]
+    assert listed == []
+
+
+def test_complete_scheme_is_not_a_host(ssh_alias, fake_listing):
+    assert complete(ClickPath(), "file:") == [("file://", "plain")]
+    assert fake_listing[1] == []

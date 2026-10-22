@@ -48,44 +48,6 @@ def test_completion_bash_outputs_script(runner):
     assert "complete -o nosort -F _asanypath_completion asanypath" in result.output
 
 
-@pytest.fixture
-def listed(monkeypatch):
-    """Fake remote listings for completion; records the URIs listed."""
-    import asanypath.click
-
-    uris: list[str] = []
-
-    def make(uri):
-        async def scandir():
-            uris.append(uri)
-            yield DirEntry(SimpleNamespace(name="docs"), is_dir=True)
-            yield DirEntry(SimpleNamespace(name="notes.txt"), is_dir=False)
-
-        return SimpleNamespace(scandir=scandir)
-
-    monkeypatch.setattr(asanypath.click, "_AsyncPath", make)
-    return uris
-
-
-@pytest.mark.parametrize(
-    "incomplete,uri,expected",
-    [
-        ("cvat:", "ssh://cvat/~/", ["cvat:docs/", "cvat:notes.txt"]),
-        ("cvat:d", "ssh://cvat/~/", ["cvat:docs/"]),
-        ("u@cvat:/srv/", "ssh://u@cvat/srv/", ["u@cvat:/srv/docs/", "u@cvat:/srv/notes.txt"]),
-    ],
-)
-def test_path_complete_scp_style(listed, incomplete, uri, expected):
-    out = cli_module._path_complete(None, None, incomplete)
-    assert [c.value for c in out] == expected
-    assert listed == [uri]
-
-
-def test_path_complete_scheme_is_not_a_host(listed):
-    assert [c.value for c in cli_module._path_complete(None, None, "file:")] == ["file://"]
-    assert listed == []
-
-
 # ---------------------------------------------------------------------------
 # exists
 # ---------------------------------------------------------------------------
@@ -1241,58 +1203,6 @@ def test_auth_show_ftp_reports_netrc_entry(runner, tmp_path, monkeypatch):
     result = runner.invoke(cli, ["auth", "show", "ftp://ftp.example.com/x"])
     assert result.exit_code == 0
     assert "entry found" in result.output
-
-
-# ---------------------------------------------------------------------------
-# scp-style sugar
-# ---------------------------------------------------------------------------
-
-
-def test_scp_style_rewrites_alias(tmp_path, monkeypatch):
-    cfg = tmp_path / "config"
-    cfg.write_text("Host prod-1\n  HostName 10.0.0.5\n  User deploy\n  Port 2222\n")
-    monkeypatch.setenv("SSH_CONFIG", str(cfg))
-    from asanypath.cli import _maybe_rewrite_scp_style
-    from asanypath.ssh import SSHPath
-
-    SSHPath._env_config = None
-    # Absolute paths preserved.
-    assert _maybe_rewrite_scp_style("prod-1:/var/log") == "ssh://prod-1/var/log"
-    assert _maybe_rewrite_scp_style("alice@prod-1:/var/log") == "ssh://alice@prod-1/var/log"
-    # Relative paths and empty path are home-relative (scp semantics).
-    assert _maybe_rewrite_scp_style("prod-1:") == "ssh://prod-1/~/"
-    assert _maybe_rewrite_scp_style("alice@prod-1:") == "ssh://alice@prod-1/~/"
-    assert _maybe_rewrite_scp_style("prod-1:foo") == "ssh://prod-1/~/foo"
-    assert _maybe_rewrite_scp_style("prod-1:foo/bar") == "ssh://prod-1/~/foo/bar"
-
-
-def test_scp_style_leaves_url_alone(monkeypatch):
-    monkeypatch.setenv("SSH_CONFIG", "")
-    from asanypath.cli import _maybe_rewrite_scp_style
-
-    assert _maybe_rewrite_scp_style("s3://bucket/key") == "s3://bucket/key"
-    assert _maybe_rewrite_scp_style("ssh://h/x") == "ssh://h/x"
-
-
-def test_scp_style_leaves_local_path_alone(monkeypatch):
-    monkeypatch.setenv("SSH_CONFIG", "")
-    from asanypath.cli import _maybe_rewrite_scp_style
-
-    assert _maybe_rewrite_scp_style("/abs/path") == "/abs/path"
-    assert _maybe_rewrite_scp_style("./rel:path") == "./rel:path"
-    assert _maybe_rewrite_scp_style("plain.txt") == "plain.txt"
-
-
-def test_scp_style_unknown_host_not_rewritten(tmp_path, monkeypatch):
-    cfg = tmp_path / "config"
-    cfg.write_text("Host knownhost\n  HostName real.example.com\n")
-    monkeypatch.setenv("SSH_CONFIG", str(cfg))
-    from asanypath.cli import _maybe_rewrite_scp_style
-    from asanypath.ssh import SSHPath
-
-    SSHPath._env_config = None
-    # No matching Host block -> passes through unchanged.
-    assert _maybe_rewrite_scp_style("unknownhost:/path") == "unknownhost:/path"
 
 
 @pytest.mark.asyncio

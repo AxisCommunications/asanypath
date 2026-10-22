@@ -483,7 +483,7 @@ asanypath auth show s3://bucket
 
 Path completions are available for all subcommands that take cloud paths: `ls`, `cp`, `mv`, `rm`, `stat`, `cat`, `exists`, `touch`, `checksums`, `mkdir`, `presign`, and `sync`.
 
-Completion lists the immediate children of the typed directory (directories end in `/`; dotfiles appear once you type the `.`), gives up after 5 seconds, and offers URI schemes (`s3://`, `ssh://`, …) as you type them. scp-style `host:path` completes too. Local paths use the shell's own file completion. Set `ASANYPATH_COMPLETION_DEBUG=1` to see why a completion came back empty.
+Completion lists the immediate children of the typed directory (directories end in `/`; dotfiles appear once you type the `.`), gives up after 5 seconds, and offers URI schemes (`s3://`, `ssh://`, …) as you type them. scp-style `host:path` completes too, for hosts that are aliases in your ssh config. Local paths use the shell's own file completion. Set `ASANYPATH_COMPLETION_DEBUG=1` to see why a completion came back empty.
 
 **Bash Setup:**
 
@@ -563,7 +563,9 @@ def main(model, out):
 
 `ClickPath` takes the same arguments as `click.Path`; `path_type` defaults to
 `asanypath.sync.AsAnyPath`. Local paths (including `file://` URIs) behave exactly
-like `click.Path`. Remote paths are checked with `exists()`, `is_dir()` and
+like `click.Path`. scp-style `[user@]host:path` becomes an `ssh://` path when
+`host` is an alias in your ssh config (a `Host` block with its own `HostName`).
+Remote paths are checked with `exists()`, `is_dir()` and
 `is_file()` while arguments are parsed:
 
 - `file_okay=False` / `dir_okay=False` reject a path only when it is exclusively

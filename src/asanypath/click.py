@@ -149,6 +149,40 @@ def _join_breaks(words: list[str]) -> list[str]:
 add_completion_class(BashComplete)
 
 
+def _maybe_rewrite_scp_style(value: str) -> str:
+    """Rewrite scp-style ``[user@]host:path`` to ``ssh://[user@]host/path``.
+
+    Only when ``host`` is an alias in the user's ssh config (a ``Host`` block
+    that sets another ``HostName``), so other values with a colon are kept.
+    """
+    if "://" in value or ":" not in value:
+        return value
+    head, _, tail = value.partition(":")
+    user = None
+    host = head
+    if "@" in head:
+        user, _, host = head.partition("@")
+    # Reject Windows drive letters (defensive) and obvious local paths.
+    if not host or len(host) == 1 or "/" in host or host.startswith("."):
+        return value
+    try:
+        from asanypath.ssh import _discover_ssh_config, _resolve_alias
+    except ImportError:
+        return value
+    if not _discover_ssh_config():
+        return value
+    if _resolve_alias(host, None, None)[0] == host:
+        # No Host block matched — leave alone (don't probe DNS).
+        return value
+    prefix = f"{user}@" if user else ""
+    # scp semantics: a leading ``/`` means absolute, anything else (including
+    # empty) is relative to the remote home. ``/~`` is translated by
+    # SSHPath._item_path to SFTP cwd (= home after login).
+    if tail.startswith("/"):
+        return f"ssh://{prefix}{host}{tail}"
+    return f"ssh://{prefix}{host}/~/{tail}"
+
+
 def _completion_debug(msg: str) -> None:
     if os.environ.get("ASANYPATH_COMPLETION_DEBUG"):
         print(f"[asanypath completion] {msg}", file=sys.stderr)
@@ -161,6 +195,9 @@ class ClickPath(click.Path):
     synchronous :class:`asanypath.sync.AsAnyPath`.
 
     Local paths, including ``file://`` URIs, behave exactly like ``click.Path``.
+    scp-style ``[user@]host:path`` becomes ``ssh://[user@]host/path`` (relative
+    paths start in the remote home) when ``host`` is an alias in the user's ssh
+    config; otherwise the value is used as given.
     For remote paths:
 
     * ``exists=True`` requires an object or a non-empty prefix at the path.
@@ -190,6 +227,8 @@ class ClickPath(click.Path):
         super().__init__(**kwargs)
 
     def convert(self, value: Any, param: click.Parameter | None, ctx: click.Context | None) -> Any:
+        if isinstance(value, str):
+            value = _maybe_rewrite_scp_style(value)
         try:
             path = AsAnyPath(value)
         except AsAnyPathError as exc:
@@ -232,20 +271,16 @@ class ClickPath(click.Path):
         if incomplete and schemes and "://" not in incomplete:
             # Plain items replace the shell's file completion, so add local matches.
             return [CompletionItem(c) for c in schemes + _local_matches(incomplete)]
-        uri = self._completion_uri(incomplete)
+        uri = _maybe_rewrite_scp_style(incomplete)
         if "://" not in uri:
             return super().shell_complete(ctx, param, incomplete)
-        # Keep what was typed (shorthand, scp-style) and add the child names.
+        # Keep what was typed (shorthand, host:path) and add the child names.
         head = incomplete[: len(incomplete) - len(uri.rsplit("/", 1)[1])]
         return [
             CompletionItem(head + name)
             for name in self._complete_remote(uri)
             if (head + name).startswith(incomplete)
         ]
-
-    def _completion_uri(self, value: str) -> str:
-        """The URI to list for ``value``. Override to accept CLI shorthands."""
-        return value
 
     def _complete_remote(self, uri: str) -> list[str]:
         """Sorted child names of ``uri``'s directory starting with its last
