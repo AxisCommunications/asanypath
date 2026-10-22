@@ -31,7 +31,7 @@ cargo check --manifest-path rust/Cargo.toml
 ## Pull Requests
 
 Keep pull requests focused and include tests for changed behavior. Preserve
-compatibility with Python 3.10 through 3.14. Describe user-visible changes and
+compatibility with Python 3.10 through 3.15. Describe user-visible changes and
 document new configuration, credentials, or backend behavior in the README.
 
 Do not include credentials, private endpoints, customer data, or other
