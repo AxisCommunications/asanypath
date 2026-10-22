@@ -196,12 +196,10 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
 
     @property
     def _service_key(self) -> str:
-        """``host/artifactory``: the service key for the keyring, the JFrog CLI
-        config and token scoping. Derived as before endpoint normalization so
-        stored credentials keep matching."""
-        raw = str(self)[len("art://") :]
-        idx = raw.find("/artifactory/")
-        return raw[: idx + len("/artifactory")] if idx >= 0 else raw.split("/")[0]
+        """``host/artifactory`` (or ``host``): the service key for the keyring,
+        the JFrog CLI config and token scoping. Same for the service root and
+        every path below it."""
+        return self._endpoint_url.removeprefix("https://")
 
     @property
     def _item_path(self) -> str:

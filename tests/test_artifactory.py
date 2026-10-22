@@ -426,6 +426,28 @@ def test_artifactory_explicit_token_is_saved(monkeypatch):
     assert saved[0][0].startswith("art:")
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "art://h.example.com/artifactory",
+        "art://h.example.com/artifactory/",
+        "art://h.example.com/artifactory/repo",
+        "art://h.example.com/artifactory/repo/dir/file.txt",
+    ],
+)
+def test_artifactory_cached_token_key_is_per_service(monkeypatch, path):
+    """The service root and paths below it share one keyring entry."""
+    from asanypath import _credstore
+
+    monkeypatch.setattr(ArtifactoryPath, "_service_tokens", {})
+    loaded: list = []
+    monkeypatch.setattr(_credstore, "load", lambda key, **_: loaded.append(key) or "cached")
+    with patch.dict("os.environ", {}, clear=True):
+        ArtifactoryPath._env_config = None
+        ArtifactoryPath(path)
+    assert loaded == ["art:h.example.com/artifactory"]
+
+
 def test_artifactory_loads_token_from_jfrog_cli_conf(tmp_path, monkeypatch):
     """No token/env/credstore → falls back to the JFrog CLI config."""
     import json
