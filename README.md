@@ -483,7 +483,7 @@ asanypath auth show s3://bucket
 
 Path completions are available for all subcommands that take cloud paths: `ls`, `cp`, `mv`, `rm`, `stat`, `cat`, `exists`, `touch`, `checksums`, `mkdir`, `presign`, and `sync`.
 
-Completions complete cloud paths up to 50 items deep with shallow enumeration (immediate children only), and are cached for 30 seconds per prefix to avoid redundant backend requests.
+Completion lists the immediate children of the typed directory (directories end in `/`; dotfiles appear once you type the `.`), gives up after 5 seconds, and offers URI schemes (`s3://`, `ssh://`, …) as you type them. scp-style `host:path` completes too, for hosts that are aliases in your ssh config. Local paths use the shell's own file completion. Set `ASANYPATH_COMPLETION_DEBUG=1` to see why a completion came back empty.
 
 **Bash Setup:**
 
@@ -563,7 +563,9 @@ def main(model, out):
 
 `ClickPath` takes the same arguments as `click.Path`; `path_type` defaults to
 `asanypath.sync.AsAnyPath`. Local paths (including `file://` URIs) behave exactly
-like `click.Path`. Remote paths are checked with `exists()`, `is_dir()` and
+like `click.Path`. scp-style `[user@]host:path` becomes an `ssh://` path when
+`host` is an alias in your ssh config (a `Host` block with its own `HostName`).
+Remote paths are checked with `exists()`, `is_dir()` and
 `is_file()` while arguments are parsed:
 
 - `file_okay=False` / `dir_okay=False` reject a path only when it is exclusively
@@ -571,6 +573,13 @@ like `click.Path`. Remote paths are checked with `exists()`, `is_dir()` and
 - `readable`, `writable`, `executable` and `resolve_path` apply to local paths only.
 - If the backend cannot be queried (credentials, network, unsupported protocol),
   `exists=True` reports the error and `exists=False` accepts the path unchecked.
+
+Shell completion of your CLI completes remote paths the same way as the
+`asanypath` CLI (see [Shell Completions](#shell-completions-beta)), with click's
+usual setup, e.g. `eval "$(_MYPROG_COMPLETE=bash_source myprog)"`. Importing
+`asanypath.click` registers `asanypath.click.BashComplete` for bash, which keeps
+URIs one word although bash splits words at `:` and `@`, and leaves no trailing
+space after a directory. With `file_okay=False` only directories are offered.
 
 ## Benchmarks
 
