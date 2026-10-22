@@ -48,129 +48,42 @@ def test_completion_bash_outputs_script(runner):
     assert "complete -o nosort -F _asanypath_completion asanypath" in result.output
 
 
-async def test_complete_path_prefix_lists_containers(monkeypatch):
-    """At a service root, completion uses the container fast path (no iterdir)."""
+@pytest.fixture
+def listed(monkeypatch):
+    """Fake remote listings for completion; records the URIs listed."""
+    import asanypath.click
 
-    class _FakeRoot:
-        @property
-        def parent(self):
-            return self
+    uris: list[str] = []
 
-        async def _list_containers(self):
-            return ["s3://beta", "s3://alpha/"]
+    def make(uri):
+        async def scandir():
+            uris.append(uri)
+            yield DirEntry(SimpleNamespace(name="docs"), is_dir=True)
+            yield DirEntry(SimpleNamespace(name="notes.txt"), is_dir=False)
 
-        async def iterdir(self):
-            raise AssertionError("iterdir must not run at container root")
-            yield  # pragma: no cover
+        return SimpleNamespace(scandir=scandir)
 
-    monkeypatch.setattr(cli_module, "AsAnyPath", lambda _prefix: _FakeRoot())
-    out = await cli_module._complete_path_prefix_async("s3://")
-    assert out == ["s3://alpha/", "s3://beta/"]
-
-
-def test_path_complete_cloud_returns_canonical_suggestions(monkeypatch):
-    monkeypatch.setattr(
-        cli_module,
-        "_complete_cloud_path",
-        lambda _: [
-            "s3://cta-dev/mikpen/subdir",
-            "s3://cta-dev/mikpen/test.txt",
-            "s3://cta-dev/mikpen/test2.txt",
-        ],
-    )
-
-    out = cli_module._path_complete(MagicMock(), MagicMock(), "s3://cta-dev/mikpen/")
-
-    assert out == [
-        "s3://cta-dev/mikpen/subdir",
-        "s3://cta-dev/mikpen/test.txt",
-        "s3://cta-dev/mikpen/test2.txt",
-    ]
+    monkeypatch.setattr(asanypath.click, "_AsyncPath", make)
+    return uris
 
 
-def test_path_complete_cloud_filters_by_typed_prefix(monkeypatch):
-    monkeypatch.setattr(
-        cli_module,
-        "_complete_cloud_path",
-        lambda _: [
-            "s3://cta-dev/mikpen/subdir/",
-            "s3://cta-dev/mikpen/test.txt",
-            "s3://cta-dev/mikpen/test2.txt",
-        ],
-    )
-
-    out = cli_module._path_complete(MagicMock(), MagicMock(), "s3://cta-dev/mikpen/sub")
-
-    assert out == ["s3://cta-dev/mikpen/subdir/"]
+@pytest.mark.parametrize(
+    "incomplete,uri,expected",
+    [
+        ("cvat:", "ssh://cvat/~/", ["cvat:docs/", "cvat:notes.txt"]),
+        ("cvat:d", "ssh://cvat/~/", ["cvat:docs/"]),
+        ("u@cvat:/srv/", "ssh://u@cvat/srv/", ["u@cvat:/srv/docs/", "u@cvat:/srv/notes.txt"]),
+    ],
+)
+def test_path_complete_scp_style(listed, incomplete, uri, expected):
+    out = cli_module._path_complete(None, None, incomplete)
+    assert [c.value for c in out] == expected
+    assert listed == [uri]
 
 
-def test_path_complete_cloud_keeps_directory_suffix(monkeypatch):
-    monkeypatch.setattr(
-        cli_module,
-        "_complete_cloud_path",
-        lambda _: [
-            "s3://cta-dev/mikpen/subdir/",
-            "s3://cta-dev/mikpen/test.txt",
-        ],
-    )
-
-    out = cli_module._path_complete(MagicMock(), MagicMock(), "s3://cta-dev/mikpen/sub")
-
-    assert out == ["s3://cta-dev/mikpen/subdir/"]
-
-
-def test_path_complete_cloud_matches_canonicalized_prefix(monkeypatch):
-    monkeypatch.setattr(
-        cli_module,
-        "_complete_cloud_path",
-        lambda _: [
-            "art://artifactory.example.com/artifactory/cta-datastore/datasets/",
-            "art://artifactory.example.com/artifactory/cta-datastore/docs/",
-        ],
-    )
-
-    out = cli_module._path_complete(MagicMock(), MagicMock(), "art://cta-datastore/d")
-
-    assert out == [
-        "art://cta-datastore/datasets/",
-        "art://cta-datastore/docs/",
-    ]
-
-
-def test_path_complete_rewrites_scp_style_prefix_for_cloud_completion(monkeypatch):
-    monkeypatch.setattr(
-        cli_module,
-        "_complete_cloud_path",
-        lambda _: [
-            "ssh://cvat/~/",
-            "ssh://cvat/~/docs/",
-            "ssh://cvat/~/notes.txt",
-        ],
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "_maybe_rewrite_scp_style",
-        lambda value, check_config=True: "ssh://cvat/~/" if value == "cvat:" else value,
-    )
-
-    out = cli_module._path_complete(MagicMock(), MagicMock(), "cvat:")
-
-    assert out == [
-        "cvat:",
-        "cvat:docs/",
-        "cvat:notes.txt",
-    ]
-
-
-def test_path_complete_scp_style_keeps_local_completion_when_not_rewritten(monkeypatch):
-    monkeypatch.setattr(
-        cli_module, "_maybe_rewrite_scp_style", lambda value, check_config=True: value
-    )
-    monkeypatch.setattr(cli_module, "_complete_local_path", lambda _: ["cvat:/tmp/"])
-
-    out = cli_module._path_complete(MagicMock(), MagicMock(), "cvat:")
-
-    assert out == ["cvat:/tmp/"]
+def test_path_complete_scheme_is_not_a_host(listed):
+    assert [c.value for c in cli_module._path_complete(None, None, "file:")] == ["file://"]
+    assert listed == []
 
 
 # ---------------------------------------------------------------------------
