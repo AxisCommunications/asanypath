@@ -853,6 +853,20 @@ translating provider IAM or ACL models.
 - `name`, `stem`, `suffix`, `parent`, `parts`
 - `protocol` — URI scheme (`s3`, `gs`, `az`, `art`, `file`, …)
 
+### Relative paths
+
+A relative remote path has no bucket or host, so `relative_to()` on a remote path
+returns a `pathlib.PurePosixPath`. Join it onto any path with `/`, e.g. to mirror a
+tree across backends:
+
+```python
+for src in src_root.rglob("*"):
+    await src.copy(dst_root / src.relative_to(src_root))
+```
+
+`walk_up=True` returns `..` segments within the same bucket/host; paths with a
+different bucket/host, scheme, or a relative `other` raise `ValueError`.
+
 ## Development
 
 Run these commands in a POSIX-compatible shell such as Bash or Zsh:

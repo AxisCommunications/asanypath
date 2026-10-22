@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from importlib import import_module
 from os import PathLike, getenv, stat_result
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -244,7 +244,9 @@ class AsAnyPurePath(ABC):
         pass
 
     @abstractmethod
-    def relative_to(self, *other: str | PathLike[str], walk_up: bool = False) -> Self:
+    def relative_to(
+        self, *other: str | PathLike[str], walk_up: bool = False
+    ) -> Self | PurePosixPath:
         pass
 
     @property
