@@ -34,7 +34,7 @@ from asanypath._backend_opts import kwargs_for, parse_options
 from asanypath._transfer import TransferBudget, transfer_scope
 from asanypath._version import __version__
 from asanypath.asanypath import PROTOCOL_MAP
-from asanypath.click import BashComplete, ClickPath
+from asanypath.click import BashComplete, ClickPath, _maybe_rewrite_scp_style
 
 if TYPE_CHECKING:
     from rich.progress import Progress
@@ -518,44 +518,6 @@ def mask_token(token: str | None, max_visible: int = 4) -> str:
     return token[:max_visible] + "*" * (len(token) - max_visible)
 
 
-def _maybe_rewrite_scp_style(value: str, check_config: bool = True) -> str:
-    """Rewrite scp-style ``[user@]host:path`` to ``ssh://[user@]host/path``.
-
-    When ``check_config=True`` (default), only rewrites if ``host`` matches
-    an entry in the user's ``~/.ssh/config`` (avoids hijacking local paths
-    that happen to contain a colon). When ``check_config=False`` (completion
-    mode), rewrites any scp-style prefix optimistically.
-    """
-    if "://" in value or ":" not in value:
-        return value
-    head, _, tail = value.partition(":")
-    user = None
-    host = head
-    if "@" in head:
-        user, _, host = head.partition("@")
-    # Reject Windows drive letters (defensive) and obvious local paths.
-    if not host or len(host) == 1 or "/" in host or host.startswith("."):
-        return value
-    if check_config:
-        try:
-            from asanypath.ssh import _discover_ssh_config, _resolve_alias
-        except ImportError:
-            return value
-        if not _discover_ssh_config():
-            return value
-        resolved_host = _resolve_alias(host, None, None)[0]
-        if resolved_host == host:
-            # No Host block matched — leave alone (don't probe DNS).
-            return value
-    prefix = f"{user}@" if user else ""
-    # scp semantics: a leading ``/`` means absolute, anything else (including
-    # empty) is relative to the remote home. ``/~`` is translated by
-    # SSHPath._item_path to SFTP cwd (= home after login).
-    if tail.startswith("/"):
-        return f"ssh://{prefix}{host}{tail}"
-    return f"ssh://{prefix}{host}/~/{tail}"
-
-
 def _resolve_path_arg(ctx: click.Context, param: click.Parameter, value: str | None) -> str:
     """Click callback: return value, falling back to a single line read from stdin."""
     if value is not None:
@@ -692,14 +654,7 @@ def _fmt_http_date(value: str, fmt: str = "%Y-%m-%d %H:%M:%S.%f %z") -> str:
             return value
 
 
-class _CliPath(ClickPath):
-    """Completion for path arguments; also completes scp-style ``host:path``."""
-
-    def _completion_uri(self, word: str) -> str:
-        return _maybe_rewrite_scp_style(word, check_config=False)
-
-
-_path_complete = _CliPath().shell_complete
+_path_complete = ClickPath().shell_complete
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
