@@ -361,6 +361,40 @@ def test_art_scheme_dispatch():
         assert isinstance(p, ArtifactoryPath)
 
 
+@pytest.mark.parametrize("setting", ["ARTIFACTORY_BASE_URL", "ART_BASE_URL"])
+async def test_bare_scheme_is_configured_service_root(monkeypatch, setting):
+    """``art://`` is the configured service root: env token allowed, repos listed."""
+    from asanypath import AsAnyPath
+    from asanypath.common import _BASE_URL_PREFIX_CACHE
+
+    _BASE_URL_PREFIX_CACHE.clear()
+    monkeypatch.setattr(ArtifactoryPath, "_env_config", None)
+    monkeypatch.setenv(setting, "https://artifactory.example.com/artifactory/")
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "env-token")
+    try:
+        root = AsAnyPath("art://")
+        assert str(root) == "art://artifactory.example.com/artifactory"
+        assert root._token == "env-token"
+        with patch(
+            "asanypath.artifactory.art_list_repos",
+            new=AsyncMock(return_value=["generic"]),
+        ) as mock:
+            assert [str(x) async for x in root.iterdir()] == [
+                "art://artifactory.example.com/artifactory/generic"
+            ]
+        assert mock.await_args.kwargs["base_url"] == "https://artifactory.example.com/artifactory"
+    finally:
+        _BASE_URL_PREFIX_CACHE.clear()
+
+
+def test_bare_scheme_without_base_url_names_the_setting(monkeypatch):
+    from asanypath.common import _BASE_URL_PREFIX_CACHE
+
+    _BASE_URL_PREFIX_CACHE.clear()
+    with pytest.raises(ValueError, match="ARTIFACTORY_BASE_URL"):
+        ArtifactoryPath("art://", token="tok")
+
+
 # ----------------------------------------------------------------------
 # Credstore wiring
 # ----------------------------------------------------------------------
@@ -390,6 +424,28 @@ def test_artifactory_explicit_token_is_saved(monkeypatch):
     assert len(saved) == 1
     assert saved[0][1] == "explicit-token"
     assert saved[0][0].startswith("art:")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "art://h.example.com/artifactory",
+        "art://h.example.com/artifactory/",
+        "art://h.example.com/artifactory/repo",
+        "art://h.example.com/artifactory/repo/dir/file.txt",
+    ],
+)
+def test_artifactory_cached_token_key_is_per_service(monkeypatch, path):
+    """The service root and paths below it share one keyring entry."""
+    from asanypath import _credstore
+
+    monkeypatch.setattr(ArtifactoryPath, "_service_tokens", {})
+    loaded: list = []
+    monkeypatch.setattr(_credstore, "load", lambda key, **_: loaded.append(key) or "cached")
+    with patch.dict("os.environ", {}, clear=True):
+        ArtifactoryPath._env_config = None
+        ArtifactoryPath(path)
+    assert loaded == ["art:h.example.com/artifactory"]
 
 
 def test_artifactory_loads_token_from_jfrog_cli_conf(tmp_path, monkeypatch):
