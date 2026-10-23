@@ -287,6 +287,30 @@ pub trait CloudBackend {
 /// second, under S3's 3,500 writes per second per prefix.
 pub const TREE_DELETE_CONCURRENCY: usize = 64;
 
+/// One DELETE per key, at most [`TREE_DELETE_CONCURRENCY`] in flight; a key
+/// that is already gone counts as deleted.
+pub async fn delete_each<B: CloudBackend + ?Sized>(
+    backend: &B,
+    keys: Vec<String>,
+    use_h2: bool,
+) -> Result<(), PyErr> {
+    futures::stream::iter(keys)
+        .map(|key| async move {
+            let (status, body) = backend
+                .do_request("DELETE", &key, None, use_h2, &[])
+                .await
+                .map_err(PyRuntimeError::new_err)?;
+            if status.is_success() || status == StatusCode::NOT_FOUND {
+                Ok(())
+            } else {
+                Err(status_to_pyerr(status, &backend.error_path(&key), &body))
+            }
+        })
+        .buffer_unordered(TREE_DELETE_CONCURRENCY)
+        .try_for_each(|()| async { Ok(()) })
+        .await
+}
+
 /// Recursive delete for object stores addressed by key prefix.
 pub trait TreeDelete: CloudBackend {
     /// One page of every object key under `search_prefix`, listed without a
@@ -304,23 +328,7 @@ pub trait TreeDelete: CloudBackend {
         keys: Vec<String>,
         use_h2: bool,
     ) -> impl std::future::Future<Output = Result<(), PyErr>> {
-        async move {
-            futures::stream::iter(keys)
-                .map(|key| async move {
-                    let (status, body) = self
-                        .do_request("DELETE", &key, None, use_h2, &[])
-                        .await
-                        .map_err(PyRuntimeError::new_err)?;
-                    if status.is_success() || status == StatusCode::NOT_FOUND {
-                        Ok(())
-                    } else {
-                        Err(status_to_pyerr(status, &self.error_path(&key), &body))
-                    }
-                })
-                .buffer_unordered(TREE_DELETE_CONCURRENCY)
-                .try_for_each(|()| async { Ok(()) })
-                .await
-        }
+        delete_each(self, keys, use_h2)
     }
 
     /// Delete every object under `prefix` (marker keys included), deleting

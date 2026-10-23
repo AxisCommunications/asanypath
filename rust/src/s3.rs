@@ -554,6 +554,124 @@ impl crate::backend::TreeDelete for S3Creds {
         let next = s3_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
         Ok((keys.0, next))
     }
+
+    /// One DeleteObjects request per 1000 keys; keys an XML body cannot carry
+    /// are deleted one by one.
+    async fn delete_keys(&self, keys: Vec<String>, use_h2: bool) -> Result<(), PyErr> {
+        let (bulk, single): (Vec<_>, Vec<_>) = keys.into_iter().partition(|key| xml_text(key));
+        crate::backend::delete_each(self, single, use_h2).await?;
+        for chunk in bulk.chunks(DELETE_OBJECTS_MAX) {
+            delete_objects(self, chunk, use_h2).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Keys per DeleteObjects request (the S3 maximum).
+const DELETE_OBJECTS_MAX: usize = 1000;
+
+/// Whether `value` can be XML 1.0 character data (escaped as needed).
+fn xml_text(value: &str) -> bool {
+    !value.chars().any(|c| {
+        (c < ' ' && !matches!(c, '\t' | '\n' | '\r')) || c == '\u{FFFE}' || c == '\u{FFFF}'
+    })
+}
+
+/// Delete up to 1000 keys with one DeleteObjects request. Keys that do not
+/// exist count as deleted; the first per-key error is raised.
+async fn delete_objects(creds: &S3Creds, keys: &[String], use_h2: bool) -> Result<(), PyErr> {
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet>"#,
+    );
+    for key in keys {
+        body.push_str("<Object><Key>");
+        body.push_str(&xml_escape(key));
+        body.push_str("</Key></Object>");
+    }
+    body.push_str("</Delete>");
+    use base64::Engine;
+    use md5::Digest;
+    let checksum = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body));
+    let headers = [
+        ("content-md5".to_string(), checksum),
+        ("content-type".to_string(), "application/xml".to_string()),
+    ];
+    let query = [("delete".to_string(), String::new())];
+    let (status, response, _) = do_s3_request(
+        creds,
+        "POST",
+        "",
+        &query,
+        Some(Bytes::from(body)),
+        use_h2,
+        &headers,
+    )
+    .await
+    .map_err(PyRuntimeError::new_err)?;
+    let bucket = format!("s3://{}", creds.bucket);
+    if !status.is_success() {
+        return Err(status_to_pyerr(status, &bucket, &response));
+    }
+    match parse_delete_errors(&response).into_iter().next() {
+        None => Ok(()),
+        Some((key, code)) => {
+            let path = format!("{bucket}/{key}");
+            Err(match code.as_str() {
+                "AccessDenied" => status_to_pyerr(reqwest::StatusCode::FORBIDDEN, &path, &[]),
+                _ => PyRuntimeError::new_err(format!("{code}: '{path}'")),
+            })
+        }
+    }
+}
+
+/// `(key, code)` of each `<Error>` in a DeleteObjects response, except keys
+/// that were already gone.
+fn parse_delete_errors(body: &[u8]) -> Vec<(String, String)> {
+    let mut reader = Reader::from_reader(body);
+    let mut buf = Vec::new();
+    let mut errors = Vec::new();
+    let (mut in_error, mut tag, mut key, mut code) =
+        (false, String::new(), String::new(), String::new());
+    loop {
+        let target = match tag.as_str() {
+            "Key" if in_error => Some(&mut key),
+            "Code" if in_error => Some(&mut code),
+            _ => None,
+        };
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                tag = local_name(e.name().as_ref()).to_string();
+                if tag == "Error" {
+                    in_error = true;
+                    key.clear();
+                    code.clear();
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if let Some(target) = target {
+                    target.push_str(&e.xml10_content());
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Some(target) = target {
+                    push_reference(target, &e);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local_name(e.name().as_ref()) == "Error" {
+                    in_error = false;
+                    if code != "NoSuchKey" {
+                        errors.push((std::mem::take(&mut key), std::mem::take(&mut code)));
+                    }
+                }
+                tag.clear();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    errors
 }
 
 /// List all buckets (service-level ListBuckets). Returns bare bucket names.
@@ -1428,7 +1546,32 @@ pub fn s3_list_buckets<'py>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, parse_listing_page, parse_s3_acl};
+    use super::{Listing, parse_delete_errors, parse_listing_page, parse_s3_acl, xml_text};
+
+    #[test]
+    fn delete_errors_skip_keys_already_gone() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Error><Key>gone.txt</Key><Code>NoSuchKey</Code><Message>x</Message></Error>
+  <Error><Key>a &amp; b.txt</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error>
+  <Error><Key>c.txt</Key><Code>InternalError</Code><Message>try again</Message></Error>
+</DeleteResult>"#;
+        assert_eq!(
+            parse_delete_errors(body),
+            vec![
+                ("a & b.txt".to_string(), "AccessDenied".to_string()),
+                ("c.txt".to_string(), "InternalError".to_string()),
+            ]
+        );
+        assert!(parse_delete_errors(b"<DeleteResult/>").is_empty());
+    }
+
+    #[test]
+    fn xml_text_rejects_characters_xml_cannot_carry() {
+        assert!(xml_text("dir/a <&> \"b\" \u{e9}.txt"));
+        assert!(!xml_text("dir/a\u{1}b"));
+        assert!(!xml_text("dir/a\u{ffff}"));
+    }
 
     #[test]
     fn parses_listing_page_metadata() {
