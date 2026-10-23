@@ -17,6 +17,7 @@ pub mod backend;
 pub mod cache;
 pub mod http;
 pub mod listing;
+pub mod multipart;
 pub mod xml;
 
 pub mod artifactory;

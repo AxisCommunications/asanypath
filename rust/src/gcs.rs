@@ -723,6 +723,51 @@ impl crate::backend::TreeDelete for GcsCreds {
         let next = gcs_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
         Ok((keys.0, next))
     }
+
+    /// One JSON batch request per 100 objects.
+    async fn delete_keys(&self, keys: Vec<String>, use_h2: bool) -> Result<(), PyErr> {
+        let batches: Vec<_> = keys
+            .chunks(GCS_BATCH_MAX)
+            .map(|names| gcs_batch_delete(self, names, use_h2))
+            .collect();
+        crate::backend::run_batches(batches).await
+    }
+}
+
+/// Requests per JSON batch request (the GCS maximum).
+const GCS_BATCH_MAX: usize = 100;
+
+/// Delete up to 100 objects with one JSON batch request; the outer
+/// request's authorization applies to every part.
+async fn gcs_batch_delete(creds: &GcsCreds, names: &[String], use_h2: bool) -> Result<(), PyErr> {
+    let requests: Vec<String> = names
+        .iter()
+        .map(|name| {
+            let url = creds.object_url(name);
+            format!("DELETE {} HTTP/1.1", crate::multipart::path_of(&url))
+        })
+        .collect();
+    let boundary = crate::multipart::boundary();
+    let body = crate::multipart::body(&boundary, &requests);
+    let mut headers = creds.auth_headers().await;
+    headers.push((
+        "content-type".to_string(),
+        format!("multipart/mixed; boundary={boundary}"),
+    ));
+    let url = format!("{}/batch/storage/v1", creds.endpoint.trim_end_matches('/'));
+    let (status, response) =
+        do_request_light("POST", &url, &headers, Some(Bytes::from(body)), use_h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("gs://{}", creds.bucket),
+            &response,
+        ));
+    }
+    let statuses = crate::multipart::statuses(&response);
+    crate::multipart::check_deletes(statuses, names, |name| creds.error_path(name))
 }
 
 /// List all buckets in a project (GET /storage/v1/b?project=). Returns bare names.

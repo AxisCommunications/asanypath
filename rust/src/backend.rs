@@ -287,6 +287,23 @@ pub trait CloudBackend {
 /// second, under S3's 3,500 writes per second per prefix.
 pub const TREE_DELETE_CONCURRENCY: usize = 64;
 
+/// Batch requests in flight per tree-delete page: a 1,000-key GCS page is 10
+/// batches of 100. 1/2/4/8 in flight took 0.37/0.21/0.17/0.15 s for 1,000
+/// objects at a 20 ms round trip; 4 keeps at most 400 deletes in flight.
+pub const BATCHES_IN_FLIGHT: usize = 4;
+
+/// Run `batches` (one future per batch request), at most
+/// [`BATCHES_IN_FLIGHT`] at a time.
+pub async fn run_batches<Fut>(batches: Vec<Fut>) -> Result<(), PyErr>
+where
+    Fut: std::future::Future<Output = Result<(), PyErr>>,
+{
+    futures::stream::iter(batches)
+        .buffer_unordered(BATCHES_IN_FLIGHT)
+        .try_for_each(|()| async { Ok(()) })
+        .await
+}
+
 /// One DELETE per key, at most [`TREE_DELETE_CONCURRENCY`] in flight; a key
 /// that is already gone counts as deleted.
 pub async fn delete_each<B: CloudBackend + ?Sized>(

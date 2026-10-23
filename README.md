@@ -144,11 +144,11 @@ await path.rmdir(recursive=True)
 ```
 
 On S3, GCS and Azure a recursive delete lists the prefix once at every depth
-and deletes each key below it, directory marker objects included: S3 with one
-`DeleteObjects` request per 1,000 keys, GCS and Azure with at most 64 requests
-in flight. Keys a request URL could misaddress (`.`/`..` segments, `\`, `%`,
-`?`, `#`, control characters) are left in place and logged. On Artifactory a
-folder is deleted with one request.
+and deletes each key below it, directory marker objects included, in bulk: S3
+with one `DeleteObjects` request per 1,000 keys, GCS with JSON batch requests
+of 100 and Azure with Blob Batch requests of 256. Keys a request URL could
+misaddress (`.`/`..` segments, `\`, `%`, `?`, `#`, control characters) are left
+in place and logged. On Artifactory a folder is deleted with one request.
 
 Copies automatically use spare transfer concurrency for large ranged reads.
 The default target is 8 streams, with an 8 MiB minimum range size and at most

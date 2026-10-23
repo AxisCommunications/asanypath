@@ -560,10 +560,11 @@ impl crate::backend::TreeDelete for S3Creds {
     async fn delete_keys(&self, keys: Vec<String>, use_h2: bool) -> Result<(), PyErr> {
         let (bulk, single): (Vec<_>, Vec<_>) = keys.into_iter().partition(|key| xml_text(key));
         crate::backend::delete_each(self, single, use_h2).await?;
-        for chunk in bulk.chunks(DELETE_OBJECTS_MAX) {
-            delete_objects(self, chunk, use_h2).await?;
-        }
-        Ok(())
+        let batches: Vec<_> = bulk
+            .chunks(DELETE_OBJECTS_MAX)
+            .map(|chunk| delete_objects(self, chunk, use_h2))
+            .collect();
+        crate::backend::run_batches(batches).await
     }
 }
 

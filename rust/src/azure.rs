@@ -111,7 +111,18 @@ impl AzCreds {
         let now = chrono_now_rfc2822();
         headers.push(("x-ms-date".to_string(), now));
         headers.push(("x-ms-version".to_string(), API_VERSION.to_string()));
+        self.sign_headers(method, url, headers, params);
+    }
 
+    /// Add the SharedKey `authorization` for `headers` as given (batch
+    /// sub-requests carry `x-ms-date` but no `x-ms-version`).
+    fn sign_headers(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &mut Vec<(String, String)>,
+        params: Option<&[(&str, &str)]>,
+    ) {
         let key_bytes = match &self.key_bytes {
             Some(kb) => kb,
             None => return, // SAS auth or no key, no signing needed
@@ -488,6 +499,65 @@ impl crate::backend::TreeDelete for AzCreds {
         let next = az_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
         Ok((keys.0, next))
     }
+
+    /// One Blob Batch request per 256 blobs.
+    async fn delete_keys(&self, keys: Vec<String>, use_h2: bool) -> Result<(), PyErr> {
+        let batches: Vec<_> = keys
+            .chunks(AZ_BATCH_MAX)
+            .map(|blobs| az_batch_delete(self, blobs, use_h2))
+            .collect();
+        crate::backend::run_batches(batches).await
+    }
+}
+
+/// Sub-requests per Blob Batch request (the Azure maximum).
+const AZ_BATCH_MAX: usize = 256;
+
+/// Delete up to 256 blobs with one container-scoped Blob Batch request.
+/// Each sub-request is authorized on its own and carries no `x-ms-version`:
+/// the batch's version applies.
+async fn az_batch_delete(creds: &AzCreds, blobs: &[String], use_h2: bool) -> Result<(), PyErr> {
+    let requests: Vec<String> = blobs
+        .iter()
+        .map(|blob| {
+            let url = creds.blob_url(blob);
+            let mut headers = vec![
+                ("x-ms-date".to_string(), chrono_now_rfc2822()),
+                ("content-length".to_string(), "0".to_string()),
+            ];
+            creds.sign_headers("DELETE", &url, &mut headers, None);
+            let mut request = format!("DELETE {} HTTP/1.1", crate::multipart::path_of(&url));
+            for (name, value) in &headers {
+                request.push_str(&format!("\r\n{name}: {value}"));
+            }
+            request
+        })
+        .collect();
+    let boundary = crate::multipart::boundary();
+    let body = crate::multipart::body(&boundary, &requests);
+    let params = [("restype", "container"), ("comp", "batch")];
+    let url = creds.list_url(&params);
+    let mut headers = vec![
+        (
+            "content-type".to_string(),
+            format!("multipart/mixed; boundary={boundary}"),
+        ),
+        ("content-length".to_string(), body.len().to_string()),
+    ];
+    creds.sign("POST", &url, &mut headers, Some(&params));
+    let (status, response) =
+        do_request_light("POST", &url, &headers, Some(Bytes::from(body)), use_h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("az://{}", creds.container),
+            &response,
+        ));
+    }
+    let statuses = crate::multipart::statuses(&response);
+    crate::multipart::check_deletes(statuses, blobs, |blob| creds.error_path(blob))
 }
 
 fn parse_az_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<String> {
