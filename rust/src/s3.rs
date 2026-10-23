@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::http::{do_request, extract_host, status_to_pyerr};
 use crate::listing::{Keys, ListEntry, ListSink, Listing};
-use crate::xml::local_name;
+use crate::xml::{local_name, push_reference};
 use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -294,8 +294,9 @@ async fn do_s3_request(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn parse_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<String> {
+    // Untrimmed: keys may start or end with spaces. Text is only read inside
+    // leaf elements, so whitespace between elements is never used.
     let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
 
     let mut buf = Vec::with_capacity(256);
     let mut text = String::new();
@@ -323,6 +324,7 @@ pub(crate) fn parse_listing_page(body: &[u8], listing: &mut impl ListSink) -> Op
                 text.clear();
             }
             Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+            Ok(Event::GeneralRef(e)) => push_reference(&mut text, &e),
             Ok(Event::End(e)) => {
                 let name = e.name();
                 match local_name(name.as_ref()) {
@@ -1458,6 +1460,19 @@ mod tests {
                 ("s3://b/dir/sub".into(), true, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn listing_keeps_escaped_characters_and_edge_spaces() {
+        let body = br#"<ListBucketResult>
+  <Contents><Key>dir/a &amp; b&#46;txt</Key><Size>1</Size></Contents>
+  <Contents>
+    <Key>dir/ lead &lt;x&gt; </Key><Size>2</Size>
+  </Contents>
+</ListBucketResult>"#;
+        let mut keys = super::Keys::default();
+        assert_eq!(parse_listing_page(body, &mut keys), None);
+        assert_eq!(keys.0, vec!["dir/a & b.txt", "dir/ lead <x> "]);
     }
 
     #[test]

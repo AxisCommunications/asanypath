@@ -491,8 +491,9 @@ impl crate::backend::TreeDelete for AzCreds {
 }
 
 fn parse_az_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<String> {
+    // Untrimmed: blob names may start or end with spaces. Text is only read
+    // inside leaf elements, so whitespace between elements is never used.
     let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut text = String::new();
     let mut in_blob = false;
@@ -519,6 +520,7 @@ fn parse_az_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<Str
                 text.clear();
             }
             Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+            Ok(Event::GeneralRef(e)) => crate::xml::push_reference(&mut text, &e),
             Ok(Event::End(e)) => {
                 let tag = e.name();
                 match local_name(tag.as_ref()) {
@@ -1232,5 +1234,18 @@ mod tests {
                 ("az://c/dir/sub".into(), true, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn listing_keeps_escaped_characters_and_edge_spaces() {
+        let body = br#"<EnumerationResults><Blobs>
+  <Blob><Name>dir/a &amp; b&#46;txt</Name></Blob>
+  <Blob>
+    <Name> dir/ lead &quot;x&quot; </Name>
+  </Blob>
+</Blobs><NextMarker /></EnumerationResults>"#;
+        let mut keys = super::Keys::default();
+        assert_eq!(parse_az_listing_page(body, &mut keys), None);
+        assert_eq!(keys.0, vec!["dir/a & b.txt", " dir/ lead \"x\" "]);
     }
 }
