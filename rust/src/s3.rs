@@ -31,7 +31,7 @@ use quick_xml::{XmlVersion, events::Event};
 use serde::{Deserialize, Serialize};
 
 use crate::http::{do_request, extract_host, status_to_pyerr};
-use crate::listing::{ListEntry, Listing};
+use crate::listing::{Keys, ListEntry, ListSink, Listing};
 use crate::xml::local_name;
 use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
@@ -293,7 +293,7 @@ async fn do_s3_request(
 // XML listing parser
 // ---------------------------------------------------------------------------
 
-pub(crate) fn parse_listing_page(body: &[u8], listing: &mut Listing) -> Option<String> {
+pub(crate) fn parse_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<String> {
     let mut reader = Reader::from_reader(body);
     reader.config_mut().trim_text(true);
 
@@ -496,40 +496,62 @@ impl CloudBackend for S3Creds {
 // Internal async helpers (used by both single + batch pyfunctions)
 // ---------------------------------------------------------------------------
 
+/// Fetch one ListObjectsV2 page into `sink`; returns the next continuation token.
+/// Without `delimiter` the page holds every key at any depth.
+async fn s3_list_page(
+    creds: &S3Creds,
+    search_prefix: &str,
+    delimiter: bool,
+    token: Option<String>,
+    use_h2: bool,
+    sink: &mut impl ListSink,
+) -> Result<Option<String>, PyErr> {
+    let mut query = vec![
+        ("list-type".to_string(), "2".to_string()),
+        ("prefix".to_string(), search_prefix.to_string()),
+    ];
+    if delimiter {
+        query.push(("delimiter".to_string(), "/".to_string()));
+    }
+    if let Some(token) = token {
+        query.push(("continuation-token".to_string(), token));
+    }
+    let (status, body, _headers) = do_s3_request(creds, "GET", "", &query, None, use_h2, &[])
+        .await
+        .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("s3://{}/{}", creds.bucket, search_prefix),
+            &body,
+        ));
+    }
+    Ok(parse_listing_page(&body, sink))
+}
+
 async fn do_s3_list(creds: &S3Creds, prefix: &str, use_h2: bool) -> Result<Vec<ListEntry>, PyErr> {
     let mut listing = Listing::new(format!("s3://{}", creds.bucket), prefix);
     let search_prefix = listing.search_prefix().to_string();
-    let mut continuation_token: Option<String> = None;
-
+    let mut token = None;
     loop {
-        let mut query = vec![
-            ("list-type".to_string(), "2".to_string()),
-            ("prefix".to_string(), search_prefix.clone()),
-            ("delimiter".to_string(), "/".to_string()),
-        ];
-        if let Some(ref token) = continuation_token {
-            query.push(("continuation-token".to_string(), token.clone()));
-        }
-
-        let (status, body, _headers) = do_s3_request(creds, "GET", "", &query, None, use_h2, &[])
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e))?;
-
-        if !status.is_success() {
-            return Err(status_to_pyerr(
-                status,
-                &format!("s3://{}/{}", creds.bucket, search_prefix),
-                &body,
-            ));
-        }
-
-        continuation_token = parse_listing_page(&body, &mut listing);
-        if continuation_token.is_none() {
-            break;
+        token = s3_list_page(creds, &search_prefix, true, token, use_h2, &mut listing).await?;
+        if token.is_none() {
+            return Ok(listing.finish());
         }
     }
+}
 
-    Ok(listing.finish())
+impl crate::backend::TreeDelete for S3Creds {
+    async fn list_keys_page(
+        &self,
+        search_prefix: &str,
+        token: Option<String>,
+        use_h2: bool,
+    ) -> Result<(Vec<String>, Option<String>), PyErr> {
+        let mut keys = Keys::default();
+        let next = s3_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
+        Ok((keys.0, next))
+    }
 }
 
 /// List all buckets (service-level ListBuckets). Returns bare bucket names.
@@ -1287,6 +1309,33 @@ pub fn s3_delete_batch<'py>(
             session_token
         );
         batch_fire!(creds, keys, h2, delete)
+    })
+}
+
+/// Delete every object under `prefix`.
+#[pyfunction]
+pub fn s3_delete_tree<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = s3_creds!(
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token
+        );
+        crate::backend::TreeDelete::delete_tree(&creds, &prefix, h2).await
     })
 }
 

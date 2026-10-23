@@ -143,6 +143,12 @@ await src.copy(dst, recursive=True)
 await path.rmdir(recursive=True)
 ```
 
+On S3, GCS and Azure a recursive delete lists the prefix once at every depth
+and deletes each key below it, directory marker objects included, with at most
+64 requests in flight. Keys a request URL could misaddress (`.`/`..` segments,
+`\`, `%`, `?`, `#`, control characters) are left in place and logged. On
+Artifactory a folder is deleted with one request.
+
 Copies automatically use spare transfer concurrency for large ranged reads.
 The default target is 8 streams, with an 8 MiB minimum range size and at most
 8 range streams per file. Files smaller than 16 MiB stay single-stream. When
@@ -639,6 +645,17 @@ This compares asanypath and boto3 using one shared request budget per client.
 It warms up each case, reports JSON timings and MiB/s, verifies uploaded contents
 outside the timed interval, and deletes only the uniquely named benchmark
 objects it created. Both clients use normal AWS credentials (or `--profile`).
+
+For recursive deletes, `scripts/bench_rmtree.py` uploads a generated tree under
+a fresh prefix, times `rmdir(recursive=True)` and checks nothing is left, e.g.
+against the MinIO emulator:
+
+```bash
+AWS_ENDPOINT_URL=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin \
+AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
+  uv run python scripts/bench_rmtree.py s3://bench-asanypath/rmtree-bench \
+  --dirs 10 --subdirs 10 --files 100
+```
 Run with one large shard and again with several representative shards; results
 from a local test server are not evidence of production endpoint throughput.
 

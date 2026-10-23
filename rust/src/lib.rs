@@ -48,6 +48,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(s3::s3_complete_multipart, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_abort_multipart, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_delete_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(s3::s3_delete_tree, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_copy_batch, m)?)?;
     m.add_function(wrap_pyfunction!(s3::s3_list_buckets, m)?)?;
@@ -65,6 +66,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gcs::gcs_start_resumable, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_upload_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_delete_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(gcs::gcs_delete_tree, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_copy_batch, m)?)?;
     m.add_function(wrap_pyfunction!(gcs::gcs_list_buckets, m)?)?;
@@ -81,6 +83,7 @@ fn asanypath_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(azure::az_put_block, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_put_block_list, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_delete_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(azure::az_delete_tree, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_exists_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_copy_batch, m)?)?;
     m.add_function(wrap_pyfunction!(azure::az_list_containers, m)?)?;

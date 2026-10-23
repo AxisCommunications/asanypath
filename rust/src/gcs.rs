@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::http::{bearer_headers, do_request, do_request_light, status_to_pyerr};
-use crate::listing::{ListEntry, Listing};
+use crate::listing::{Keys, ListEntry, ListSink, Listing};
 
 // ---------------------------------------------------------------------------
 // Typed JSON response structs (avoids Value allocations)
@@ -655,6 +655,47 @@ async fn do_gcs_put_acl(creds: &GcsCreds, object_path: &str, acl_json: &str) -> 
     Ok(())
 }
 
+/// Fetch one objects.list page into `sink`; returns the next page token.
+/// Without `delimiter` the page holds every object at any depth.
+async fn gcs_list_page(
+    creds: &GcsCreds,
+    search_prefix: &str,
+    delimiter: bool,
+    token: Option<String>,
+    use_h2: bool,
+    sink: &mut impl ListSink,
+) -> Result<Option<String>, PyErr> {
+    let mut params: Vec<(&str, &str)> = vec![("prefix", search_prefix)];
+    if delimiter {
+        params.push(("delimiter", "/"));
+    }
+    if let Some(token) = token.as_deref() {
+        params.push(("pageToken", token));
+    }
+    let url = append_params(&creds.storage_base(), &params);
+    let headers = creds.auth_headers().await;
+    let (status, body) = do_request_light("GET", &url, &headers, None, use_h2)
+        .await
+        .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("gs://{}/{}", creds.bucket, search_prefix),
+            &body,
+        ));
+    }
+    let resp: ListResponse = sonic_rs::from_slice(&body)
+        .map_err(|e| PyRuntimeError::new_err(format!("JSON parse error: {e}")))?;
+    for p in &resp.prefixes {
+        sink.add_prefix(p);
+    }
+    for item in resp.items {
+        let size = item.size.and_then(|s| s.parse().ok());
+        sink.add_object(&item.name, size, item.updated);
+    }
+    Ok(resp.next_page_token)
+}
+
 async fn do_gcs_list(
     creds: &GcsCreds,
     prefix: &str,
@@ -662,52 +703,26 @@ async fn do_gcs_list(
 ) -> Result<Vec<ListEntry>, PyErr> {
     let mut listing = Listing::new(format!("gs://{}", creds.bucket), prefix);
     let search_prefix = listing.search_prefix().to_string();
-    let mut page_token: Option<String> = None;
-    let headers = creds.auth_headers().await;
-
+    let mut token = None;
     loop {
-        let mut params_owned: Vec<(String, String)> = vec![
-            ("prefix".to_string(), search_prefix.clone()),
-            ("delimiter".to_string(), "/".to_string()),
-        ];
-        if let Some(ref token) = page_token {
-            params_owned.push(("pageToken".to_string(), token.clone()));
-        }
-        let params_ref: Vec<(&str, &str)> = params_owned
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let url = append_params(&creds.storage_base(), &params_ref);
-
-        let (status, body) = do_request_light("GET", &url, &headers, None, use_h2)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e))?;
-
-        if !status.is_success() {
-            return Err(status_to_pyerr(
-                status,
-                &format!("gs://{}/{}", creds.bucket, search_prefix),
-                &body,
-            ));
-        }
-
-        let resp: ListResponse = sonic_rs::from_slice(&body)
-            .map_err(|e| PyRuntimeError::new_err(format!("JSON parse error: {e}")))?;
-        for p in &resp.prefixes {
-            listing.add_prefix(p);
-        }
-        for item in resp.items {
-            let size = item.size.and_then(|s| s.parse().ok());
-            listing.add_object(&item.name, size, item.updated);
-        }
-
-        page_token = resp.next_page_token;
-        if page_token.is_none() {
-            break;
+        token = gcs_list_page(creds, &search_prefix, true, token, use_h2, &mut listing).await?;
+        if token.is_none() {
+            return Ok(listing.finish());
         }
     }
+}
 
-    Ok(listing.finish())
+impl crate::backend::TreeDelete for GcsCreds {
+    async fn list_keys_page(
+        &self,
+        search_prefix: &str,
+        token: Option<String>,
+        use_h2: bool,
+    ) -> Result<(Vec<String>, Option<String>), PyErr> {
+        let mut keys = Keys::default();
+        let next = gcs_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
+        Ok((keys.0, next))
+    }
 }
 
 /// List all buckets in a project (GET /storage/v1/b?project=). Returns bare names.
@@ -1043,6 +1058,23 @@ pub fn gcs_delete_batch<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let creds = gcs_creds!(endpoint, bucket, access_token);
         batch_fire!(creds, object_paths, h2, delete)
+    })
+}
+
+/// Delete every object under `prefix`.
+#[pyfunction]
+pub fn gcs_delete_tree<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    access_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = gcs_creds!(endpoint, bucket, access_token);
+        crate::backend::TreeDelete::delete_tree(&creds, &prefix, h2).await
     })
 }
 
