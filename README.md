@@ -106,6 +106,30 @@ update it. It is not necessarily the final per-request URL (for example, after
 bucket addressing or redirects). Local, HTTP, SSH and FTP paths do not expose
 this property.
 
+### Artifactory URLs
+
+`art://host/artifactory/repo/path` addresses Artifactory directly. With
+`ARTIFACTORY_BASE_URL` set, e.g. to `https://artifacts.example.com/artifactory`:
+
+- `art://repo/path` (and `art://` for the repository list) expand to it;
+- `https://` URLs under it are Artifactory paths as well, using the Artifactory
+  API and token;
+- `ARTIFACTORY_IDENTITY_TOKEN` is sent to it and nowhere else.
+
+An `https://` URL on a host that is not configured stays plain HTTPS and is
+read without a token. When one Artifactory answers under several host names,
+list them all, comma-separated; `art://` shorthand expands to the first:
+
+```bash
+export ARTIFACTORY_BASE_URL=https://artifacts.example.com/artifactory,https://artifactory.example.com/artifactory
+```
+
+Only listed host names count, never DNS aliases. Without a token (`token=`,
+`ARTIFACTORY_IDENTITY_TOKEN`, the keyring or the JFrog CLI config) requests are
+anonymous, which is enough for repositories open to anonymous reads. A
+configured token is always sent: an expired one fails instead of falling back
+to anonymous access.
+
 ### Copy and recursive delete
 
 ```python
