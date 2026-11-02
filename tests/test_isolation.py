@@ -506,6 +506,11 @@ _ART_ENV = {
     "ARTIFACTORY_IDENTITY_TOKEN": "ambient",
     "ARTIFACTORY_BASE_URL": "corp.example/artifactory",
 }
+# One service under two host names, listed explicitly.
+_ART_ALIASES_ENV = {
+    "ARTIFACTORY_IDENTITY_TOKEN": "ambient",
+    "ARTIFACTORY_BASE_URL": "https://corp.example/artifactory, https://alias.example/artifactory",
+}
 
 
 @pytest.mark.parametrize(
@@ -519,6 +524,10 @@ _ART_ENV = {
         ({}, "art://art.example/artifactory/repo/f", None),
         (_ART_ENV, "art://corp.example/artifactory/repo/f", "ambient"),
         (_ART_ENV, "art://attacker.example/artifactory/repo/f", None),
+        (_ART_ALIASES_ENV, "art://corp.example/artifactory/repo/f", "ambient"),
+        (_ART_ALIASES_ENV, "art://alias.example/artifactory/repo/f", "ambient"),
+        (_ART_ALIASES_ENV, "art://alias.example.attacker.example/artifactory/f", None),
+        (_ART_ALIASES_ENV, "art://unlisted.example/artifactory/repo/f", None),
         ({"ARTIFACTORY_IDENTITY_TOKEN": "ambient"}, "art://any.example/artifactory/repo/f", None),
     ],
 )

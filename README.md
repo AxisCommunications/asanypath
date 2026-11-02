@@ -274,8 +274,9 @@ service they are not sent at all, and a warning names the missing setting:
   `HTTP_AUTH_URL`, e.g. `HTTP_AUTH_URL=https://files.example.com`. On a
   redirect to another scheme, host or port, only non-credential headers
   (`Range`, `Accept`, conditional headers, ...) are forwarded.
-- **Artifactory:** `ARTIFACTORY_IDENTITY_TOKEN` is only used for the service in
-  `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`). A JFrog CLI server token is only
+- **Artifactory:** `ARTIFACTORY_IDENTITY_TOKEN` is only used for the services in
+  `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`), a comma-separated list when one
+  Artifactory answers under several host names. A JFrog CLI server token is only
   used for that server's own origin.
 - **SSH:** host keys are checked like OpenSSH. `StrictHostKeyChecking`
   (`yes`, `ask`, `accept-new`, `no`) and `UserKnownHostsFile` are read from

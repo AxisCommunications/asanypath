@@ -413,6 +413,63 @@ def test_get_base_url_prefix_no_netloc():
     _BASE_URL_PREFIX_CACHE.clear()
 
 
+@pytest.fixture
+def art_env(monkeypatch):
+    """A clean base-URL cache and environment for ``art``."""
+    monkeypatch.setattr("asanypath.common._BASE_URL_PREFIX_CACHE", {})
+    for name in ("ARTIFACTORY_BASE_URL", "ART_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_base_url_lists_several_hosts(art_env):
+    from asanypath.common import _get_base_url_prefixes
+
+    art_env.setenv(
+        "ARTIFACTORY_BASE_URL",
+        " https://a.example/artifactory ,b.example/artifactory,,/no-host,a.example/artifactory",
+    )
+    aliases = ArtifactoryPath._BASE_URL_ENV_ALIASES
+    assert _get_base_url_prefixes("art", aliases) == (
+        "a.example/artifactory",
+        "b.example/artifactory",
+    )
+    assert _get_base_url_prefix("art", aliases) == "a.example/artifactory"
+
+
+def test_art_base_url_still_takes_precedence(art_env):
+    from asanypath.common import _get_base_url_prefixes
+
+    art_env.setenv("ARTIFACTORY_BASE_URL", "a.example/artifactory")
+    art_env.setenv("ART_BASE_URL", "b.example/artifactory")
+    prefixes = _get_base_url_prefixes("art", ArtifactoryPath._BASE_URL_ENV_ALIASES)
+    assert prefixes == ("b.example/artifactory", "a.example/artifactory")
+
+
+def test_every_listed_host_is_artifactory(art_env):
+    from asanypath import AsAnyPath
+    from asanypath.http import HTTPSPath
+
+    art_env.setenv("ARTIFACTORY_BASE_URL", "a.example/artifactory,b.example/artifactory")
+    for host in ("a.example", "b.example"):
+        p = AsAnyPath(f"https://{host}/artifactory/repo/f", token="t")
+        assert isinstance(p, ArtifactoryPath)
+        assert str(p) == f"art://{host}/artifactory/repo/f"
+    assert type(AsAnyPath("https://c.example/artifactory/repo/f")) is HTTPSPath
+    # Shorthand expands to the first host.
+    assert str(ArtifactoryPath("art://repo/f", token="t")) == "art://a.example/artifactory/repo/f"
+
+
+def test_https_dispatch_follows_environment_changes(art_env):
+    from asanypath import AsAnyPath
+    from asanypath.http import HTTPSPath
+
+    uri = "https://late.example/artifactory/repo/f"
+    assert type(AsAnyPath(uri)) is HTTPSPath
+    art_env.setenv("ARTIFACTORY_BASE_URL", "late.example/artifactory")
+    assert isinstance(AsAnyPath(uri, token="t"), ArtifactoryPath)
+
+
 def test_expand_base_url_http_conversion():
     """_expand_protocol_base_url converts https:// URL matching base to art:// scheme."""
     from asanypath.common import _BASE_URL_PREFIX_CACHE

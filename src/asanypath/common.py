@@ -103,11 +103,11 @@ _TRAILING_SLASH_RE: re.Pattern = re.compile(r"(?<!:)/+$")
 # Bounded by number of protocols (~6 entries max).
 _SCHEME_RE_CACHE: dict[str, re.Pattern] = {}
 
-# Per-protocol resolved base URL prefix (from env vars).
-# Bounded by number of protocols (~6 entries max).
-# _BASE_URL_PREFIX_SENTINEL distinguishes "resolved to None" from "not yet resolved".
-_BASE_URL_PREFIX_SENTINEL = object()
-_BASE_URL_PREFIX_CACHE: dict[str, str | None | object] = {}
+# Base URL prefixes per protocol: read once per process under the protocol's
+# name, or per environment value under (protocol, *values) for live lookups.
+_BASE_URL_PREFIX_CACHE: dict[object, tuple[str, ...]] = {}
+# The environment variables naming each protocol's base URLs, in precedence order.
+_BASE_URL_ENV_NAMES: dict[str, tuple[str, ...]] = {}
 
 
 def _get_scheme_re(protocol: str) -> re.Pattern:
@@ -119,30 +119,54 @@ def _get_scheme_re(protocol: str) -> re.Pattern:
     return pat
 
 
-def _get_base_url_prefix(protocol: str, aliases: dict[str, tuple[str, ...]]) -> str | None:
-    """Resolve and cache the base URL prefix for a protocol from env vars.
+def _get_base_url_prefixes(
+    protocol: str, aliases: dict[str, tuple[str, ...]], *, live: bool = False
+) -> tuple[str, ...]:
+    """Every ``host[/path]`` configured for a protocol, in order.
 
-    Cache is bounded by number of protocols (finite, small).
+    ``{PROTOCOL}_BASE_URL`` and its aliases (e.g. ``ART_BASE_URL``) may list
+    several URLs separated by commas: one service under several host names.
+    Only listed hosts count; DNS aliases are never followed. The environment
+    is read once per process, or on every call with ``live=True``.
     """
-    cached = _BASE_URL_PREFIX_CACHE.get(protocol, _BASE_URL_PREFIX_SENTINEL)
-    if cached is not _BASE_URL_PREFIX_SENTINEL:
-        return cached  # type: ignore[return-value]
-    env_names = [
-        f"{protocol.upper()}_BASE_URL",
-        *aliases.get(protocol, ()),
-    ]
-    base_url = next((getenv(name) for name in env_names if getenv(name)), None)
-    if not base_url:
-        _BASE_URL_PREFIX_CACHE[protocol] = None
-        return None
-    parsed = urlsplit(base_url if "://" in base_url else f"{protocol}://{base_url}")
-    if not parsed.netloc:
-        _BASE_URL_PREFIX_CACHE[protocol] = None
-        return None
-    base_path = parsed.path.strip("/")
-    result = f"{parsed.netloc}/{base_path}" if base_path else parsed.netloc
-    _BASE_URL_PREFIX_CACHE[protocol] = result
+    cached = _BASE_URL_PREFIX_CACHE.get(protocol)
+    if cached is not None and not live:
+        return cached
+    names = _BASE_URL_ENV_NAMES.get(protocol)
+    if names is None:
+        names = (f"{protocol.upper()}_BASE_URL", *aliases.get(protocol, ()))
+        names = _BASE_URL_ENV_NAMES[protocol] = tuple(dict.fromkeys(names))
+    key = (protocol, *map(getenv, names))
+    result = _BASE_URL_PREFIX_CACHE.get(key)
+    if result is None:
+        prefixes: list[str] = []
+        for value in filter(None, key[1:]):
+            for url in filter(None, (u.strip() for u in value.split(","))):
+                parsed = urlsplit(url if "://" in url else f"{protocol}://{url}")
+                path = parsed.path.strip("/")
+                prefix = f"{parsed.netloc}/{path}" if path else parsed.netloc
+                if parsed.netloc and prefix not in prefixes:
+                    prefixes.append(prefix)
+        if len(_BASE_URL_PREFIX_CACHE) > 64:
+            _BASE_URL_PREFIX_CACHE.clear()
+        result = _BASE_URL_PREFIX_CACHE[key] = tuple(prefixes)
+    if not live:
+        _BASE_URL_PREFIX_CACHE[protocol] = result
     return result
+
+
+def _get_base_url_prefix(protocol: str, aliases: dict[str, tuple[str, ...]]) -> str | None:
+    """The first configured prefix: the one ``protocol://`` shorthand expands to."""
+    prefixes = _get_base_url_prefixes(protocol, aliases)
+    return prefixes[0] if prefixes else None
+
+
+def _under_prefix(rest: str, prefixes: tuple[str, ...]) -> bool:
+    """Whether ``host/path`` ``rest`` is one of ``prefixes`` or lies below one."""
+    for prefix in prefixes:
+        if rest.startswith(prefix) and rest[len(prefix) : len(prefix) + 1] in ("", "/"):
+            return True
+    return False
 
 
 class CommonPurePathMixin:
@@ -460,12 +484,9 @@ class CommonPurePathMixin:
         for entry in entries:
             yield entry
 
-    def _resolve_base_url_prefix(self) -> str | None:
-        """Resolve base URL host/path prefix for this protocol from environment.
-
-        Uses module-level cache bounded by protocol count (~6 entries).
-        """
-        return _get_base_url_prefix(self.protocol, self._BASE_URL_ENV_ALIASES)
+    def _resolve_base_url_prefixes(self) -> tuple[str, ...]:
+        """Every base URL host/path prefix configured for this protocol."""
+        return _get_base_url_prefixes(self.protocol, self._BASE_URL_ENV_ALIASES)
 
     def _expand_protocol_base_url(self, part: str) -> str:
         """Expand shorthand protocol URLs using configured base URL.
@@ -477,28 +498,27 @@ class CommonPurePathMixin:
         if self.protocol == "file":
             return part
 
-        base_prefix = self._resolve_base_url_prefix()
+        prefixes = self._resolve_base_url_prefixes()
 
-        # Convert http(s):// URLs that match our base URL to our protocol scheme
-        if base_prefix and self.protocol not in ("http", "https"):
+        # Convert http(s):// URLs under a configured base URL to our protocol scheme
+        if prefixes and self.protocol not in ("http", "https"):
             for http_scheme in ("https://", "http://"):
                 if part.lower().startswith(http_scheme):
                     rest = part[len(http_scheme) :]
-                    bp = base_prefix.rstrip("/")
-                    if rest.rstrip("/") == bp or rest.startswith(f"{bp}/"):
+                    if _under_prefix(rest, prefixes):
                         return f"{self.protocol}{SCHEME_SEP}{rest}"
 
-        if not base_prefix:
+        if not prefixes:
             return part
 
         scheme_re = _get_scheme_re(self.protocol)
         normalized = scheme_re.sub(f"{self.protocol}{SCHEME_SEP}", part, count=1)
         normalized_rest = normalized.split(SCHEME_SEP, 1)[1].lstrip("/")
-        base_prefix = base_prefix.rstrip("/")
+        base_prefix = prefixes[0]
         if not normalized_rest:
             # The bare root (e.g. ``art://``) is the configured service root.
             return f"{self.protocol}{SCHEME_SEP}{base_prefix}"
-        if normalized_rest == base_prefix or normalized_rest.startswith(f"{base_prefix}/"):
+        if _under_prefix(normalized_rest, prefixes):
             return normalized
 
         parsed = urlsplit(normalized)

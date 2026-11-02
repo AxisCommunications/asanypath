@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from importlib import import_module
-from os import PathLike, getenv, stat_result
+from os import PathLike, stat_result
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlsplit
@@ -109,26 +109,20 @@ _VALIDATED_FLAVORS: set[type] = set()
 
 
 def _match_base_url_flavor(url: str) -> type | None:
-    """Check if an HTTP(S) URL matches any backend's configured BASE_URL."""
+    """The backend whose configured base URL (``{PROTO}_BASE_URL``, possibly a
+    comma-separated list) an HTTP(S) URL falls under, else the scheme's class."""
     parsed = urlsplit(url)
     scheme = parsed.scheme.lower() or "file"
 
     if scheme in ("http", "https"):
+        from asanypath.common import _get_base_url_prefixes
+
         url_host_path = f"{parsed.netloc}{parsed.path}".rstrip("/")
         for proto, klass in PROTOCOL_MAP.items():
             if proto in ("http", "https", "file"):
                 continue
-
-            env_names = [
-                f"{proto.upper()}_BASE_URL",
-                *getattr(klass, "_BASE_URL_ENV_ALIASES", {}).get(proto, ()),
-            ]
-            for base_url in filter(None, map(getenv, env_names)):
-                bp = urlsplit(base_url if "://" in base_url else f"https://{base_url}")
-                if not bp.netloc:
-                    break
-                bp_path = bp.path.strip("/")
-                prefix = f"{bp.netloc}/{bp_path}" if bp_path else bp.netloc
+            aliases = getattr(klass, "_BASE_URL_ENV_ALIASES", {})
+            for prefix in _get_base_url_prefixes(proto, aliases, live=True):
                 if url_host_path == prefix or url_host_path.startswith(f"{prefix}/"):
                     return klass
     return PROTOCOL_MAP[scheme]

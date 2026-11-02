@@ -201,11 +201,11 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
     # ------------------------------------------------------------------
 
     def _env_token(self) -> str | None:
-        """``ARTIFACTORY_IDENTITY_TOKEN``, only for the service named by
+        """``ARTIFACTORY_IDENTITY_TOKEN``, only for the services listed in
         ``ARTIFACTORY_BASE_URL`` (or ``ART_BASE_URL``)."""
         token = self.env_config.token
         if token and self._ambient_credentials_allowed(
-            self._resolve_base_url_prefix(),
+            self._resolve_base_url_prefixes(),
             self._service_key,
             credential="ARTIFACTORY_IDENTITY_TOKEN",
             setting="ARTIFACTORY_BASE_URL",
