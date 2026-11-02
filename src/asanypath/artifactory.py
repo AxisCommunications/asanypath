@@ -192,9 +192,10 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
         """Build env config from Artifactory environment variables."""
-        return SimpleNamespace(
-            token=getenv("ARTIFACTORY_IDENTITY_TOKEN"),
-        )
+        # Tokens never contain whitespace; a trailing newline from
+        # "$(cat token-file)" would otherwise make Artifactory reject it.
+        token = (getenv("ARTIFACTORY_IDENTITY_TOKEN") or "").strip()
+        return SimpleNamespace(token=token or None)
 
     # ------------------------------------------------------------------
     # CloudPathMixin hooks

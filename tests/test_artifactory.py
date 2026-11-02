@@ -150,6 +150,20 @@ class TestArtifactoryPath(testbase):
             p = ArtifactoryPath(art_path())
             assert p._token == "env-token"
 
+    @pytest.mark.parametrize(("raw", "token"), [(" env-token\n", "env-token"), ("  \n", "")])
+    def test_token_from_env_var_ignores_surrounding_whitespace(self, monkeypatch, raw, token):
+        monkeypatch.setattr(ArtifactoryPath, "_service_tokens", {})
+        monkeypatch.setattr("asanypath._credstore.load", lambda key, **_: None)
+        monkeypatch.setattr("asanypath.artifactory._jfrog_conf_token", lambda base_url: None)
+        env = {
+            "ARTIFACTORY_IDENTITY_TOKEN": raw,
+            "ARTIFACTORY_BASE_URL": "artifactory.example.com/artifactory",
+        }
+        with patch.dict("os.environ", env):
+            ArtifactoryPath._env_config = None
+            p = ArtifactoryPath(art_path())
+        assert p._native_kwargs["token"] == token
+
     def test_token_parameter_takes_precedence(self):
         with patch.dict("os.environ", {"ARTIFACTORY_IDENTITY_TOKEN": "env-token"}):
             p = _make_artifactory_path(token="param-token")
