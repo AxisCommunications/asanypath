@@ -66,6 +66,15 @@ mod endpoint_tests {
     use super::ArtCreds;
 
     #[test]
+    fn empty_token_sends_no_authorization() {
+        let anonymous = ArtCreds::new("example.com/artifactory".into(), String::new());
+        assert!(anonymous.auth_headers().is_empty());
+        let authenticated = ArtCreds::new("example.com/artifactory".into(), "t".into());
+        assert_eq!(authenticated.auth_headers().len(), 1);
+        assert_eq!(authenticated.auth_headers()[0].0, "authorization");
+    }
+
+    #[test]
     fn complete_and_legacy_endpoints_build_the_same_urls() {
         for endpoint in [
             "example.com/artifactory",
@@ -121,7 +130,12 @@ impl ArtCreds {
     }
 
     fn auth_headers(&self) -> Vec<(String, String)> {
-        bearer_headers(&self.token)
+        // An empty token means anonymous access.
+        if self.token.is_empty() {
+            Vec::new()
+        } else {
+            bearer_headers(&self.token)
+        }
     }
 
     fn content_url(&self, path: &str) -> String {

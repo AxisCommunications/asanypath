@@ -132,12 +132,14 @@ class TestArtifactoryPath(testbase):
         p = _make_artifactory_path(token="my-token")
         assert p._token == "my-token"
 
-    def test_token_required(self):
-        # Ensure env var is not set - token must be provided explicitly
+    def test_without_a_token_requests_are_anonymous(self):
         with patch.dict("os.environ", {}, clear=True):
             ArtifactoryPath._env_config = None
-            with pytest.raises(ValueError, match="token required"):
-                ArtifactoryPath(art_path())
+            p = ArtifactoryPath(art_path())
+        assert p._native_kwargs["token"] == ""
+        from asanypath.exceptions import credential_hint
+
+        assert "no Artifactory token was found" in credential_hint(str(p))
 
     def test_token_from_env_var(self):
         env = {

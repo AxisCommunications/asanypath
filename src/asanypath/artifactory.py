@@ -125,16 +125,15 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
     }
 
     def __init__(self, *args, token: str | None = None, **kwargs):
-        """Initialize ArtifactoryPath with optional Bearer token.
+        """Initialize ArtifactoryPath with an optional Bearer token.
 
         Args:
             *args: Path arguments passed to parent HTTPSPath.
-            token: Bearer token for authentication. If not provided, will attempt to read
-                   from ARTIFACTORY_IDENTITY_TOKEN environment variable.
+            token: Bearer token for authentication. If not provided, it is looked
+                   up in ARTIFACTORY_IDENTITY_TOKEN (for the service in
+                   ARTIFACTORY_BASE_URL), the keyring and the JFrog CLI config.
+                   Without one, requests are anonymous.
             **kwargs: Additional keyword arguments passed to parent HTTPSPath.
-
-        Raises:
-            ValueError: If token is not provided and ARTIFACTORY_IDENTITY_TOKEN env var is not set.
         """
         super().__init__(*args, **kwargs)
         self._bind_path_attrs()
@@ -180,10 +179,11 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
                 if self._token:
                     known[cred_key] = self._token
         if not self._token:
-            raise ValueError(
-                "Artifactory token required via 'token' parameter, "
-                "ARTIFACTORY_IDENTITY_TOKEN environment variable, the JFrog CLI config "
-                "(~/.jfrog/jfrog-cli.conf), or a previously cached token (see keyring)."
+            self._token = ""  # anonymous: public repositories need no token
+            set_credential_hint(
+                service,
+                "no Artifactory token was found; pass token=, set ARTIFACTORY_IDENTITY_TOKEN "
+                "with ARTIFACTORY_BASE_URL, or configure the JFrog CLI",
             )
         # Cached folder hint — set by iterdir() to avoid redundant API calls
         self._is_folder: bool | None = None
