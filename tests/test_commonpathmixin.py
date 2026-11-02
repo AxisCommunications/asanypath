@@ -206,6 +206,11 @@ class TestCommonPurePath:
         assert "extra" in str(joined)
         assert isinstance(joined, type(p))
 
+    def test_joinpath_several_parts_like_pathlib(self, path_and_factory):
+        p, _ = path_and_factory
+        assert p.joinpath("a", "b/c", "d") == p / "a" / "b/c" / "d"
+        assert p.joinpath() == p
+
     def test_match(self, path_and_factory):
         p, _ = path_and_factory
         assert p.match("*.txt")

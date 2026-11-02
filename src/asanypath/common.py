@@ -333,7 +333,10 @@ class CommonPurePathMixin:
             return False
 
     def joinpath(self, *other: T | str) -> Self:
-        return self.__truediv__(*other)
+        path = self
+        for part in other:
+            path = path / part
+        return path
 
     def match(self, pattern: str, *, case_sensitive: bool | None = None) -> bool:
         if not pattern:
