@@ -41,6 +41,7 @@ from asanypath_native import (
 
 from asanypath.cloud import CloudPathMixin, ServiceEndpointMixin, _service_origin
 from asanypath.common import DirEntry
+from asanypath.exceptions import set_credential_hint
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -146,6 +147,7 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
         from asanypath import _credstore
 
         cred_key = f"art:{self._service_key}"
+        service = f"art://{self._service_key}"
         known = ArtifactoryPath._service_tokens
         if token:
             # Persist user-supplied tokens once per service, not per derived path.
@@ -154,10 +156,27 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
                 known[cred_key] = token
             self._token = token
             self._init_options = {"token": token}
+            set_credential_hint(service, "check the token passed as token=")
+        elif env_token := self._env_token():
+            self._token = env_token
+            set_credential_hint(service, "check ARTIFACTORY_IDENTITY_TOKEN, it may have expired")
         else:
-            self._token = self._env_token() or known.get(cred_key)
+            self._token = known.get(cred_key)
             if not self._token:
-                self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._service_key)
+                if stored := _credstore.load(cred_key):
+                    self._token = stored
+                    set_credential_hint(
+                        service,
+                        f"the token cached in the keyring as '{cred_key}' may have expired; "
+                        "pass token= to replace it",
+                    )
+                elif jfrog := _jfrog_conf_token(self._service_key):
+                    self._token = jfrog
+                    set_credential_hint(
+                        service,
+                        "the token from the JFrog CLI config may have expired; "
+                        "renew it with 'jf config'",
+                    )
                 if self._token:
                     known[cred_key] = self._token
         if not self._token:
