@@ -615,8 +615,8 @@ def _backend_options(two_sided: bool = False):
                 "-o",
                 "--option",
                 "all",
-                "Backend option SCHEME.KEY=VALUE (repeatable), e.g. s3.profile=NAME or "
-                "http.headers='X-Name: value'",
+                "Backend option KEY=VALUE (repeatable; inferred from path), or "
+                "SCHEME.KEY=VALUE, e.g. profile=NAME or headers='X-Name: value'",
             )
         ]
         if two_sided:

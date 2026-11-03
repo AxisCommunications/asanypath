@@ -30,6 +30,10 @@ def test_option_keys_follow_constructor_signature():
             {"http": {"headers": [("X-Tag", "one"), ("X-Tag", "two")]}},
         ),
         (
+            ["headers=X-Tag: one", "headers=X-Tag: two"],
+            {"*": {"headers": [("X-Tag", "one"), ("X-Tag", "two")]}},
+        ),
+        (
             ["S3.aws_region=eu-west-1", "ssh.port=2222"],
             {"s3": {"aws_region": "eu-west-1"}, "ssh": {"port": 2222}},
         ),
@@ -43,7 +47,7 @@ def test_parse_options(specs, expected):
 @pytest.mark.parametrize(
     "spec",
     [
-        "profile=p",
+        "not-an-option=value",
         "s3.profile",
         "s3.=x",
         "nope.key=v",
@@ -72,6 +76,13 @@ def test_kwargs_for_keeps_http_and_https_headers_scheme_scoped():
     assert kwargs_for("https://example.com/file", opts) == {"headers": [("X-Two", "2")]}
 
 
+def test_kwargs_for_infers_backend_for_unqualified_options():
+    opts = parse_options(["profile=example", "headers=X-Client: cli", "port=2222"])
+    assert kwargs_for("s3://bucket/key", opts) == {"profile": "example"}
+    assert kwargs_for("https://example.com/file", opts) == {"headers": [("X-Client", "cli")]}
+    assert kwargs_for("ssh://host/path", opts) == {"port": 2222}
+
+
 def _invoke(args):
     with patch("asanypath.cli.AsAnyPath") as mock_cls:
         mock_cls.return_value.exists = _async_true
@@ -87,6 +98,20 @@ def test_cli_option_reaches_path_constructor():
     result, mock_cls = _invoke(["exists", "s3://b/k", "-o", "s3.profile=prof"])
     assert result.exit_code == 0, result.output
     mock_cls.assert_called_once_with("s3://b/k", profile="prof")
+
+
+def test_cli_unqualified_option_is_inferred_from_path():
+    result, mock_cls = _invoke(["exists", "s3://b/k", "-o", "profile=prof"])
+    assert result.exit_code == 0, result.output
+    mock_cls.assert_called_once_with("s3://b/k", profile="prof")
+
+
+def test_cli_unqualified_headers_are_inferred_from_https_path():
+    result, mock_cls = _invoke(
+        ["exists", "https://example.com/data", "-o", "headers=X-Client: cli"]
+    )
+    assert result.exit_code == 0, result.output
+    mock_cls.assert_called_once_with("https://example.com/data", headers=[("X-Client", "cli")])
 
 
 def test_cli_option_other_backend_is_ignored():

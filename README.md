@@ -452,12 +452,12 @@ asanypath cp s3://bucket/file.txt /local/file.txt
 
 # Add repeatable headers to HTTP requests
 asanypath cat https://example.com/data \
-  -o 'https.headers=Accept: application/json' \
-  -o 'https.headers=X-View: compact'
+  -o 'headers=Accept: application/json' \
+  -o 'headers=X-View: compact'
 
 # Scope headers to only one side of a copy
 asanypath cp https://example.com/data /local/data \
-  --src-option 'https.headers=Accept: application/json'
+  --src-option 'headers=Accept: application/json'
 
 # Allow 32 concurrent files; fill spare capacity toward 8 streams for large files
 asanypath cp -r s3://bucket/data/ ./data/ -j 32 --concurrency-floor 8
@@ -488,8 +488,10 @@ asanypath auth show
 asanypath auth show s3://bucket
 ```
 
-HTTP headers can be repeated with `-o`, `--src-option`, and `--dst-option`; each
-value uses `NAME: VALUE` syntax. Transport-managed headers such as `Host` and
+Backend options can omit the scheme prefix when it can be inferred from each
+path; for example, `-o headers='X-Name: value'`. HTTP headers can be repeated
+with `-o`, `--src-option`, and `--dst-option`; each value uses `NAME: VALUE`
+syntax. Transport-managed headers such as `Host` and
 `Content-Length` are rejected. Header values passed on the command line may be
 visible in shell history or process listings, so use the HTTP auth environment
 variables for secrets.

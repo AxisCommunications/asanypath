@@ -41,24 +41,40 @@ def option_keys(cls: type) -> dict[str, Callable[[str], Any]]:
 
 
 def parse_options(specs: Iterable[str]) -> Options:
-    """Parse ``scheme.key=value`` specs; raise ValueError on anything unsupported."""
+    """Parse ``key=value`` or ``scheme.key=value`` backend options."""
     parsed: Options = {}
     for spec in specs:
         lhs, eq, value = spec.partition("=")
         scheme, dot, key = lhs.partition(".")
-        if not eq or not dot or not key:
+        if not eq or not lhs:
+            raise ValueError(f"invalid option {spec!r}; expected KEY=VALUE")
+        if not dot:
+            key = lhs
+            if not any(key in option_keys(cls) for cls in PROTOCOL_MAP.values()):
+                raise ValueError(f"unknown backend option {key!r}")
+            scheme = "*"
+        elif not key:
             raise ValueError(f"invalid option {spec!r}; expected SCHEME.KEY=VALUE")
         scheme = scheme.lower()
-        if scheme not in PROTOCOL_MAP:
+        if scheme != "*" and scheme not in PROTOCOL_MAP:
             raise ValueError(f"unknown protocol {scheme!r} in option {spec!r}")
-        keys = option_keys(PROTOCOL_MAP[scheme])
-        if key not in keys:
+        keys = option_keys(PROTOCOL_MAP[scheme]) if scheme != "*" else None
+        if keys is not None and key not in keys:
             valid = ", ".join(sorted(keys)) or "none"
             raise ValueError(f"{scheme} does not support option {key!r} (valid: {valid})")
-        try:
-            converted = keys[key](value)
-        except ValueError:
-            raise ValueError(f"invalid value {value!r} for {scheme}.{key}") from None
+        if key == "headers":
+            try:
+                converted = _header_option(value)
+            except ValueError:
+                label = f"{scheme}.{key}" if scheme != "*" else key
+                raise ValueError(f"invalid value {value!r} for {label}") from None
+        elif scheme == "*":
+            converted = value
+        else:
+            try:
+                converted = keys[key](value)
+            except ValueError:
+                raise ValueError(f"invalid value {value!r} for {scheme}.{key}") from None
         scheme_options = parsed.setdefault(scheme, {})
         if key == "headers":
             scheme_options.setdefault(key, []).append(converted)
@@ -72,12 +88,28 @@ def kwargs_for(path: str, options: Options) -> dict[str, Any]:
     if not options:
         return {}
     flavor = _match_base_url_flavor(path)
+    if flavor is None:
+        return {}
     merged: dict[str, Any] = {}
+
+    def apply(values: dict[str, Any], *, coerce: bool) -> None:
+        keys = option_keys(flavor)
+        for key, value in values.items():
+            if key not in keys:
+                continue
+            if coerce and key != "headers":
+                try:
+                    value = keys[key](value)
+                except ValueError:
+                    raise ValueError(f"invalid value {value!r} for {key}") from None
+            if key == "headers":
+                merged.setdefault(key, []).extend(value)
+            else:
+                merged[key] = value
+
+    if "*" in options:
+        apply(options["*"], coerce=True)
     for scheme, values in options.items():
-        if PROTOCOL_MAP[scheme] is flavor:
-            for key, value in values.items():
-                if key == "headers":
-                    merged.setdefault(key, []).extend(value)
-                else:
-                    merged[key] = value
+        if scheme != "*" and PROTOCOL_MAP[scheme] is flavor:
+            apply(values, coerce=False)
     return merged
