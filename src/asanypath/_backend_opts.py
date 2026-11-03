@@ -12,6 +12,16 @@ from asanypath.asanypath import PROTOCOL_MAP, _match_base_url_flavor
 Options = dict[str, dict[str, Any]]
 
 
+def _header_option(value: str) -> tuple[str, str]:
+    name, separator, header_value = value.partition(":")
+    name = name.strip()
+    if not separator or not name:
+        raise ValueError("expected HEADER: VALUE")
+    if "\r" in name or "\n" in name or "\r" in header_value or "\n" in header_value:
+        raise ValueError("header names and values cannot contain newlines")
+    return name, header_value.lstrip()
+
+
 def option_keys(cls: type) -> dict[str, Callable[[str], Any]]:
     """Return ``{key: coercer}`` for the keyword arguments a path class accepts."""
     keys: dict[str, Callable[[str], Any]] = {}
@@ -21,6 +31,9 @@ def option_keys(cls: type) -> dict[str, Callable[[str], Any]]:
             param.VAR_KEYWORD,
             param.POSITIONAL_ONLY,
         ):
+            continue
+        if name == "headers":
+            keys[name] = _header_option
             continue
         ann = str(param.annotation)
         keys[name] = int if re.search(r"\bint\b", ann) and "str" not in ann else str
@@ -43,9 +56,14 @@ def parse_options(specs: Iterable[str]) -> Options:
             valid = ", ".join(sorted(keys)) or "none"
             raise ValueError(f"{scheme} does not support option {key!r} (valid: {valid})")
         try:
-            parsed.setdefault(scheme, {})[key] = keys[key](value)
+            converted = keys[key](value)
         except ValueError:
             raise ValueError(f"invalid value {value!r} for {scheme}.{key}") from None
+        scheme_options = parsed.setdefault(scheme, {})
+        if key == "headers":
+            scheme_options.setdefault(key, []).append(converted)
+        else:
+            scheme_options[key] = converted
     return parsed
 
 
@@ -57,5 +75,9 @@ def kwargs_for(path: str, options: Options) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     for scheme, values in options.items():
         if PROTOCOL_MAP[scheme] is flavor:
-            merged.update(values)
+            for key, value in values.items():
+                if key == "headers":
+                    merged.setdefault(key, []).extend(value)
+                else:
+                    merged[key] = value
     return merged

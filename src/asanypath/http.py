@@ -191,16 +191,39 @@ class HTTPPath(CloudPathMixin):
         "apache": ("td a[href]", "href"),
         "nginx": ("a[href]", "href"),
     }
+    _RESERVED_HEADERS = {
+        "connection",
+        "content-length",
+        "host",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+    _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 
     def __init__(
         self,
         *parts,
         listing: str | None = "auto",
         listing_attr: str | None = None,
+        headers: dict[str, str] | list[tuple[str, str]] | None = None,
     ) -> None:
         super().__init__(*parts)
         self._listing = listing
         self._listing_attr = listing_attr
+        self._user_headers = (
+            list(headers.items()) if isinstance(headers, dict) else list(headers or [])
+        )
+        for name, value in self._user_headers:
+            if not self._HEADER_NAME_PATTERN.fullmatch(name):
+                raise ValueError(f"invalid HTTP header name {name!r}")
+            if name.lower() in self._RESERVED_HEADERS:
+                raise ValueError(f"HTTP header {name!r} is managed by the transport")
+            if "\r" in value or "\n" in value:
+                raise ValueError(f"HTTP header {name!r} cannot contain newlines")
         # Pathlib normalises trailing slashes away; preserve the hint so
         # iterdir/is_dir can distinguish directory-style URLs.
         self._trailing_slash = bool(parts) and str(parts[-1]).endswith("/")
@@ -249,20 +272,24 @@ class HTTPPath(CloudPathMixin):
         user_headers: dict[str, str] | list[tuple[str, str]] | None,
         *,
         with_auth: bool = True,
+        with_path_headers: bool = True,
     ) -> list[tuple[str, str]] | None:
-        """Merge auth headers (unless *with_auth* is false) with user-supplied headers."""
+        """Merge path, request, and auth headers, optionally restricting path defaults."""
         auth = self._auth_headers() if with_auth else []
-        if not user_headers and not auth:
-            return None
-        merged = list(auth)
+        extra = list(self._user_headers) if with_path_headers else []
         if user_headers:
-            extra = (
+            request_headers = (
                 list(user_headers.items()) if isinstance(user_headers, dict) else list(user_headers)
             )
-            # User-supplied headers override auth headers with same name
-            extra_keys = {ek.lower() for ek, _ in extra}
-            merged = [(k, v) for k, v in merged if k.lower() not in extra_keys]
-            merged.extend(extra)
+            request_keys = {key.lower() for key, _ in request_headers}
+            extra = [(key, value) for key, value in extra if key.lower() not in request_keys]
+            extra.extend(request_headers)
+        if not extra and not auth:
+            return None
+        merged = list(auth)
+        extra_keys = {key.lower() for key, _ in extra}
+        merged = [(key, value) for key, value in merged if key.lower() not in extra_keys]
+        merged.extend(extra)
         return merged or None
 
     async def request(
@@ -288,6 +315,7 @@ class HTTPPath(CloudPathMixin):
         """
         own = str(self)
         with_auth = True
+        with_path_headers = True
         if url is None:
             url = own
         elif url != own:
@@ -295,7 +323,9 @@ class HTTPPath(CloudPathMixin):
             # parsers would read differently; pre-encoded queries (presigned
             # URLs) are kept as-is, like in ``__init__``.
             url = str(URL(url, encoded="?" in url))
-            with_auth = _service_origin(url) == _service_origin(own)
+            same_origin = _service_origin(url) == _service_origin(own)
+            with_auth = same_origin
+            with_path_headers = same_origin
         if http_request is None:
             raise ImportError(
                 "http_request not available; upgrade asanypath-native to use request()"
@@ -304,7 +334,11 @@ class HTTPPath(CloudPathMixin):
             data = msgspec.json.encode(json)
             headers = dict(headers) if isinstance(headers, dict) else dict(headers or [])
             headers.setdefault("content-type", "application/json")
-        merged = self._merge_headers(headers, with_auth=with_auth)
+        merged = self._merge_headers(
+            headers,
+            with_auth=with_auth,
+            with_path_headers=with_path_headers,
+        )
         status_code, body, resp_headers = await http_request(
             method,
             url,
@@ -385,6 +419,7 @@ class HTTPPath(CloudPathMixin):
                 link,
                 listing=self._listing,
                 listing_attr=self._listing_attr,
+                headers=self._user_headers,
             )
             if self._plain_child_name(link) is not None or self._is_direct_child(child):
                 yield child
