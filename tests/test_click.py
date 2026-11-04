@@ -6,14 +6,19 @@
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import click
 import pytest
+from click.shell_completion import get_completion_class
 from click.testing import CliRunner
 
-from asanypath.click import ClickPath
+import asanypath.click
+from asanypath.click import BashComplete, ClickPath, _maybe_rewrite_scp_style
+from asanypath.common import DirEntry
 from asanypath.local import SyncPath
 from asanypath.s3 import S3Path
+from asanypath.ssh import SSHPath
 from asanypath.sync import AsAnyPath
 
 
@@ -225,3 +230,230 @@ def test_import_asanypath_does_not_import_click():
         text=True,
     ).stdout.strip()
     assert out == "False"
+
+
+# --- shell completion ----------------------------------------------------------------
+
+
+def complete(param_type, incomplete):
+    return [(c.value, c.type) for c in param_type.shell_complete(None, None, incomplete)]
+
+
+@pytest.fixture
+def tree(tmp_path):
+    (tmp_path / "sub" / "inner").mkdir(parents=True)
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "a.txt").touch()
+    (tmp_path / "sub" / "b.txt").touch()
+    return tmp_path
+
+
+@pytest.fixture
+def fake_listing(monkeypatch):
+    """Replace remote listings: URI -> [(name, is_dir)]; records the URIs listed."""
+    listings: dict = {}
+    listed: list = []
+
+    def make(uri):
+        async def scandir():
+            listed.append(uri)
+            if isinstance(listings.get(uri), Exception):
+                raise listings[uri]
+            for name, is_dir in listings.get(uri, ()):
+                yield DirEntry(SimpleNamespace(name=name), is_dir=is_dir)
+
+        return SimpleNamespace(scandir=scandir)
+
+    monkeypatch.setattr(asanypath.click, "_AsyncPath", make)
+    return listings, listed
+
+
+def test_complete_remote_directory(tree):
+    base = f"file://{tree}/"
+    assert complete(ClickPath(), base) == [(f"{base}a.txt", "plain"), (f"{base}sub/", "plain")]
+    assert complete(ClickPath(), f"{base}s") == [(f"{base}sub/", "plain")]
+    assert complete(ClickPath(), f"{base}sub/in") == [(f"{base}sub/inner/", "plain")]
+
+
+def test_complete_remote_hidden_only_when_typed(tree):
+    assert complete(ClickPath(), f"file://{tree}/.") == [(f"file://{tree}/.hidden/", "plain")]
+
+
+def test_complete_remote_dirs_only_when_files_not_okay(tree):
+    assert complete(ClickPath(file_okay=False), f"file://{tree}/") == [
+        (f"file://{tree}/sub/", "plain")
+    ]
+
+
+def test_complete_service_root_lists_containers(fake_listing):
+    listings, listed = fake_listing
+    listings["s3://"] = [("beta", True), ("alpha", True)]
+    assert complete(ClickPath(), "s3://") == [("s3://alpha/", "plain"), ("s3://beta/", "plain")]
+    assert complete(ClickPath(), "s3://al") == [("s3://alpha/", "plain")]
+    assert listed == ["s3://", "s3://"]
+
+
+def test_complete_keeps_typed_shorthand(fake_listing):
+    # art://repo/... expands to the configured service; replies keep the shorthand.
+    listings, _ = fake_listing
+    listings["art://repo/"] = [("datasets", True), ("docs", True), ("x", False)]
+    assert complete(ClickPath(), "art://repo/d") == [
+        ("art://repo/datasets/", "plain"),
+        ("art://repo/docs/", "plain"),
+    ]
+
+
+def test_complete_backend_error_is_empty(fake_listing):
+    listings, _ = fake_listing
+    listings["s3://bucket/"] = PermissionError("denied")
+    assert complete(ClickPath(), "s3://bucket/k") == []
+
+
+def test_complete_scheme_names_with_local_matches(tmp_path, monkeypatch):
+    (tmp_path / "src").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert complete(ClickPath(), "s") == [
+        ("s3://", "plain"),
+        ("ssh://", "plain"),
+        ("src/", "plain"),
+    ]
+    assert complete(ClickPath(), "s3:") == [("s3://", "plain")]
+
+
+@pytest.mark.parametrize("incomplete", ["", "/tmp/x", "./rel"])
+def test_complete_local_paths_left_to_the_shell(incomplete):
+    assert complete(ClickPath(), incomplete) == [(incomplete, "file")]
+
+
+def test_bash_completion_class_is_registered():
+    assert get_completion_class("bash") is BashComplete
+
+
+def bash_complete(monkeypatch, words, cword):
+    """Run click's bash completion for a two-path command as bash would call it."""
+
+    @click.command()
+    @click.argument("src", type=ClickPath())
+    @click.argument("dst", type=ClickPath())
+    def cmd(src, dst):
+        pass
+
+    monkeypatch.setenv("COMP_WORDS", words)
+    monkeypatch.setenv("COMP_CWORD", str(cword))
+    return BashComplete(cmd, {}, "prog", "_PROG_COMPLETE").complete().splitlines()
+
+
+def test_bash_rejoins_words_split_at_colon(tree, monkeypatch):
+    # bash splits file:///x/s into "file", ":", "///x/s" and replaces only the last.
+    out = bash_complete(monkeypatch, f"prog file : //{tree}/s", 3)
+    assert out == [f"plain,//{tree}/sub/"]
+
+
+def test_bash_rejoins_earlier_arguments(tree, monkeypatch):
+    words = f"prog file : //{tree}/a.txt file : //{tree}/sub/i"
+    assert bash_complete(monkeypatch, words, 6) == [f"plain,//{tree}/sub/inner/"]
+
+
+def test_bash_reply_right_after_colon(monkeypatch):
+    # The cursor right after "file:" makes ":" the current word; readline replaces
+    # the empty text after it.
+    assert bash_complete(monkeypatch, "prog file :", 2) == ["plain,//"]
+
+
+def test_bash_rejoins_user_at_host(fake_listing, monkeypatch):
+    listings, _ = fake_listing
+    listings["ssh://u@host/"] = [("etc", True)]
+    out = bash_complete(monkeypatch, "prog ssh : //u @ host/e", 5)
+    assert out == ["plain,host/etc/"]
+
+
+def test_bash_source_calls_complete_exe():
+    script = BashComplete(click.Command("prog"), {}, "prog", "_PROG_COMPLETE")
+    script._check_version = lambda: None
+    assert "_PROG_COMPLETE=bash_complete $1)" in script.source()
+    script.complete_exe = "/opt/prog"
+    source = script.source()
+    assert "_PROG_COMPLETE=bash_complete /opt/prog)" in source
+    assert "complete -o nosort -F _prog_completion prog" in source
+
+
+# --- scp-style host:path ---------------------------------------------------------------
+
+
+@pytest.fixture
+def ssh_alias(tmp_path, monkeypatch):
+    """An ssh config where ``prod-1`` and ``cvat`` are aliases."""
+    cfg = tmp_path / "ssh_config"
+    cfg.write_text("Host prod-1 cvat\n  HostName 10.0.0.5\n  Port 2222\n")
+    monkeypatch.setenv("SSH_CONFIG", str(cfg))
+    monkeypatch.setattr(SSHPath, "_env_config", None)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # Absolute paths are kept; relative and empty ones start in the remote home.
+        ("prod-1:/var/log", "ssh://prod-1/var/log"),
+        ("alice@prod-1:/var/log", "ssh://alice@prod-1/var/log"),
+        ("prod-1:", "ssh://prod-1/~/"),
+        ("alice@prod-1:", "ssh://alice@prod-1/~/"),
+        ("prod-1:foo/bar", "ssh://prod-1/~/foo/bar"),
+        # Not scp-style, or not a configured alias: unchanged.
+        ("unknownhost:/path", "unknownhost:/path"),
+        ("s3://bucket/key", "s3://bucket/key"),
+        ("ssh://h/x", "ssh://h/x"),
+        ("/abs/path", "/abs/path"),
+        ("./rel:path", "./rel:path"),
+        ("C:/data", "C:/data"),
+        ("plain.txt", "plain.txt"),
+    ],
+)
+def test_scp_style_rewrite(ssh_alias, value, expected):
+    assert _maybe_rewrite_scp_style(value) == expected
+
+
+def test_scp_style_needs_an_ssh_config(monkeypatch):
+    monkeypatch.setenv("SSH_CONFIG", "")
+    assert _maybe_rewrite_scp_style("prod-1:/var/log") == "prod-1:/var/log"
+
+
+def test_scp_style_value_is_an_ssh_path(ssh_alias, monkeypatch):
+    async def exists(self):
+        return True
+
+    monkeypatch.setattr(SSHPath, "exists", exists)
+    result, paths = invoke(ClickPath(path_type=str), "prod-1:/var/log", "alice@cvat:logs")
+    assert result.exit_code == 0, result.output
+    assert paths == ("ssh://prod-1/var/log", "ssh://alice@cvat/~/logs")
+
+
+def test_scp_style_unknown_host_is_not_rewritten(ssh_alias):
+    result, paths = invoke(ClickPath(path_type=str), "other:file")
+    assert result.exit_code == 0, result.output
+    assert not paths[0].startswith("ssh:")
+
+
+@pytest.mark.parametrize(
+    "incomplete,uri,expected",
+    [
+        ("cvat:", "ssh://cvat/~/", ["cvat:docs/", "cvat:notes.txt"]),
+        ("cvat:d", "ssh://cvat/~/", ["cvat:docs/"]),
+        ("u@cvat:/srv/", "ssh://u@cvat/srv/", ["u@cvat:/srv/docs/", "u@cvat:/srv/notes.txt"]),
+    ],
+)
+def test_complete_scp_style(ssh_alias, fake_listing, incomplete, uri, expected):
+    listings, listed = fake_listing
+    listings[uri] = [("docs", True), ("notes.txt", False)]
+    assert [value for value, _ in complete(ClickPath(), incomplete)] == expected
+    assert listed == [uri]
+
+
+def test_complete_unknown_host_is_local(ssh_alias, fake_listing):
+    _, listed = fake_listing
+    assert complete(ClickPath(), "other:") == [("other:", "file")]
+    assert listed == []
+
+
+def test_complete_scheme_is_not_a_host(ssh_alias, fake_listing):
+    assert complete(ClickPath(), "file:") == [("file://", "plain")]
+    assert fake_listing[1] == []

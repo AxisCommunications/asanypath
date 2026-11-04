@@ -957,25 +957,31 @@ class CloudPathMixin(CommonPurePathMixin):
         await self._rmtree()
 
     async def _rmtree(self) -> None:
-        """Recursively delete this prefix's contents with concurrency.
-
-        Children are deleted concurrently so the :class:`MicroBatcher` can
-        coalesce the in-flight object deletes into batch API calls; no
-        Python-side semaphore is used because a small bound would only cap
-        the batch size and defeat that coalescing.
-        """
-
-        async def _remove(child: Self) -> None:
-            if await child.is_dir():
-                await child._rmtree()
-            else:
-                await child.unlink()
-
-        children = [_remove(child) async for child in self.iterdir(fresh=True)]
-        for result in await asyncio.gather(*children, return_exceptions=True):
+        """Delete every object under this prefix; at the service root, under
+        every bucket, container or repository."""
+        containers = await self._list_containers()
+        roots = [self] if containers is None else [self._spawn(uri) for uri in containers]
+        results = await asyncio.gather(*(r._delete_tree() for r in roots), return_exceptions=True)
+        self._invalidate_tree()
+        for root, result in zip(roots, results):
             if isinstance(result, BaseException):
                 raise result
-        self._invalidate_listing()
+            for key in result:
+                logger.warning("Not deleting %r under %s: not addressable as a path", key, root)
+
+    async def _delete_tree(self) -> list[str]:
+        """Delete every object under this prefix with as few requests as the
+        backend allows; return the keys left because no request path can
+        address them unambiguously (``..`` segments, ``%``, ``?``, ``#``)."""
+        raise NotImplementedError(f"{type(self).__name__} must define _delete_tree")
+
+    def _invalidate_tree(self) -> None:
+        """Drop the cached listings of this path and of every path below it."""
+        cache = type(self)._listing_cache
+        here = str(self)
+        below = here.rstrip("/") + "/"
+        for uri in [u for u in cache if u == here or u.startswith(below)]:
+            del cache[uri]
 
     async def copy(
         self,

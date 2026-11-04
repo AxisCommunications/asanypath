@@ -321,6 +321,56 @@ class TestArtifactoryPath(testbase):
             "art://artifactory.example.com/artifactory/maven",
         ]
 
+    # --- rmdir(recursive=True) ---
+
+    @staticmethod
+    def _tree_mocks(p, info):
+        storage = (
+            AsyncMock(return_value=info) if isinstance(info, dict) else AsyncMock(side_effect=info)
+        )
+        batcher = AsyncMock()
+        return (
+            patch.object(p, "_storage_info", new=storage),
+            patch.object(p, "_get_batcher", return_value=batcher),
+            batcher,
+        )
+
+    async def test_rmtree_deletes_a_folder_in_one_request(self):
+        p = _make_artifactory_path(art_path(file="dir/sub"))
+        storage, get_batcher, batcher = self._tree_mocks(p, {"children": []})
+        with storage, get_batcher:
+            await p.rmdir(recursive=True)
+        batcher.delete.assert_awaited_once()
+        assert batcher.delete.await_args.kwargs["item"] == "generic/dir/sub"
+
+    @pytest.mark.parametrize("info", [{"size": "3"}, FileNotFoundError()], ids=["file", "missing"])
+    async def test_rmtree_refuses_anything_but_a_folder(self, info):
+        p = _make_artifactory_path(art_path(file="thing"))
+        storage, get_batcher, batcher = self._tree_mocks(p, info)
+        with storage, get_batcher, pytest.raises(NotADirectoryError):
+            await p.rmdir(recursive=True)
+        batcher.delete.assert_not_awaited()
+
+    async def test_rmtree_at_repository_root_keeps_the_repository(self):
+        root = _make_artifactory_path("art://artifactory.example.com/artifactory/generic")
+        storage, get_batcher, batcher = self._tree_mocks(root, {"children": []})
+
+        async def children(**kwargs):
+            yield root / "a.txt"
+            yield root / "dir"
+
+        with storage, get_batcher, patch.object(root, "iterdir", children):
+            await root.rmdir(recursive=True)
+        items = sorted(c.kwargs["item"] for c in batcher.delete.await_args_list)
+        assert items == ["generic/a.txt", "generic/dir"]
+
+    async def test_rmtree_ignores_items_already_gone(self):
+        p = _make_artifactory_path(art_path(file="dir"))
+        storage, get_batcher, batcher = self._tree_mocks(p, {"children": []})
+        batcher.delete.side_effect = FileNotFoundError
+        with storage, get_batcher:
+            await p.rmdir(recursive=True)
+
     # --- _parse_art_ts ---
 
     @pytest.mark.parametrize(

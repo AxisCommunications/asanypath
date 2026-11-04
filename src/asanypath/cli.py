@@ -34,6 +34,7 @@ from asanypath._backend_opts import kwargs_for, parse_options
 from asanypath._transfer import TransferBudget, transfer_scope
 from asanypath._version import __version__
 from asanypath.asanypath import PROTOCOL_MAP
+from asanypath.click import BashComplete, ClickPath, _maybe_rewrite_scp_style
 
 if TYPE_CHECKING:
     from rich.progress import Progress
@@ -517,44 +518,6 @@ def mask_token(token: str | None, max_visible: int = 4) -> str:
     return token[:max_visible] + "*" * (len(token) - max_visible)
 
 
-def _maybe_rewrite_scp_style(value: str, check_config: bool = True) -> str:
-    """Rewrite scp-style ``[user@]host:path`` to ``ssh://[user@]host/path``.
-
-    When ``check_config=True`` (default), only rewrites if ``host`` matches
-    an entry in the user's ``~/.ssh/config`` (avoids hijacking local paths
-    that happen to contain a colon). When ``check_config=False`` (completion
-    mode), rewrites any scp-style prefix optimistically.
-    """
-    if "://" in value or ":" not in value:
-        return value
-    head, _, tail = value.partition(":")
-    user = None
-    host = head
-    if "@" in head:
-        user, _, host = head.partition("@")
-    # Reject Windows drive letters (defensive) and obvious local paths.
-    if not host or len(host) == 1 or "/" in host or host.startswith("."):
-        return value
-    if check_config:
-        try:
-            from asanypath.ssh import _discover_ssh_config, _resolve_alias
-        except ImportError:
-            return value
-        if not _discover_ssh_config():
-            return value
-        resolved_host = _resolve_alias(host, None, None)[0]
-        if resolved_host == host:
-            # No Host block matched — leave alone (don't probe DNS).
-            return value
-    prefix = f"{user}@" if user else ""
-    # scp semantics: a leading ``/`` means absolute, anything else (including
-    # empty) is relative to the remote home. ``/~`` is translated by
-    # SSHPath._item_path to SFTP cwd (= home after login).
-    if tail.startswith("/"):
-        return f"ssh://{prefix}{host}{tail}"
-    return f"ssh://{prefix}{host}/~/{tail}"
-
-
 def _resolve_path_arg(ctx: click.Context, param: click.Parameter, value: str | None) -> str:
     """Click callback: return value, falling back to a single line read from stdin."""
     if value is not None:
@@ -691,276 +654,7 @@ def _fmt_http_date(value: str, fmt: str = "%Y-%m-%d %H:%M:%S.%f %z") -> str:
             return value
 
 
-# Shell completion infrastructure
-_COMPLETION_CACHE: dict[str, tuple[float, list[str]]] = {}
-_COMPLETION_CACHE_TTL = 30.0
-_COMPLETION_TIMEOUT = 5.0
-
-
-def _completion_debug(msg: str) -> None:
-    """Emit completion diagnostics when explicitly enabled."""
-    if os.environ.get("ASANYPATH_COMPLETION_DEBUG"):
-        print(f"[asanypath completion] {msg}", file=sys.stderr)
-
-
-def _ensure_endswith_slash(path: str) -> str:
-    """Ensure a path ends with a slash, for completion purposes."""
-    return path.rstrip("/") + "/"
-
-
-async def _complete_path_prefix_async(prefix: str) -> list[str]:
-    """Async helper to complete cloud paths. Returns up to 50 candidates."""
-    if not prefix or "://" not in prefix:
-        return []
-
-    try:
-        p = AsAnyPath(prefix)
-        # Get parent directory for enumeration
-        parent = p.parent if not prefix.endswith("/") else p
-
-        async def _enumerate() -> list[str]:
-            candidates: list[str] = []
-            # Container/bucket/repo fast path: when at a service root the
-            # backend lists top-level names directly. These are always
-            # "directories", so mark them and skip per-entry is_dir probes.
-            list_containers = getattr(parent, "_list_containers", None)
-            if list_containers is not None:
-                names = await list_containers()
-                if names is not None:
-                    return sorted(map(_ensure_endswith_slash, names))
-
-            # SSH fast path: use OpenSSH subprocess so that a pre-existing
-            # ControlMaster socket makes this near-instant.
-            list_dir_remote = getattr(parent, "_list_dir_remote", None)
-            if list_dir_remote is not None:
-                entries = await list_dir_remote()
-                if entries is not None:
-                    for name, is_dir in entries:
-                        child = parent / name
-                        candidate = str(child)
-                        if is_dir:
-                            candidate = _ensure_endswith_slash(candidate)
-                        candidates.append(candidate)
-                        if len(candidates) >= 50:
-                            break
-                    return sorted(candidates)
-
-            async for child in parent.iterdir():
-                candidate = str(child)
-                try:
-                    if await child.is_dir():
-                        candidate = _ensure_endswith_slash(candidate)
-                except Exception:
-                    # Best effort: keep candidate even if dir detection fails.
-                    pass
-                candidates.append(candidate)
-                if len(candidates) >= 50:
-                    break
-            return sorted(candidates)
-
-        # asyncio.wait_for keeps the timeout compatible with Python 3.10
-        # (asyncio.timeout is 3.11+).
-        return await asyncio.wait_for(_enumerate(), _COMPLETION_TIMEOUT)
-    except FileNotFoundError:
-        _completion_debug(f"not found for prefix: {prefix}")
-        return []
-    except NotImplementedError:
-        _completion_debug(f"not implemented for prefix: {prefix}")
-        return []
-    except asyncio.TimeoutError:
-        _completion_debug(f"timeout after {_COMPLETION_TIMEOUT}s for prefix: {prefix}")
-        return []
-    except Exception as exc:
-        _completion_debug(f"error for prefix {prefix!r}: {exc}")
-        return []
-
-
-def _complete_cloud_path(prefix: str) -> list[str]:
-    """Complete cloud paths with caching (shallow, max 50 candidates)."""
-    if not prefix or "://" not in prefix:
-        return []
-
-    # Check cache
-    cache_key = prefix
-    if cache_key in _COMPLETION_CACHE:
-        cached_time, cached_results = _COMPLETION_CACHE[cache_key]
-        if time.time() - cached_time < _COMPLETION_CACHE_TTL:
-            return cached_results
-
-    try:
-        results = asyncio.run(_complete_path_prefix_async(prefix))
-        _COMPLETION_CACHE[cache_key] = (time.time(), results)
-        return results
-    except Exception as exc:
-        _completion_debug(f"runner failed for prefix {prefix!r}: {exc}")
-        return []
-
-
-def _complete_local_path(prefix: str, limit: int = 50) -> list[str]:
-    """Complete local paths for plain tokens (no URI scheme)."""
-    if "://" in prefix:
-        return []
-
-    try:
-        expanded = os.path.expanduser(prefix)
-        sep = os.sep
-        altsep = os.altsep
-
-        has_sep = sep in expanded or (altsep is not None and altsep in expanded)
-        if has_sep:
-            parent_part, name_part = os.path.split(expanded)
-            parent = Path(parent_part) if parent_part else Path(".")
-        else:
-            parent = Path(".")
-            name_part = expanded
-
-        out: list[str] = []
-        for child in parent.iterdir():
-            if not child.name.startswith(name_part):
-                continue
-            suggestion = str(child)
-            if child.is_dir() and not suggestion.endswith("/"):
-                suggestion += "/"
-            out.append(suggestion)
-            if len(out) >= limit:
-                break
-        return sorted(out)
-    except Exception:
-        return []
-
-
-def _normalize_completion_prefix(ctx: click.Context, incomplete: str) -> str:
-    """Normalize shell-split tokens (notably bash ':' word-break behavior)."""
-    if "://" in incomplete:
-        return incomplete
-
-    comp_words = os.environ.get("COMP_WORDS")
-    comp_cword = os.environ.get("COMP_CWORD")
-    if not comp_words or comp_cword is None:
-        return incomplete
-
-    try:
-        words = comp_words.split()
-        cword = int(comp_cword)
-    except Exception:
-        return incomplete
-
-    if cword <= 0 or cword >= len(words):
-        return incomplete
-
-    current = words[cword]
-    previous = words[cword - 1]
-
-    if "://" in current:
-        return current
-
-    # Bash commonly splits "s3://bucket/prefix" into ["s3", "//bucket/prefix"].
-    if current.startswith("//") and previous in PROTOCOL_MAP:
-        return f"{previous}:{current}"
-
-    if previous.endswith("://"):
-        return previous + current
-
-    if previous.endswith(":"):
-        scheme = previous[:-1]
-        if scheme in PROTOCOL_MAP:
-            return previous + current
-
-    return incomplete
-
-
-def _path_complete(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
-    """Click shell completion callback for path arguments."""
-    if not incomplete:
-        return []
-
-    normalized = _normalize_completion_prefix(ctx, incomplete)
-    scp_original = None  # Track original scp-style prefix for result conversion.
-    if "://" not in normalized:
-        # Support scp-style shorthand (for example "cvat:") during completion
-        # without requiring SSH config validation (use check_config=False).
-        rewritten = _maybe_rewrite_scp_style(normalized, check_config=False)
-        if "://" in rewritten:
-            scp_original = normalized
-            normalized = rewritten
-
-    if "://" in normalized:
-        try:
-            # Cloud completion may require network operations
-            # Catch any errors to avoid breaking shell completion
-            results = _complete_cloud_path(normalized)
-        except Exception:
-            # On timeout or connection error, return empty
-            results = []
-
-        def _matches(candidate: str, prefix: str) -> bool:
-            if candidate.startswith(prefix):
-                return True
-            if "://" not in candidate or "://" not in prefix:
-                return False
-
-            c_scheme, c_right = candidate.split("://", 1)
-            p_scheme, p_right = prefix.split("://", 1)
-            if c_scheme != p_scheme:
-                return False
-
-            if c_right.startswith(p_right):
-                return True
-
-            # Some backends canonicalize to a fuller path prefix than the
-            # user typed (for example art://repo/... -> art://host/.../repo/...).
-            return f"/{p_right}" in f"/{c_right}"
-
-        def _render(candidate: str, prefix: str) -> str:
-            if "://" not in candidate or "://" not in prefix:
-                return candidate
-            c_scheme, c_right = candidate.split("://", 1)
-            p_scheme, p_right = prefix.split("://", 1)
-            if c_scheme != p_scheme:
-                return candidate
-            if p_scheme == "ssh" and scp_original:
-                # Convert ssh://host/~/path back to scp-style host:path
-                if "@" in c_right:
-                    user, _, rest = c_right.partition("@")
-                    host, _, path = rest.partition("/")
-                else:
-                    host, _, path = c_right.partition("/")
-                # Extract original host from scp_original (e.g., "cvat:.confi" -> "cvat")
-                if "@" in scp_original:
-                    orig_user, _, orig_rest = scp_original.partition("@")
-                    orig_host = orig_rest.partition(":")[0]
-                    orig_user_prefix = f"{orig_user}@"
-                else:
-                    orig_host = scp_original.partition(":")[0]
-                    orig_user_prefix = ""
-                if host == orig_host:
-                    # Match: convert back to scp format
-                    if path.startswith("~/"):
-                        # Relative path from home
-                        return f"{orig_user_prefix}{orig_host}:{path[2:]}"
-                    elif path == "~/":
-                        # Just home
-                        return f"{orig_user_prefix}{orig_host}:"
-                    else:
-                        # Absolute path
-                        return f"{orig_user_prefix}{orig_host}:{path}"
-            if p_scheme != "art":
-                return candidate
-            marker = f"/{p_right}"
-            idx = c_right.find(marker)
-            if idx < 0:
-                return candidate
-            suffix = c_right[idx + len(marker) :]
-            return f"{p_scheme}://{p_right}{suffix}"
-
-        filtered = [_render(r, normalized) for r in results if _matches(r, normalized)]
-        return list(dict.fromkeys(filtered))[:50]
-
-    # Preserve local path completion and also suggest cloud URI schemes.
-    local = _complete_local_path(incomplete)
-    schemes = [f"{scheme}://" for scheme in sorted(PROTOCOL_MAP) if scheme.startswith(incomplete)]
-    merged = list(dict.fromkeys(local + schemes))
-    return merged[:50]
+_path_complete = ClickPath().shell_complete
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
@@ -1058,64 +752,17 @@ def completion(shell: str, exe_path: str | None) -> None:
 
     Persist it by adding that same line to your ~/.bashrc.
 
-    Important: use *this* command — not Click's generic
-    'eval "$(_ASANYPATH_COMPLETE=bash_source asanypath)"'. The generic script
-    leaves ':' in COMP_WORDBREAKS, so bash splits URI schemes and cloud paths
-    like 's3://bucket/…' or 'art://repo/…' never complete. This script drops
-    ':' from the word-break set so the whole URI stays a single token.
+    URIs like 's3://bucket/…' and 'user@host:path' complete as one word even
+    though bash splits words at ':' and '@'. Click's generic
+    'eval "$(_ASANYPATH_COMPLETE=bash_source asanypath)"' gives the same
+    script, except that it calls the command as typed instead of --exe.
 
     Tip: 'export ASANYPATH_COMPLETION_DEBUG=1' prints per-TAB diagnostics.
     """
     del shell  # currently only bash is supported
-    exe = exe_path or _default_completion_exe()
-    quoted_exe = shlex.quote(exe)
-
-    script = f"""# Keep URI schemes (e.g. s3://) as a single completion token.
-COMP_WORDBREAKS=${{COMP_WORDBREAKS//:}}
-
-_asanypath_completion() {{
-    local IFS=$'\\n'
-    local response
-    response=$(env COMP_WORDS=\"${{COMP_WORDS[*]}}\" COMP_CWORD=$COMP_CWORD \\
-        _ASANYPATH_COMPLETE=bash_complete {quoted_exe})
-
-    # Default to regular spacing; switch to nospace only for dir-only results.
-    compopt +o nospace 2>/dev/null || true
-
-    COMPREPLY=()
-    local has_dir=0
-    local has_file=0
-    local type value
-    for completion in $response; do
-        IFS=',' read -r type value <<< \"$completion\"
-        if [[ $type == 'dir' ]]; then
-            COMPREPLY=()
-            compopt -o dirnames
-        elif [[ $type == 'file' ]]; then
-            COMPREPLY=()
-            compopt -o default
-        elif [[ $type == 'plain' ]]; then
-            COMPREPLY+=(\"$value\")
-            if [[ $value == */ ]]; then
-                has_dir=1
-            else
-                has_file=1
-            fi
-        fi
-    done
-
-    if [[ $has_dir -eq 1 && $has_file -eq 0 ]]; then
-        compopt -o nospace
-    else
-        compopt +o nospace 2>/dev/null || true
-    fi
-
-    return 0
-}}
-
-complete -o nosort -F _asanypath_completion asanypath
-"""
-    click.echo(script)
+    script = BashComplete(cli, {}, "asanypath", "_ASANYPATH_COMPLETE")
+    script.complete_exe = shlex.quote(exe_path or _default_completion_exe())
+    click.echo(script.source())
 
 
 @cli.command(short_help="Check if path exists", context_settings=CONTEXT_SETTINGS)

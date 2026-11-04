@@ -31,8 +31,8 @@ use quick_xml::{XmlVersion, events::Event};
 use serde::{Deserialize, Serialize};
 
 use crate::http::{do_request, extract_host, status_to_pyerr};
-use crate::listing::{ListEntry, Listing};
-use crate::xml::local_name;
+use crate::listing::{Keys, ListEntry, ListSink, Listing};
+use crate::xml::{local_name, push_reference};
 use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -293,9 +293,10 @@ async fn do_s3_request(
 // XML listing parser
 // ---------------------------------------------------------------------------
 
-pub(crate) fn parse_listing_page(body: &[u8], listing: &mut Listing) -> Option<String> {
+pub(crate) fn parse_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<String> {
+    // Untrimmed: keys may start or end with spaces. Text is only read inside
+    // leaf elements, so whitespace between elements is never used.
     let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
 
     let mut buf = Vec::with_capacity(256);
     let mut text = String::new();
@@ -323,6 +324,7 @@ pub(crate) fn parse_listing_page(body: &[u8], listing: &mut Listing) -> Option<S
                 text.clear();
             }
             Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+            Ok(Event::GeneralRef(e)) => push_reference(&mut text, &e),
             Ok(Event::End(e)) => {
                 let name = e.name();
                 match local_name(name.as_ref()) {
@@ -496,40 +498,181 @@ impl CloudBackend for S3Creds {
 // Internal async helpers (used by both single + batch pyfunctions)
 // ---------------------------------------------------------------------------
 
+/// Fetch one ListObjectsV2 page into `sink`; returns the next continuation token.
+/// Without `delimiter` the page holds every key at any depth.
+async fn s3_list_page(
+    creds: &S3Creds,
+    search_prefix: &str,
+    delimiter: bool,
+    token: Option<String>,
+    use_h2: bool,
+    sink: &mut impl ListSink,
+) -> Result<Option<String>, PyErr> {
+    let mut query = vec![
+        ("list-type".to_string(), "2".to_string()),
+        ("prefix".to_string(), search_prefix.to_string()),
+    ];
+    if delimiter {
+        query.push(("delimiter".to_string(), "/".to_string()));
+    }
+    if let Some(token) = token {
+        query.push(("continuation-token".to_string(), token));
+    }
+    let (status, body, _headers) = do_s3_request(creds, "GET", "", &query, None, use_h2, &[])
+        .await
+        .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("s3://{}/{}", creds.bucket, search_prefix),
+            &body,
+        ));
+    }
+    Ok(parse_listing_page(&body, sink))
+}
+
 async fn do_s3_list(creds: &S3Creds, prefix: &str, use_h2: bool) -> Result<Vec<ListEntry>, PyErr> {
     let mut listing = Listing::new(format!("s3://{}", creds.bucket), prefix);
     let search_prefix = listing.search_prefix().to_string();
-    let mut continuation_token: Option<String> = None;
-
+    let mut token = None;
     loop {
-        let mut query = vec![
-            ("list-type".to_string(), "2".to_string()),
-            ("prefix".to_string(), search_prefix.clone()),
-            ("delimiter".to_string(), "/".to_string()),
-        ];
-        if let Some(ref token) = continuation_token {
-            query.push(("continuation-token".to_string(), token.clone()));
-        }
-
-        let (status, body, _headers) = do_s3_request(creds, "GET", "", &query, None, use_h2, &[])
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e))?;
-
-        if !status.is_success() {
-            return Err(status_to_pyerr(
-                status,
-                &format!("s3://{}/{}", creds.bucket, search_prefix),
-                &body,
-            ));
-        }
-
-        continuation_token = parse_listing_page(&body, &mut listing);
-        if continuation_token.is_none() {
-            break;
+        token = s3_list_page(creds, &search_prefix, true, token, use_h2, &mut listing).await?;
+        if token.is_none() {
+            return Ok(listing.finish());
         }
     }
+}
 
-    Ok(listing.finish())
+impl crate::backend::TreeDelete for S3Creds {
+    async fn list_keys_page(
+        &self,
+        search_prefix: &str,
+        token: Option<String>,
+        use_h2: bool,
+    ) -> Result<(Vec<String>, Option<String>), PyErr> {
+        let mut keys = Keys::default();
+        let next = s3_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
+        Ok((keys.0, next))
+    }
+
+    /// One DeleteObjects request per 1000 keys; keys an XML body cannot carry
+    /// are deleted one by one.
+    async fn delete_keys(&self, keys: Vec<String>, use_h2: bool) -> Result<(), PyErr> {
+        let (bulk, single): (Vec<_>, Vec<_>) = keys.into_iter().partition(|key| xml_text(key));
+        crate::backend::delete_each(self, single, use_h2).await?;
+        let batches: Vec<_> = bulk
+            .chunks(DELETE_OBJECTS_MAX)
+            .map(|chunk| delete_objects(self, chunk, use_h2))
+            .collect();
+        crate::backend::run_batches(batches).await
+    }
+}
+
+/// Keys per DeleteObjects request (the S3 maximum).
+const DELETE_OBJECTS_MAX: usize = 1000;
+
+/// Whether `value` can be XML 1.0 character data (escaped as needed).
+fn xml_text(value: &str) -> bool {
+    !value.chars().any(|c| {
+        (c < ' ' && !matches!(c, '\t' | '\n' | '\r')) || c == '\u{FFFE}' || c == '\u{FFFF}'
+    })
+}
+
+/// Delete up to 1000 keys with one DeleteObjects request. Keys that do not
+/// exist count as deleted; the first per-key error is raised.
+async fn delete_objects(creds: &S3Creds, keys: &[String], use_h2: bool) -> Result<(), PyErr> {
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet>"#,
+    );
+    for key in keys {
+        body.push_str("<Object><Key>");
+        body.push_str(&xml_escape(key));
+        body.push_str("</Key></Object>");
+    }
+    body.push_str("</Delete>");
+    use base64::Engine;
+    use md5::Digest;
+    let checksum = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body));
+    let headers = [
+        ("content-md5".to_string(), checksum),
+        ("content-type".to_string(), "application/xml".to_string()),
+    ];
+    let query = [("delete".to_string(), String::new())];
+    let (status, response, _) = do_s3_request(
+        creds,
+        "POST",
+        "",
+        &query,
+        Some(Bytes::from(body)),
+        use_h2,
+        &headers,
+    )
+    .await
+    .map_err(PyRuntimeError::new_err)?;
+    let bucket = format!("s3://{}", creds.bucket);
+    if !status.is_success() {
+        return Err(status_to_pyerr(status, &bucket, &response));
+    }
+    match parse_delete_errors(&response).into_iter().next() {
+        None => Ok(()),
+        Some((key, code)) => {
+            let path = format!("{bucket}/{key}");
+            Err(match code.as_str() {
+                "AccessDenied" => status_to_pyerr(reqwest::StatusCode::FORBIDDEN, &path, &[]),
+                _ => PyRuntimeError::new_err(format!("{code}: '{path}'")),
+            })
+        }
+    }
+}
+
+/// `(key, code)` of each `<Error>` in a DeleteObjects response, except keys
+/// that were already gone.
+fn parse_delete_errors(body: &[u8]) -> Vec<(String, String)> {
+    let mut reader = Reader::from_reader(body);
+    let mut buf = Vec::new();
+    let mut errors = Vec::new();
+    let (mut in_error, mut tag, mut key, mut code) =
+        (false, String::new(), String::new(), String::new());
+    loop {
+        let target = match tag.as_str() {
+            "Key" if in_error => Some(&mut key),
+            "Code" if in_error => Some(&mut code),
+            _ => None,
+        };
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                tag = local_name(e.name().as_ref()).to_string();
+                if tag == "Error" {
+                    in_error = true;
+                    key.clear();
+                    code.clear();
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if let Some(target) = target {
+                    target.push_str(&e.xml10_content());
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Some(target) = target {
+                    push_reference(target, &e);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local_name(e.name().as_ref()) == "Error" {
+                    in_error = false;
+                    if code != "NoSuchKey" {
+                        errors.push((std::mem::take(&mut key), std::mem::take(&mut code)));
+                    }
+                }
+                tag.clear();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    errors
 }
 
 /// List all buckets (service-level ListBuckets). Returns bare bucket names.
@@ -1290,6 +1433,33 @@ pub fn s3_delete_batch<'py>(
     })
 }
 
+/// Delete every object under `prefix`.
+#[pyfunction]
+pub fn s3_delete_tree<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = s3_creds!(
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token
+        );
+        crate::backend::TreeDelete::delete_tree(&creds, &prefix, h2).await
+    })
+}
+
 /// Check existence of multiple objects concurrently. Returns list of bools.
 #[pyfunction]
 pub fn s3_exists_batch<'py>(
@@ -1377,7 +1547,32 @@ pub fn s3_list_buckets<'py>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, parse_listing_page, parse_s3_acl};
+    use super::{Listing, parse_delete_errors, parse_listing_page, parse_s3_acl, xml_text};
+
+    #[test]
+    fn delete_errors_skip_keys_already_gone() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Error><Key>gone.txt</Key><Code>NoSuchKey</Code><Message>x</Message></Error>
+  <Error><Key>a &amp; b.txt</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error>
+  <Error><Key>c.txt</Key><Code>InternalError</Code><Message>try again</Message></Error>
+</DeleteResult>"#;
+        assert_eq!(
+            parse_delete_errors(body),
+            vec![
+                ("a & b.txt".to_string(), "AccessDenied".to_string()),
+                ("c.txt".to_string(), "InternalError".to_string()),
+            ]
+        );
+        assert!(parse_delete_errors(b"<DeleteResult/>").is_empty());
+    }
+
+    #[test]
+    fn xml_text_rejects_characters_xml_cannot_carry() {
+        assert!(xml_text("dir/a <&> \"b\" \u{e9}.txt"));
+        assert!(!xml_text("dir/a\u{1}b"));
+        assert!(!xml_text("dir/a\u{ffff}"));
+    }
 
     #[test]
     fn parses_listing_page_metadata() {
@@ -1409,6 +1604,19 @@ mod tests {
                 ("s3://b/dir/sub".into(), true, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn listing_keeps_escaped_characters_and_edge_spaces() {
+        let body = br#"<ListBucketResult>
+  <Contents><Key>dir/a &amp; b&#46;txt</Key><Size>1</Size></Contents>
+  <Contents>
+    <Key>dir/ lead &lt;x&gt; </Key><Size>2</Size>
+  </Contents>
+</ListBucketResult>"#;
+        let mut keys = super::Keys::default();
+        assert_eq!(parse_listing_page(body, &mut keys), None);
+        assert_eq!(keys.0, vec!["dir/a & b.txt", "dir/ lead <x> "]);
     }
 
     #[test]
