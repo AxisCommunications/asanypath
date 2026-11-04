@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from os import PathLike, getenv, sep
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 from urllib.parse import urlsplit
 
@@ -257,6 +257,9 @@ class CommonPurePathMixin:
             if SCHEME_SEP in other and not other.startswith(self.protocol):
                 raise UnsupportedProtocolError(f"Cannot join {self.protocol} path with {other}")
             other = [other.replace(self.protocol + SCHEME_SEP, "", 1)]
+        elif isinstance(other, PurePath) and not other.is_absolute():
+            # e.g. the result of relative_to(): dst_root / src.relative_to(src_root)
+            other = [other.as_posix()]
         else:
             raise UnsupportedProtocolError(f"Cannot join {self.protocol} path with {other}")
 
@@ -340,24 +343,54 @@ class CommonPurePathMixin:
         return (*drive, *parts)
 
     def _relative_part(self, other: str | PathLike[str], *, walk_up: bool = False) -> Any:
-        """Return the part of this path below *other*, without building a path."""
-        try:
-            if self.protocol == "file":
-                return self._path.relative_to(other)
-            if not (str(self).startswith(str(other)) or walk_up):
-                raise ValueError
-            other = self._derive(other).absolute()
-            if not str(self).startswith(str(other)):
-                raise ValueError
-            return str(self).replace(str(other), "")
-        except ValueError:
-            raise ValueError(
-                f"{self} is not in the subpath of {other}"
-                "OR one path is relative and the other is absolute."
-            ) from None
+        """Return the part of this path below *other* as a relative path.
 
-    def relative_to(self, other: str | PathLike[str], *, walk_up: bool = False) -> Self:
-        return self._derive(self._relative_part(other, walk_up=walk_up))
+        Remote paths are compared segment by segment below the same scheme and
+        bucket/host, so ``s3://b/ab`` is not relative to ``s3://b/a``. As in
+        pathlib, a path that is not below *other* raises ``ValueError`` (also for
+        another backend: a different anchor) and a non-path raises ``TypeError``.
+        """
+        from asanypath.sync import _SyncProxy
+
+        if isinstance(other, _SyncProxy):
+            other = other._async
+        if not isinstance(other, (str, PathLike)):
+            raise TypeError(
+                f"argument should be a str or an os.PathLike object, not {type(other).__name__!r}"
+            )
+        error = ValueError(f"{self} is not in the subpath of {other}")
+        if self.protocol == "file":
+            if isinstance(other, CommonPurePathMixin) and other.protocol != "file":
+                raise error  # a remote path has no os.fspath() for pathlib to compare
+            return self._path.relative_to(other)
+        base = str(other)
+        if not base.lower().startswith(self.protocol + SCHEME_SEP):
+            raise error  # relative, or another protocol
+        # Parse without the subclass __init__: no credentials are needed to compare paths
+        probe = object.__new__(type(self))
+        CommonPurePathMixin.__init__(probe, base)
+        mine, theirs = self.parts, probe.parts
+        if mine[:2] != theirs[:2]:  # different bucket/host: no common anchor
+            raise error
+        common = 0
+        while common < min(len(mine), len(theirs)) and mine[common] == theirs[common]:
+            common += 1
+        if common < len(theirs) and not walk_up:
+            raise error
+        # URLs normalize "..", so unlike pathlib *other* never has segments that cannot be walked
+        return PurePosixPath(*[".."] * (len(theirs) - common), *mine[common:])
+
+    def relative_to(
+        self, other: str | PathLike[str], *, walk_up: bool = False
+    ) -> Self | PurePosixPath:
+        """Return this path relative to *other*.
+
+        A relative remote path has no bucket or host, so it is returned as a
+        :class:`~pathlib.PurePosixPath`; join it onto any path with ``/``.
+        """
+        if self.protocol == "file":
+            return self._derive(self._relative_part(other, walk_up=walk_up))
+        return self._relative_part(other, walk_up=walk_up)
 
     @property
     def root(self) -> str:
