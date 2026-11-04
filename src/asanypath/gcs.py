@@ -27,6 +27,7 @@ import msgspec
 from asanypath_native import (
     gcs_copy_batch,
     gcs_delete_batch,
+    gcs_delete_tree,
     gcs_exists_batch,
     gcs_get_acl,
     gcs_get_batch,
@@ -184,6 +185,11 @@ class GCSPath(CloudPathMixin, ServiceEndpointMixin):
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has objects with this prefix)."""
         return await gcs_is_dir(prefix=self._object_path, **self._native_kwargs)
+
+    async def _delete_tree(self) -> list[str]:
+        return await gcs_delete_tree(
+            prefix=self._item_path, use_h2=False, **(await self._get_native_kwargs())
+        )
 
     async def _list_containers(self) -> list[str] | None:
         """List buckets when at the service root (``gs://``); else None."""

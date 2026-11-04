@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -360,6 +361,28 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
             if child is not None:
                 entries.append(DirEntry(child, is_folder))
         return entries
+
+    async def _delete_tree(self) -> list[str]:
+        # Artifactory deletes a folder and everything in it with one DELETE.
+        try:
+            is_folder = "children" in await self._storage_info()
+        except FileNotFoundError:
+            is_folder = False
+        if not is_folder:
+            raise NotADirectoryError(20, f"Not a directory: '{self}'")
+        if "/" in self._repo_path.strip("/"):
+            items = [self._repo_path]
+        else:  # repository root: its top-level items, never the repository itself
+            items = [child._repo_path async for child in self.iterdir(fresh=True)]
+        batcher, native_kwargs = self._get_batcher(), await self._get_native_kwargs()
+        results = await asyncio.gather(
+            *(batcher.delete(item=item, **native_kwargs) for item in items),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, FileNotFoundError):
+                raise result
+        return []
 
     async def _list_containers(self) -> list[str] | None:
         """List repositories when at the server root (``art://<host>/artifactory/``).

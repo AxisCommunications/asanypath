@@ -1142,25 +1142,77 @@ class TestCloudFileHelpers:
             with pytest.raises(OSError):
                 await p.rmdir(recursive=False)
 
-    async def test_rmdir_recursive_unlinks_files(self):
-        p = _make_s3()
-        child_file = _make_s3()
-        child_dir = _make_s3()
+    @pytest.mark.parametrize(
+        "make,module,func,uri,expected",
+        [
+            (
+                _BACKENDS[0].values[0],
+                "s3",
+                "s3_delete_tree",
+                "s3://bucket/dir/",
+                {"bucket": "bucket"},
+            ),
+            (
+                _BACKENDS[1].values[0],
+                "gcs",
+                "gcs_delete_tree",
+                "gs://bucket/dir/",
+                {"bucket": "bucket", "access_token": "tok"},
+            ),
+            (
+                _BACKENDS[2].values[0],
+                "azure",
+                "az_delete_tree",
+                "az://box/dir/",
+                {"container": "box", "account_name": "dev"},
+            ),
+        ],
+        ids=["s3", "gcs", "azure"],
+    )
+    async def test_rmdir_recursive_is_one_native_tree_delete(
+        self, make, module, func, uri, expected
+    ):
+        p = make(uri)
+        with patch(f"asanypath.{module}.{func}", new=AsyncMock(return_value=[])) as native:
+            await p.rmdir(recursive=True)
+        native.assert_awaited_once()
+        kwargs = native.await_args.kwargs
+        assert kwargs["prefix"] == "dir"
+        assert kwargs.items() >= expected.items()
 
-        child_file.is_dir = AsyncMock(return_value=False)
-        child_file.unlink = AsyncMock()
-        child_dir.is_dir = AsyncMock(return_value=True)
-        child_dir._rmtree = AsyncMock()
+    async def test_rmdir_recursive_drops_cached_listings_below(self):
+        p = _make_s3()._spawn("s3://bucket/dir")
+        cache = type(p)._listing_cache
+        for uri in ("s3://bucket/dir", "s3://bucket/dir/sub", "s3://bucket/dirx", "s3://bucket"):
+            cache[uri] = {"id": (0.0, [])}
+        with patch("asanypath.s3.s3_delete_tree", new=AsyncMock(return_value=[])):
+            await p.rmdir(recursive=True)
+        assert sorted(cache) == ["s3://bucket", "s3://bucket/dirx"]
 
-        async def fake_root_iterdir(**kwargs):
-            yield child_file
-            yield child_dir
+    async def test_rmdir_recursive_warns_about_keys_left(self, caplog):
+        p = _make_s3()._spawn("s3://bucket/dir")
+        left = AsyncMock(return_value=["dir/../outside.txt"])
+        with patch("asanypath.s3.s3_delete_tree", new=left), caplog.at_level("WARNING"):
+            await p.rmdir(recursive=True)
+        assert "'dir/../outside.txt'" in caplog.text
 
-        with patch.object(p, "iterdir", fake_root_iterdir):
+    async def test_rmdir_recursive_raises_backend_errors(self):
+        p = _make_s3()._spawn("s3://bucket/dir")
+        failing = AsyncMock(side_effect=PermissionError("denied"))
+        with patch("asanypath.s3.s3_delete_tree", new=failing), pytest.raises(PermissionError):
             await p.rmdir(recursive=True)
 
-        child_file.unlink.assert_awaited_once()
-        child_dir._rmtree.assert_awaited_once_with()
+    async def test_rmdir_recursive_at_service_root_covers_every_bucket(self):
+        root = _make_s3()._spawn("s3://")
+        containers = AsyncMock(return_value=["s3://alpha", "s3://beta"])
+        native = AsyncMock(return_value=[])
+        with (
+            patch.object(S3Path, "_list_containers", new=containers),
+            patch("asanypath.s3.s3_delete_tree", new=native),
+        ):
+            await root.rmdir(recursive=True)
+        assert sorted(c.kwargs["bucket"] for c in native.await_args_list) == ["alpha", "beta"]
+        assert {c.kwargs["prefix"] for c in native.await_args_list} == {""}
 
     async def test_open_no_upload_on_exception(self, cloud_path):
         mock_write = AsyncMock()

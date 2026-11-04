@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::http::{do_request, do_request_light, status_to_pyerr};
-use crate::listing::{ListEntry, Listing};
+use crate::listing::{Keys, ListEntry, ListSink, Listing};
 use crate::xml::local_name;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -111,7 +111,18 @@ impl AzCreds {
         let now = chrono_now_rfc2822();
         headers.push(("x-ms-date".to_string(), now));
         headers.push(("x-ms-version".to_string(), API_VERSION.to_string()));
+        self.sign_headers(method, url, headers, params);
+    }
 
+    /// Add the SharedKey `authorization` for `headers` as given (batch
+    /// sub-requests carry `x-ms-date` but no `x-ms-version`).
+    fn sign_headers(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &mut Vec<(String, String)>,
+        params: Option<&[(&str, &str)]>,
+    ) {
         let key_bytes = match &self.key_bytes {
             Some(kb) => kb,
             None => return, // SAS auth or no key, no signing needed
@@ -428,47 +439,131 @@ async fn do_az_is_dir(creds: &AzCreds, prefix: &str, use_h2: bool) -> Result<boo
     Ok(false)
 }
 
+/// Fetch one List Blobs page into `sink`; returns the next marker.
+/// Without `delimiter` the page holds every blob at any depth.
+async fn az_list_page(
+    creds: &AzCreds,
+    search_prefix: &str,
+    delimiter: bool,
+    marker: Option<String>,
+    use_h2: bool,
+    sink: &mut impl ListSink,
+) -> Result<Option<String>, PyErr> {
+    let mut params: Vec<(&str, &str)> = vec![
+        ("restype", "container"),
+        ("comp", "list"),
+        ("prefix", search_prefix),
+    ];
+    if delimiter {
+        params.push(("delimiter", "/"));
+    }
+    if let Some(marker) = marker.as_deref().filter(|m| !m.is_empty()) {
+        params.push(("marker", marker));
+    }
+    let url = creds.list_url(&params);
+    let mut headers = Vec::new();
+    creds.sign("GET", &url, &mut headers, Some(&params));
+    let (status, body) = do_request_light("GET", &url, &headers, None, use_h2)
+        .await
+        .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("az://{}/{}", creds.container, search_prefix),
+            &body,
+        ));
+    }
+    Ok(parse_az_listing_page(&body, sink))
+}
+
 async fn do_az_list(creds: &AzCreds, prefix: &str, use_h2: bool) -> Result<Vec<ListEntry>, PyErr> {
     let mut listing = Listing::new(format!("az://{}", creds.container), prefix);
     let search_prefix = listing.search_prefix().to_string();
-    let mut marker: Option<String> = None;
-
+    let mut marker = None;
     loop {
-        let marker_str = marker.clone().unwrap_or_default();
-        let mut params: Vec<(&str, &str)> = vec![
-            ("restype", "container"),
-            ("comp", "list"),
-            ("prefix", &search_prefix),
-            ("delimiter", "/"),
-        ];
-        if !marker_str.is_empty() {
-            params.push(("marker", &marker_str));
-        }
-        let url = creds.list_url(&params);
-        let mut headers = Vec::new();
-        creds.sign("GET", &url, &mut headers, Some(&params));
-        let (status, body) = do_request_light("GET", &url, &headers, None, use_h2)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e))?;
-        if !status.is_success() {
-            return Err(status_to_pyerr(
-                status,
-                &format!("az://{}/{}", creds.container, search_prefix),
-                &body,
-            ));
-        }
-        marker = parse_az_listing_page(&body, &mut listing);
+        marker = az_list_page(creds, &search_prefix, true, marker, use_h2, &mut listing).await?;
         if marker.is_none() {
-            break;
+            return Ok(listing.finish());
         }
     }
-
-    Ok(listing.finish())
 }
 
-fn parse_az_listing_page(body: &[u8], listing: &mut Listing) -> Option<String> {
+impl crate::backend::TreeDelete for AzCreds {
+    async fn list_keys_page(
+        &self,
+        search_prefix: &str,
+        token: Option<String>,
+        use_h2: bool,
+    ) -> Result<(Vec<String>, Option<String>), PyErr> {
+        let mut keys = Keys::default();
+        let next = az_list_page(self, search_prefix, false, token, use_h2, &mut keys).await?;
+        Ok((keys.0, next))
+    }
+
+    /// One Blob Batch request per 256 blobs.
+    async fn delete_keys(&self, keys: Vec<String>, use_h2: bool) -> Result<(), PyErr> {
+        let batches: Vec<_> = keys
+            .chunks(AZ_BATCH_MAX)
+            .map(|blobs| az_batch_delete(self, blobs, use_h2))
+            .collect();
+        crate::backend::run_batches(batches).await
+    }
+}
+
+/// Sub-requests per Blob Batch request (the Azure maximum).
+const AZ_BATCH_MAX: usize = 256;
+
+/// Delete up to 256 blobs with one container-scoped Blob Batch request.
+/// Each sub-request is authorized on its own and carries no `x-ms-version`:
+/// the batch's version applies.
+async fn az_batch_delete(creds: &AzCreds, blobs: &[String], use_h2: bool) -> Result<(), PyErr> {
+    let requests: Vec<String> = blobs
+        .iter()
+        .map(|blob| {
+            let url = creds.blob_url(blob);
+            let mut headers = vec![
+                ("x-ms-date".to_string(), chrono_now_rfc2822()),
+                ("content-length".to_string(), "0".to_string()),
+            ];
+            creds.sign_headers("DELETE", &url, &mut headers, None);
+            let mut request = format!("DELETE {} HTTP/1.1", crate::multipart::path_of(&url));
+            for (name, value) in &headers {
+                request.push_str(&format!("\r\n{name}: {value}"));
+            }
+            request
+        })
+        .collect();
+    let boundary = crate::multipart::boundary();
+    let body = crate::multipart::body(&boundary, &requests);
+    let params = [("restype", "container"), ("comp", "batch")];
+    let url = creds.list_url(&params);
+    let mut headers = vec![
+        (
+            "content-type".to_string(),
+            format!("multipart/mixed; boundary={boundary}"),
+        ),
+        ("content-length".to_string(), body.len().to_string()),
+    ];
+    creds.sign("POST", &url, &mut headers, Some(&params));
+    let (status, response) =
+        do_request_light("POST", &url, &headers, Some(Bytes::from(body)), use_h2)
+            .await
+            .map_err(PyRuntimeError::new_err)?;
+    if !status.is_success() {
+        return Err(status_to_pyerr(
+            status,
+            &format!("az://{}", creds.container),
+            &response,
+        ));
+    }
+    let statuses = crate::multipart::statuses(&response);
+    crate::multipart::check_deletes(statuses, blobs, |blob| creds.error_path(blob))
+}
+
+fn parse_az_listing_page(body: &[u8], listing: &mut impl ListSink) -> Option<String> {
+    // Untrimmed: blob names may start or end with spaces. Text is only read
+    // inside leaf elements, so whitespace between elements is never used.
     let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut text = String::new();
     let mut in_blob = false;
@@ -495,6 +590,7 @@ fn parse_az_listing_page(body: &[u8], listing: &mut Listing) -> Option<String> {
                 text.clear();
             }
             Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
+            Ok(Event::GeneralRef(e)) => crate::xml::push_reference(&mut text, &e),
             Ok(Event::End(e)) => {
                 let tag = e.name();
                 match local_name(tag.as_ref()) {
@@ -1039,6 +1135,25 @@ pub fn az_delete_batch<'py>(
     })
 }
 
+/// Delete every blob under `prefix`.
+#[pyfunction]
+pub fn az_delete_tree<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    container: String,
+    prefix: String,
+    account_name: String,
+    account_key: Option<String>,
+    sas_token: Option<String>,
+    use_h2: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let h2 = use_h2.unwrap_or(false);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let creds = az_creds!(endpoint, container, account_name, account_key, sas_token);
+        crate::backend::TreeDelete::delete_tree(&creds, &prefix, h2).await
+    })
+}
+
 #[pyfunction]
 pub fn az_exists_batch<'py>(
     py: Python<'py>,
@@ -1189,5 +1304,18 @@ mod tests {
                 ("az://c/dir/sub".into(), true, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn listing_keeps_escaped_characters_and_edge_spaces() {
+        let body = br#"<EnumerationResults><Blobs>
+  <Blob><Name>dir/a &amp; b&#46;txt</Name></Blob>
+  <Blob>
+    <Name> dir/ lead &quot;x&quot; </Name>
+  </Blob>
+</Blobs><NextMarker /></EnumerationResults>"#;
+        let mut keys = super::Keys::default();
+        assert_eq!(parse_az_listing_page(body, &mut keys), None);
+        assert_eq!(keys.0, vec!["dir/a & b.txt", " dir/ lead \"x\" "]);
     }
 }

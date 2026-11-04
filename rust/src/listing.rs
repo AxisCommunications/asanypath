@@ -13,6 +13,48 @@ use std::collections::HashMap;
 /// backend's raw timestamp text, parsed on the Python side.
 pub type ListEntry = (String, bool, Option<u64>, Option<String>);
 
+/// Receives the entries of one listing page.
+pub trait ListSink {
+    /// A delimiter-rolled-up common prefix (a directory).
+    fn add_prefix(&mut self, prefix: &str);
+    /// An object key.
+    fn add_object(&mut self, key: &str, size: Option<u64>, modified: Option<String>);
+}
+
+/// Every object key of a listing made without a delimiter.
+#[derive(Default)]
+pub struct Keys(pub Vec<String>);
+
+impl ListSink for Keys {
+    fn add_prefix(&mut self, _prefix: &str) {}
+
+    fn add_object(&mut self, key: &str, _size: Option<u64>, _modified: Option<String>) {
+        self.0.push(key.to_string());
+    }
+}
+
+/// The key prefix that selects everything below `prefix` (`""` for the root).
+pub fn search_prefix(prefix: &str) -> String {
+    let key = prefix.trim_matches('/');
+    if key.is_empty() {
+        String::new()
+    } else {
+        format!("{key}/")
+    }
+}
+
+/// Whether `key` lies under `search_prefix` and can be sent as a request path
+/// as is: URL parsing would resolve `.`/`..` segments, treat `\` as `/`,
+/// decode `%`, split at `?`/`#` and drop tab, CR and LF.
+pub fn plain_key(key: &str, search_prefix: &str) -> bool {
+    key.strip_prefix(search_prefix).is_some_and(|rel| {
+        !rel.contains(['\\', '%', '?', '#', '\t', '\r', '\n'])
+            && !rel
+                .split('/')
+                .any(|segment| segment == "." || segment == "..")
+    })
+}
+
 /// Collects the direct children of `prefix`, deduplicated by name.
 pub struct Listing {
     base: String,
@@ -25,16 +67,10 @@ pub struct Listing {
 impl Listing {
     /// `base` is the URI root such as `s3://bucket`.
     pub fn new(base: String, prefix: &str) -> Self {
-        let current_key = prefix.trim_matches('/').to_string();
-        let search_prefix = if current_key.is_empty() {
-            String::new()
-        } else {
-            format!("{current_key}/")
-        };
         Self {
             base,
-            current_key,
-            search_prefix,
+            current_key: prefix.trim_matches('/').to_string(),
+            search_prefix: search_prefix(prefix),
             index: HashMap::new(),
             entries: Vec::new(),
         }
@@ -42,26 +78,6 @@ impl Listing {
 
     pub fn search_prefix(&self) -> &str {
         &self.search_prefix
-    }
-
-    /// Add a delimiter-rolled-up common prefix (a directory).
-    pub fn add_prefix(&mut self, prefix: &str) {
-        self.insert(prefix.trim_end_matches('/'), true, None, None);
-    }
-
-    /// Add an object key; keys below a deeper `/` collapse to their directory.
-    pub fn add_object(&mut self, key: &str, size: Option<u64>, modified: Option<String>) {
-        let relative = key
-            .strip_prefix(self.search_prefix.as_str())
-            .unwrap_or(key)
-            .trim_start_matches('/');
-        match relative.split_once('/') {
-            Some((first, _)) => {
-                let name = format!("{}{first}", self.search_prefix);
-                self.insert(&name, true, None, None);
-            }
-            None => self.insert(key.trim_end_matches('/'), false, size, modified),
-        }
     }
 
     pub fn finish(self) -> Vec<ListEntry> {
@@ -82,6 +98,27 @@ impl Listing {
         self.index.insert(name.to_string(), self.entries.len());
         self.entries
             .push((format!("{}/{name}", self.base), is_dir, size, modified));
+    }
+}
+
+impl ListSink for Listing {
+    fn add_prefix(&mut self, prefix: &str) {
+        self.insert(prefix.trim_end_matches('/'), true, None, None);
+    }
+
+    /// Keys below a deeper `/` collapse to their directory.
+    fn add_object(&mut self, key: &str, size: Option<u64>, modified: Option<String>) {
+        let relative = key
+            .strip_prefix(self.search_prefix.as_str())
+            .unwrap_or(key)
+            .trim_start_matches('/');
+        match relative.split_once('/') {
+            Some((first, _)) => {
+                let name = format!("{}{first}", self.search_prefix);
+                self.insert(&name, true, None, None);
+            }
+            None => self.insert(key.trim_end_matches('/'), false, size, modified),
+        }
     }
 }
 
@@ -115,6 +152,50 @@ mod tests {
                 ("s3://b/root/deep".into(), true, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn keys_sink_keeps_every_key() {
+        let mut keys = Keys::default();
+        keys.add_prefix("ignored/");
+        keys.add_object("dir/", Some(0), None);
+        keys.add_object("dir/a/b.txt", Some(1), None);
+        assert_eq!(keys.0, vec!["dir/", "dir/a/b.txt"]);
+    }
+
+    #[test]
+    fn search_prefix_selects_below() {
+        assert_eq!(search_prefix("/dir/sub/"), "dir/sub/");
+        assert_eq!(search_prefix(""), "");
+    }
+
+    #[test]
+    fn plain_key_rejects_keys_a_url_would_reinterpret() {
+        for key in [
+            "dir/",
+            "dir/a",
+            "dir/a/b.txt",
+            "dir/x/",
+            "dir/a..b",
+            "dir/.hidden",
+        ] {
+            assert!(plain_key(key, "dir/"), "{key}");
+        }
+        for key in [
+            "other/a",
+            "dir/../outside.txt",
+            "dir/a/./b",
+            "dir/a/..",
+            "dir/a\\..\\b",
+            "dir/a%2Fb",
+            "dir/a?b",
+            "dir/a#b",
+            "dir/a\tb",
+            "dir/a\nb",
+        ] {
+            assert!(!plain_key(key, "dir/"), "{key:?}");
+        }
+        assert!(plain_key("anything/at/root", ""));
     }
 
     #[test]
