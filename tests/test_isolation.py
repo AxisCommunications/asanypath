@@ -136,8 +136,8 @@ def test_artifactory_token_scoping():
         lambda: ArtifactoryPath(f"{OTHER}/f"),
         lambda: path.with_segments(f"{OTHER}/f"),
     ):
-        with pytest.raises(ValueError, match="token required"):
-            elsewhere()
+        # The other service gets no token: its requests are anonymous.
+        assert elsewhere()._native_kwargs["token"] == ""
 
 
 _CLOUD_CASES = [
@@ -506,6 +506,11 @@ _ART_ENV = {
     "ARTIFACTORY_IDENTITY_TOKEN": "ambient",
     "ARTIFACTORY_BASE_URL": "corp.example/artifactory",
 }
+# One service under two host names, listed explicitly.
+_ART_ALIASES_ENV = {
+    "ARTIFACTORY_IDENTITY_TOKEN": "ambient",
+    "ARTIFACTORY_BASE_URL": "https://corp.example/artifactory, https://alias.example/artifactory",
+}
 
 
 @pytest.mark.parametrize(
@@ -519,6 +524,10 @@ _ART_ENV = {
         ({}, "art://art.example/artifactory/repo/f", None),
         (_ART_ENV, "art://corp.example/artifactory/repo/f", "ambient"),
         (_ART_ENV, "art://attacker.example/artifactory/repo/f", None),
+        (_ART_ALIASES_ENV, "art://corp.example/artifactory/repo/f", "ambient"),
+        (_ART_ALIASES_ENV, "art://alias.example/artifactory/repo/f", "ambient"),
+        (_ART_ALIASES_ENV, "art://alias.example.attacker.example/artifactory/f", None),
+        (_ART_ALIASES_ENV, "art://unlisted.example/artifactory/repo/f", None),
         ({"ARTIFACTORY_IDENTITY_TOKEN": "ambient"}, "art://any.example/artifactory/repo/f", None),
     ],
 )
@@ -527,8 +536,8 @@ def test_ambient_artifactory_tokens(ambient, env, uri, token):
         ambient.setenv(name, value)
 
     if token is None:
-        with pytest.raises(ValueError, match="token required"):
-            ArtifactoryPath(uri)
+        # Not the configured service: anonymous, the ambient token is not sent.
+        assert ArtifactoryPath(uri)._native_kwargs["token"] == ""
     else:
         assert ArtifactoryPath(uri)._token == token
 
@@ -564,8 +573,7 @@ def test_unscoped_ambient_credentials_warn_once_per_setting(ambient, caplog):
     ambient.setenv("ARTIFACTORY_IDENTITY_TOKEN", "t")
     for host in ("a.example", "b.example"):
         HTTPSPath(f"https://{host}/x")._auth_headers()
-        with pytest.raises(ValueError):
-            ArtifactoryPath(f"art://{host}/artifactory/repo/f")
+        assert ArtifactoryPath(f"art://{host}/artifactory/repo/f")._native_kwargs["token"] == ""
 
     assert sorted(r.message for r in caplog.records if "is ignored" in r.message) == [
         "ARTIFACTORY_IDENTITY_TOKEN is ignored: set ARTIFACTORY_BASE_URL to the service it is for",

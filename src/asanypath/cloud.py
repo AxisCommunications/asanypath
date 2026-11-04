@@ -16,7 +16,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import aclosing
 from functools import lru_cache, partial
 from os import PathLike
@@ -227,24 +227,25 @@ class CloudPathMixin(CommonPurePathMixin):
         return ()
 
     def _ambient_credentials_allowed(
-        self, service_url: str | None, own_url: str, *, credential: str, setting: str
+        self, service_urls: Sequence[str], own_url: str, *, credential: str, setting: str
     ) -> bool:
         """Whether ambient (environment) credentials may be sent to this path.
 
-        Ambient credentials belong to the one service named by *setting*
-        (*service_url*), so they are only used for a path on that service's
-        origin (scheme, host and port). Without a configured service they are
-        never sent; a warning names the missing setting once per process.
+        Ambient credentials belong to the service named by *setting*
+        (*service_urls*: one service, possibly under several host names), so
+        they are only used for a path on one of those origins (scheme, host
+        and port). Without a configured service they are never sent; a warning
+        names the missing setting once per process.
         """
-        if not service_url:
+        if not service_urls:
             if credential not in _UNSCOPED_WARNED:
                 _UNSCOPED_WARNED.add(credential)
                 logger.warning(
                     "%s is ignored: set %s to the service it is for", credential, setting
                 )
             return False
-        service = _service_origin(service_url)
-        return service is not None and service == _service_origin(own_url)
+        own = _service_origin(own_url)
+        return own is not None and any(_service_origin(url) == own for url in service_urls)
 
     def _identity_fingerprint(self) -> str:
         """Stable digest of this path's identity, safe to persist.

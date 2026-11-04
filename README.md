@@ -106,6 +106,30 @@ update it. It is not necessarily the final per-request URL (for example, after
 bucket addressing or redirects). Local, HTTP, SSH and FTP paths do not expose
 this property.
 
+### Artifactory URLs
+
+`art://host/artifactory/repo/path` addresses Artifactory directly. With
+`ARTIFACTORY_BASE_URL` set, e.g. to `https://artifacts.example.com/artifactory`:
+
+- `art://repo/path` (and `art://` for the repository list) expand to it;
+- `https://` URLs under it are Artifactory paths as well, using the Artifactory
+  API and token;
+- `ARTIFACTORY_IDENTITY_TOKEN` is sent to it and nowhere else.
+
+An `https://` URL on a host that is not configured stays plain HTTPS and is
+read without a token. When one Artifactory answers under several host names,
+list them all, comma-separated; `art://` shorthand expands to the first:
+
+```bash
+export ARTIFACTORY_BASE_URL=https://artifacts.example.com/artifactory,https://artifactory.example.com/artifactory
+```
+
+Only listed host names count, never DNS aliases. Without a token (`token=`,
+`ARTIFACTORY_IDENTITY_TOKEN`, the keyring or the JFrog CLI config) requests are
+anonymous, which is enough for repositories open to anonymous reads. A
+configured token is always sent: an expired one fails instead of falling back
+to anonymous access.
+
 ### Copy and recursive delete
 
 ```python
@@ -274,8 +298,9 @@ service they are not sent at all, and a warning names the missing setting:
   `HTTP_AUTH_URL`, e.g. `HTTP_AUTH_URL=https://files.example.com`. On a
   redirect to another scheme, host or port, only non-credential headers
   (`Range`, `Accept`, conditional headers, ...) are forwarded.
-- **Artifactory:** `ARTIFACTORY_IDENTITY_TOKEN` is only used for the service in
-  `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`). A JFrog CLI server token is only
+- **Artifactory:** `ARTIFACTORY_IDENTITY_TOKEN` is only used for the services in
+  `ARTIFACTORY_BASE_URL` (or `ART_BASE_URL`), a comma-separated list when one
+  Artifactory answers under several host names. A JFrog CLI server token is only
   used for that server's own origin.
 - **SSH:** host keys are checked like OpenSSH. `StrictHostKeyChecking`
   (`yes`, `ask`, `accept-new`, `no`) and `UserKnownHostsFile` are read from
