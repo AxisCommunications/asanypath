@@ -250,7 +250,10 @@ class HTTPPath(CloudPathMixin):
             return memo[2]
         headers = _build_auth_headers()
         if headers and not self._ambient_credentials_allowed(
-            env[-1], str(self), credential="HTTP_AUTH_*", setting="HTTP_AUTH_URL"
+            (env[-1],) if env[-1] else (),
+            str(self),
+            credential="HTTP_AUTH_*",
+            setting="HTTP_AUTH_URL",
         ):
             headers = []
         self._auth_memo = (env, self._path, headers)

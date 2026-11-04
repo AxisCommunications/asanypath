@@ -41,6 +41,7 @@ from asanypath_native import (
 
 from asanypath.cloud import CloudPathMixin, ServiceEndpointMixin, _service_origin
 from asanypath.common import DirEntry
+from asanypath.exceptions import set_credential_hint
 from asanypath.options import (
     UPLOAD_CHUNK_SIZE,
     AccessGrant,
@@ -124,16 +125,15 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
     }
 
     def __init__(self, *args, token: str | None = None, **kwargs):
-        """Initialize ArtifactoryPath with optional Bearer token.
+        """Initialize ArtifactoryPath with an optional Bearer token.
 
         Args:
             *args: Path arguments passed to parent HTTPSPath.
-            token: Bearer token for authentication. If not provided, will attempt to read
-                   from ARTIFACTORY_IDENTITY_TOKEN environment variable.
+            token: Bearer token for authentication. If not provided, it is looked
+                   up in ARTIFACTORY_IDENTITY_TOKEN (for the service in
+                   ARTIFACTORY_BASE_URL), the keyring and the JFrog CLI config.
+                   Without one, requests are anonymous.
             **kwargs: Additional keyword arguments passed to parent HTTPSPath.
-
-        Raises:
-            ValueError: If token is not provided and ARTIFACTORY_IDENTITY_TOKEN env var is not set.
         """
         super().__init__(*args, **kwargs)
         self._bind_path_attrs()
@@ -146,6 +146,7 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
         from asanypath import _credstore
 
         cred_key = f"art:{self._service_key}"
+        service = f"art://{self._service_key}"
         known = ArtifactoryPath._service_tokens
         if token:
             # Persist user-supplied tokens once per service, not per derived path.
@@ -154,17 +155,35 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
                 known[cred_key] = token
             self._token = token
             self._init_options = {"token": token}
+            set_credential_hint(service, "check the token passed as token=")
+        elif env_token := self._env_token():
+            self._token = env_token
+            set_credential_hint(service, "check ARTIFACTORY_IDENTITY_TOKEN, it may have expired")
         else:
-            self._token = self._env_token() or known.get(cred_key)
+            self._token = known.get(cred_key)
             if not self._token:
-                self._token = _credstore.load(cred_key) or _jfrog_conf_token(self._service_key)
+                if stored := _credstore.load(cred_key):
+                    self._token = stored
+                    set_credential_hint(
+                        service,
+                        f"the token cached in the keyring as '{cred_key}' may have expired; "
+                        "pass token= to replace it",
+                    )
+                elif jfrog := _jfrog_conf_token(self._service_key):
+                    self._token = jfrog
+                    set_credential_hint(
+                        service,
+                        "the token from the JFrog CLI config may have expired; "
+                        "renew it with 'jf config'",
+                    )
                 if self._token:
                     known[cred_key] = self._token
         if not self._token:
-            raise ValueError(
-                "Artifactory token required via 'token' parameter, "
-                "ARTIFACTORY_IDENTITY_TOKEN environment variable, the JFrog CLI config "
-                "(~/.jfrog/jfrog-cli.conf), or a previously cached token (see keyring)."
+            self._token = ""  # anonymous: public repositories need no token
+            set_credential_hint(
+                service,
+                "no Artifactory token was found; pass token=, set ARTIFACTORY_IDENTITY_TOKEN "
+                "with ARTIFACTORY_BASE_URL, or configure the JFrog CLI",
             )
         # Cached folder hint — set by iterdir() to avoid redundant API calls
         self._is_folder: bool | None = None
@@ -173,20 +192,21 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
     @classmethod
     def _create_env_config(cls) -> SimpleNamespace:
         """Build env config from Artifactory environment variables."""
-        return SimpleNamespace(
-            token=getenv("ARTIFACTORY_IDENTITY_TOKEN"),
-        )
+        # Tokens never contain whitespace; a trailing newline from
+        # "$(cat token-file)" would otherwise make Artifactory reject it.
+        token = (getenv("ARTIFACTORY_IDENTITY_TOKEN") or "").strip()
+        return SimpleNamespace(token=token or None)
 
     # ------------------------------------------------------------------
     # CloudPathMixin hooks
     # ------------------------------------------------------------------
 
     def _env_token(self) -> str | None:
-        """``ARTIFACTORY_IDENTITY_TOKEN``, only for the service named by
+        """``ARTIFACTORY_IDENTITY_TOKEN``, only for the services listed in
         ``ARTIFACTORY_BASE_URL`` (or ``ART_BASE_URL``)."""
         token = self.env_config.token
         if token and self._ambient_credentials_allowed(
-            self._resolve_base_url_prefix(),
+            self._resolve_base_url_prefixes(),
             self._service_key,
             credential="ARTIFACTORY_IDENTITY_TOKEN",
             setting="ARTIFACTORY_BASE_URL",
