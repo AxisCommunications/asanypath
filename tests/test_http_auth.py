@@ -129,6 +129,23 @@ class TestHTTPPathAuth:
         p = HTTPPath("http://example.com/file")
         assert check(p._merge_headers(input_headers))
 
+    def test_path_headers_merge_with_auth_and_request_headers(self, monkeypatch):
+        monkeypatch.setenv("HTTP_AUTH_TOKEN", "tok")
+        monkeypatch.delenv("HTTP_AUTH_USER", raising=False)
+        monkeypatch.delenv("HTTP_AUTH_PASSWORD", raising=False)
+        monkeypatch.delenv("HTTP_AUTH_HEADER", raising=False)
+        p = HTTPPath(
+            "http://example.com/file",
+            headers=[("X-Path", "initial"), ("X-Repeat", "one"), ("X-Repeat", "two")],
+        )
+
+        assert p._merge_headers({"X-Path": "request"}) == [
+            ("authorization", "Bearer tok"),
+            ("X-Repeat", "one"),
+            ("X-Repeat", "two"),
+            ("X-Path", "request"),
+        ]
+
     async def test_exists_passes_auth_headers(self, monkeypatch):
         monkeypatch.setenv("HTTP_AUTH_TOKEN", "tok")
         monkeypatch.delenv("HTTP_AUTH_USER", raising=False)
@@ -139,6 +156,59 @@ class TestHTTPPathAuth:
         assert result is True
         _, kwargs = mock.call_args
         assert ("authorization", "Bearer tok") in kwargs["headers"]
+
+    async def test_exists_passes_configured_headers(self):
+        p = HTTPPath("http://example.com/file", headers=[("X-Client", "cli")])
+        with patch("asanypath.http.http_exists", new=AsyncMock(return_value=True)) as mock:
+            assert await p.exists() is True
+        assert ("X-Client", "cli") in mock.call_args.kwargs["headers"]
+
+    async def test_iterdir_children_inherit_configured_headers(self):
+        p = HTTPPath("http://example.com/dir/", headers=[("X-Client", "cli")])
+        with patch(
+            "asanypath.http.http_scrape_links",
+            new=AsyncMock(return_value=["http://example.com/dir/file"]),
+        ):
+            children = [child async for child in p.iterdir()]
+
+        assert children[0]._merge_headers(None) == [("X-Client", "cli")]
+
+    async def test_iterdir_does_not_send_configured_headers_to_other_origins(self):
+        p = HTTPPath("http://example.com/dir/", headers=[("X-Client", "secret")])
+        with patch(
+            "asanypath.http.http_scrape_links",
+            new=AsyncMock(return_value=["https://other.example/file"]),
+        ):
+            children = [child async for child in p.iterdir()]
+
+        assert children == []
+
+    async def test_request_other_origin_omits_path_headers(self):
+        p = HTTPPath("http://example.com/api", headers=[("X-Path", "secret")])
+        with patch(
+            "asanypath.http.http_request",
+            new=AsyncMock(return_value=(200, b"", {})),
+        ) as mock:
+            await p.request(
+                "GET",
+                "https://other.example/api",
+                headers={"X-Request": "explicit"},
+            )
+
+        assert mock.call_args.kwargs["headers"] == [("X-Request", "explicit")]
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            ("Host", "other.example"),
+            ("Content-Length", "0"),
+            ("Bad Name", "value"),
+            ("X-Client", "one\ntwo"),
+        ],
+    )
+    def test_path_headers_reject_invalid_or_transport_managed_headers(self, header):
+        with pytest.raises(ValueError):
+            HTTPPath("http://example.com/file", headers=[header])
 
     async def test_read_bytes_passes_auth_headers(self, monkeypatch):
         monkeypatch.setenv("HTTP_AUTH_TOKEN", "secret")

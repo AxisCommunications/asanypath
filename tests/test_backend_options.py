@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -26,6 +26,14 @@ def test_option_keys_follow_constructor_signature():
         (["s3.profile=p"], {"s3": {"profile": "p"}}),
         (["s3.profile=p", "s3.profile=q"], {"s3": {"profile": "q"}}),
         (
+            ["http.headers=X-Tag: one", "http.headers=X-Tag: two"],
+            {"http": {"headers": [("X-Tag", "one"), ("X-Tag", "two")]}},
+        ),
+        (
+            ["headers=X-Tag: one", "headers=X-Tag: two"],
+            {"*": {"headers": [("X-Tag", "one"), ("X-Tag", "two")]}},
+        ),
+        (
             ["S3.aws_region=eu-west-1", "ssh.port=2222"],
             {"s3": {"aws_region": "eu-west-1"}, "ssh": {"port": 2222}},
         ),
@@ -38,7 +46,16 @@ def test_parse_options(specs, expected):
 
 @pytest.mark.parametrize(
     "spec",
-    ["profile=p", "s3.profile", "s3.=x", "nope.key=v", "s3.bogus=v", "ssh.port=abc", "file.x=y"],
+    [
+        "not-an-option=value",
+        "s3.profile",
+        "s3.=x",
+        "nope.key=v",
+        "s3.bogus=v",
+        "ssh.port=abc",
+        "file.x=y",
+        "http.headers=missing-colon",
+    ],
 )
 def test_parse_options_rejects(spec):
     with pytest.raises(ValueError):
@@ -51,6 +68,19 @@ def test_kwargs_for_matches_backend_only():
     assert kwargs_for("gs://b/k", opts) == {"project_id": "proj"}
     assert kwargs_for("/tmp/x", opts) == {}
     assert kwargs_for("s3://b/k", {}) == {}
+
+
+def test_kwargs_for_keeps_http_and_https_headers_scheme_scoped():
+    opts = parse_options(["http.headers=X-One: 1", "https.headers=X-Two: 2"])
+    assert kwargs_for("http://example.com/file", opts) == {"headers": [("X-One", "1")]}
+    assert kwargs_for("https://example.com/file", opts) == {"headers": [("X-Two", "2")]}
+
+
+def test_kwargs_for_infers_backend_for_unqualified_options():
+    opts = parse_options(["profile=example", "headers=X-Client: cli", "port=2222"])
+    assert kwargs_for("s3://bucket/key", opts) == {"profile": "example"}
+    assert kwargs_for("https://example.com/file", opts) == {"headers": [("X-Client", "cli")]}
+    assert kwargs_for("ssh://host/path", opts) == {"port": 2222}
 
 
 def _invoke(args):
@@ -68,6 +98,20 @@ def test_cli_option_reaches_path_constructor():
     result, mock_cls = _invoke(["exists", "s3://b/k", "-o", "s3.profile=prof"])
     assert result.exit_code == 0, result.output
     mock_cls.assert_called_once_with("s3://b/k", profile="prof")
+
+
+def test_cli_unqualified_option_is_inferred_from_path():
+    result, mock_cls = _invoke(["exists", "s3://b/k", "-o", "profile=prof"])
+    assert result.exit_code == 0, result.output
+    mock_cls.assert_called_once_with("s3://b/k", profile="prof")
+
+
+def test_cli_unqualified_headers_are_inferred_from_https_path():
+    result, mock_cls = _invoke(
+        ["exists", "https://example.com/data", "-o", "headers=X-Client: cli"]
+    )
+    assert result.exit_code == 0, result.output
+    mock_cls.assert_called_once_with("https://example.com/data", headers=[("X-Client", "cli")])
 
 
 def test_cli_option_other_backend_is_ignored():
@@ -107,3 +151,36 @@ def test_cli_src_and_dst_options_are_scoped():
     by_path = dict(calls)
     assert by_path["s3://a/k"] == {"aws_region": "r0", "profile": "src"}
     assert by_path["s3://b/k"] == {"aws_region": "r0", "profile": "dst"}
+
+
+def test_cli_http_headers_are_repeatable_and_scoped():
+    calls = []
+
+    def fake(path, **kwargs):
+        calls.append((path, kwargs))
+        result = MagicMock()
+        result.exists = AsyncMock(return_value=True)
+        result.is_dir = AsyncMock(return_value=False)
+        result.copy = AsyncMock()
+        return result
+
+    with patch("asanypath.cli.AsAnyPath", side_effect=fake):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "cp",
+                "http://a/file",
+                "http://b/file",
+                "-o",
+                "http.headers=X-Common: all",
+                "--src-option",
+                "http.headers=X-Side: source",
+                "--dst-option",
+                "http.headers=X-Side: destination",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    by_path = dict(calls)
+    assert by_path["http://a/file"] == {"headers": [("X-Common", "all"), ("X-Side", "source")]}
+    assert by_path["http://b/file"] == {"headers": [("X-Common", "all"), ("X-Side", "destination")]}
