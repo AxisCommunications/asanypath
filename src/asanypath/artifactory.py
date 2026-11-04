@@ -137,6 +137,11 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
         """
         super().__init__(*args, **kwargs)
         self._bind_path_attrs()
+        if not self._service_key:
+            raise ValueError(
+                "Artifactory path needs a host (art://<host>/artifactory/...), "
+                "or set ARTIFACTORY_BASE_URL to use art:// shorthand."
+            )
 
         from asanypath import _credstore
 
@@ -191,12 +196,10 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
 
     @property
     def _service_key(self) -> str:
-        """``host/artifactory``: the service key for the keyring, the JFrog CLI
-        config and token scoping. Derived as before endpoint normalization so
-        stored credentials keep matching."""
-        raw = str(self)[len("art://") :]
-        idx = raw.find("/artifactory/")
-        return raw[: idx + len("/artifactory")] if idx >= 0 else raw.split("/")[0]
+        """``host/artifactory`` (or ``host``): the service key for the keyring,
+        the JFrog CLI config and token scoping. Same for the service root and
+        every path below it."""
+        return self._endpoint_url.removeprefix("https://")
 
     @property
     def _item_path(self) -> str:
