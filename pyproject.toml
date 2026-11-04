@@ -9,6 +9,11 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.hooks.vcs]
 version-file = "src/asanypath/_version.py"
 
+[tool.uv]
+# filelock (pre-commit -> virtualenv) has security fixes only from 4.2.1, which
+# needs Python 3.11; Python 3.10 keeps the newest release it supports.
+constraint-dependencies = ["filelock>=4.2.1; python_version >= '3.11'"]
+
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
 default = true
