@@ -132,12 +132,14 @@ class TestArtifactoryPath(testbase):
         p = _make_artifactory_path(token="my-token")
         assert p._token == "my-token"
 
-    def test_token_required(self):
-        # Ensure env var is not set - token must be provided explicitly
+    def test_without_a_token_requests_are_anonymous(self):
         with patch.dict("os.environ", {}, clear=True):
             ArtifactoryPath._env_config = None
-            with pytest.raises(ValueError, match="token required"):
-                ArtifactoryPath(art_path())
+            p = ArtifactoryPath(art_path())
+        assert p._native_kwargs["token"] == ""
+        from asanypath.exceptions import credential_hint
+
+        assert "no Artifactory token was found" in credential_hint(str(p))
 
     def test_token_from_env_var(self):
         env = {
@@ -147,6 +149,20 @@ class TestArtifactoryPath(testbase):
         with patch.dict("os.environ", env):
             p = ArtifactoryPath(art_path())
             assert p._token == "env-token"
+
+    @pytest.mark.parametrize(("raw", "token"), [(" env-token\n", "env-token"), ("  \n", "")])
+    def test_token_from_env_var_ignores_surrounding_whitespace(self, monkeypatch, raw, token):
+        monkeypatch.setattr(ArtifactoryPath, "_service_tokens", {})
+        monkeypatch.setattr("asanypath._credstore.load", lambda key, **_: None)
+        monkeypatch.setattr("asanypath.artifactory._jfrog_conf_token", lambda base_url: None)
+        env = {
+            "ARTIFACTORY_IDENTITY_TOKEN": raw,
+            "ARTIFACTORY_BASE_URL": "artifactory.example.com/artifactory",
+        }
+        with patch.dict("os.environ", env):
+            ArtifactoryPath._env_config = None
+            p = ArtifactoryPath(art_path())
+        assert p._native_kwargs["token"] == token
 
     def test_token_parameter_takes_precedence(self):
         with patch.dict("os.environ", {"ARTIFACTORY_IDENTITY_TOKEN": "env-token"}):

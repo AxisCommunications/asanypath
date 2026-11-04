@@ -319,13 +319,52 @@ pub fn extract_host(endpoint: &str) -> String {
         .to_string()
 }
 
-/// Map an HTTP status code to the appropriate Python exception.
-pub fn status_to_pyerr(status: StatusCode, path: &str, _body: &[u8]) -> PyErr {
+pyo3::import_exception!(asanypath.exceptions, AuthenticationError);
+
+/// Map an HTTP status code to the appropriate Python exception. 401 and 403
+/// carry the server's reason when the error body has one.
+pub fn status_to_pyerr(status: StatusCode, path: &str, body: &[u8]) -> PyErr {
+    let reason = error_reason(body).map_or_else(String::new, |r| format!(" ({r})"));
     match status.as_u16() {
         404 => PyFileNotFoundError::new_err(format!("No such file or directory: '{path}'")),
-        403 => PyPermissionError::new_err(format!("Permission denied: '{path}'")),
+        401 => AuthenticationError::new_err((
+            format!("Authentication failed{reason}: '{path}'"),
+            path.to_string(),
+        )),
+        403 => PyPermissionError::new_err(format!("Permission denied{reason}: '{path}'")),
         _ => PyRuntimeError::new_err(format!("HTTP {}: '{path}'", status.as_u16())),
     }
+}
+
+/// The message of an error response: Artifactory and GCS JSON
+/// (`errors[0].message`, `error.message`) or S3 and Azure XML (`<Message>`,
+/// else `<Code>`). Only the first line, at most 200 characters.
+pub fn error_reason(body: &[u8]) -> Option<String> {
+    use sonic_rs::JsonValueTrait;
+    let from_json = || {
+        let doc: sonic_rs::Value = sonic_rs::from_slice(body).ok()?;
+        let message = doc
+            .get("errors")
+            .and_then(|errors| errors.get(0))
+            .or_else(|| doc.get("error"))
+            .unwrap_or(&doc)
+            .get("message")?;
+        message.as_str().map(str::to_string)
+    };
+    let from_xml = || {
+        let text = std::str::from_utf8(body).ok()?;
+        ["Message", "Code"].into_iter().find_map(|tag| {
+            let start = text.find(&format!("<{tag}>"))? + tag.len() + 2;
+            let end = start + text[start..].find(&format!("</{tag}>"))?;
+            quick_xml::escape::unescape(&text[start..end])
+                .ok()
+                .map(|s| s.into_owned())
+        })
+    };
+    let reason = from_json().or_else(from_xml)?;
+    let line = reason.lines().next().unwrap_or_default().trim();
+    let line: String = line.chars().filter(|c| !c.is_control()).take(200).collect();
+    (!line.is_empty()).then_some(line)
 }
 
 /// Build a Bearer Authorization header pair.
@@ -615,4 +654,43 @@ pub fn http_scrape_links(
         }
         Ok(out)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_reason;
+
+    #[test]
+    fn error_reason_reads_json_and_xml_error_bodies() {
+        let artifactory = br#"{"errors" : [ {"status" : 401, "message" : "Props Authentication Token not found"} ]}"#;
+        assert_eq!(
+            error_reason(artifactory).as_deref(),
+            Some("Props Authentication Token not found")
+        );
+        let gcs = br#"{"error": {"code": 401, "message": "Invalid Credentials"}}"#;
+        assert_eq!(error_reason(gcs).as_deref(), Some("Invalid Credentials"));
+        let s3 = b"<?xml version=\"1.0\"?><Error><Code>InvalidAccessKeyId</Code>\
+<Message>The key &amp; id do not exist</Message></Error>";
+        assert_eq!(
+            error_reason(s3).as_deref(),
+            Some("The key & id do not exist")
+        );
+        let azure = b"<Error><Code>AuthenticationFailed</Code><Message>Server failed to \
+authenticate the request.\nRequestId:abc\nTime:2026</Message></Error>";
+        assert_eq!(
+            error_reason(azure).as_deref(),
+            Some("Server failed to authenticate the request.")
+        );
+        let code_only = b"<Error><Code>AccessDenied</Code></Error>";
+        assert_eq!(error_reason(code_only).as_deref(), Some("AccessDenied"));
+    }
+
+    #[test]
+    fn error_reason_ignores_bodies_without_a_message() {
+        assert_eq!(error_reason(b""), None);
+        assert_eq!(error_reason(b"<html><body>401</body></html>"), None);
+        assert_eq!(error_reason(br#"{"errors": []}"#), None);
+        let long = format!(r#"{{"message": "{}"}}"#, "x".repeat(500));
+        assert_eq!(error_reason(long.as_bytes()).map(|r| r.len()), Some(200));
+    }
 }

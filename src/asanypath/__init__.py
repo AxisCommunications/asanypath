@@ -17,6 +17,7 @@ from asanypath.asanypath import (
 )
 from asanypath.exceptions import (
     AsAnyPathError,
+    AuthenticationError,
     InvalidPathError,
     PathIsADirectoryError,
     PathNotADirectoryError,
@@ -102,6 +103,7 @@ __all__ = [
     "register_protocol",
     "list_protocols",
     "AsAnyPathError",
+    "AuthenticationError",
     "InvalidPathError",
     "UnsupportedProtocolError",
     "UnsupportedProtocolPath",
