@@ -21,6 +21,7 @@ from asanypath_native import (
     s3_copy_batch,
     s3_create_multipart,
     s3_delete_batch,
+    s3_delete_tree,
     s3_exists_batch,
     s3_get_acl,
     s3_get_batch,
@@ -256,6 +257,11 @@ class S3Path(CloudPathMixin, ServiceEndpointMixin):
     async def is_dir(self) -> bool:
         """Check if path is a directorish."""
         return await s3_is_dir(prefix=self._item_path, **(await self._get_native_kwargs()))
+
+    async def _delete_tree(self) -> list[str]:
+        return await s3_delete_tree(
+            prefix=self._item_path, use_h2=False, **(await self._get_native_kwargs())
+        )
 
     async def _list_containers(self) -> list[str] | None:
         """List buckets when at the service root (``s3://``); else None."""

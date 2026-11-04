@@ -18,3 +18,18 @@ pub fn local_name(full: &str) -> &str {
         full
     }
 }
+
+/// Append the character a reference event stands for: quick-xml reports
+/// `&amp;` and `&#38;` in text as separate events, not as part of the text.
+pub fn push_reference(text: &mut String, reference: &quick_xml::events::BytesRef) {
+    match reference.resolve_char_ref() {
+        Ok(Some(c)) => text.push(c),
+        _ => {
+            if let Some(value) =
+                quick_xml::escape::resolve_predefined_entity(&reference.xml10_content())
+            {
+                text.push_str(value);
+            }
+        }
+    }
+}

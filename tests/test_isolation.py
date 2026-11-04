@@ -315,26 +315,23 @@ async def test_iterdir_skips_entries_outside_the_listed_prefix(entry, monkeypatc
 
 
 async def test_recursive_delete_stays_inside_the_prefix(monkeypatch):
-    deleted: list[str] = []
+    # The native tree delete lists and deletes below exactly this prefix and
+    # leaves keys a request path could misaddress (listing::plain_key in Rust).
+    prefixes: list[str] = []
 
-    async def fake_fetch(self):
-        if str(self) == "s3://bucket/allowed":
-            return _rows("s3://bucket/allowed/../outside.txt", "s3://bucket/allowed/inside.txt")
-        return []
+    async def fake_tree(**kwargs):
+        prefixes.append(kwargs["prefix"])
+        return ["allowed/../outside.txt"]
 
-    async def fake_unlink(self, missing_ok=False):
-        deleted.append(str(self))
+    async def no_unlink(self, missing_ok=False):
+        raise AssertionError(f"per-entry delete of {self}")
 
-    async def not_dir(self):
-        return False
-
-    monkeypatch.setattr(S3Path, "_fetch_listing", fake_fetch)
-    monkeypatch.setattr(S3Path, "unlink", fake_unlink)
-    monkeypatch.setattr(S3Path, "is_dir", not_dir)
+    monkeypatch.setattr("asanypath.s3.s3_delete_tree", fake_tree)
+    monkeypatch.setattr(S3Path, "unlink", no_unlink)
 
     await _s3("s3://bucket/allowed").rmdir(recursive=True)
 
-    assert deleted == ["s3://bucket/allowed/inside.txt"]
+    assert prefixes == ["allowed"]
 
 
 async def test_artifactory_listing_skips_dot_segment_names():

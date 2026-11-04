@@ -23,6 +23,7 @@ import msgspec
 from asanypath_native import (
     az_copy_batch,
     az_delete_batch,
+    az_delete_tree,
     az_exists_batch,
     az_get_batch,
     az_get_container_acl,
@@ -230,6 +231,11 @@ class AzurePath(CloudPathMixin, ServiceEndpointMixin):
     async def is_dir(self) -> bool:
         """Check if path is a directory prefix (has blobs with this prefix)."""
         return await az_is_dir(prefix=self._blob_path, **self._native_kwargs)
+
+    async def _delete_tree(self) -> list[str]:
+        return await az_delete_tree(
+            prefix=self._item_path, use_h2=False, **(await self._get_native_kwargs())
+        )
 
     async def _list_containers(self) -> list[str] | None:
         """List containers when at the account root (``az://``); else None."""
