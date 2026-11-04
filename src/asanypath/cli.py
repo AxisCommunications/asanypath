@@ -578,7 +578,8 @@ def _backend_options(two_sided: bool = False):
                 "-o",
                 "--option",
                 "all",
-                "Backend option SCHEME.KEY=VALUE (repeatable), e.g. s3.profile=NAME",
+                "Backend option KEY=VALUE (repeatable; inferred from path), or "
+                "SCHEME.KEY=VALUE, e.g. profile=NAME or headers='X-Name: value'",
             )
         ]
         if two_sided:
@@ -606,7 +607,10 @@ def _make_path(path: str, kwargs: dict, role: str | None = None):
     opts = click.get_current_context().meta.get(_OPTS_META, {})
     extra = kwargs_for(path, opts.get("all", {}))
     if role:
-        extra.update(kwargs_for(path, opts.get(role, {})))
+        role_options = kwargs_for(path, opts.get(role, {}))
+        if "headers" in role_options:
+            role_options["headers"] = [*extra.get("headers", []), *role_options["headers"]]
+        extra.update(role_options)
     return AsAnyPath(path, **{**kwargs, **extra})
 
 
