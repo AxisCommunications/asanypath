@@ -130,6 +130,10 @@ anonymous, which is enough for repositories open to anonymous reads. A
 configured token is always sent: an expired one fails instead of falling back
 to anonymous access.
 
+Artifactory `exists()`, `is_file()` and `is_dir()` return `False` for missing
+paths, but propagate authentication and permission errors. CLI source checks
+report those errors rather than claiming the file does not exist.
+
 ### Copy and recursive delete
 
 ```python
