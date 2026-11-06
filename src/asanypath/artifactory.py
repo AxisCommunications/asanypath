@@ -330,7 +330,7 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
             info = await self._storage_info()
             self._is_folder = "children" in info
             return self._is_folder
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError:
             return False
 
     async def is_file(self) -> bool:
@@ -340,7 +340,7 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
             info = await self._storage_info()
             self._is_folder = "children" in info
             return not self._is_folder
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError:
             return False
 
     async def _list_entries(self, *, stat: bool = False, fresh: bool = False) -> list[DirEntry]:

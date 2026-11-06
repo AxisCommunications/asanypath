@@ -43,7 +43,14 @@ def server():
             pass
 
         def do_GET(self):
-            status, body = (403, S3_403) if self.path == "/denied" else (401, ARTIFACTORY_401)
+            if self.path.endswith("/denied"):
+                status, body = 403, S3_403
+            elif self.path.endswith("/missing"):
+                status, body = 404, b"{}"
+            elif self.path.endswith("/present"):
+                status, body = 200, b'{"size": "1"}'
+            else:
+                status, body = 401, ARTIFACTORY_401
             self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -53,6 +60,81 @@ def server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["exists", "is_dir", "is_file", "cli_source_check"])
+@pytest.mark.parametrize(
+    "name,error",
+    [("unauthorized", AuthenticationError), ("denied", PermissionError)],
+)
+async def test_artifactory_source_checks_preserve_auth_errors(
+    server, monkeypatch, operation, name, error
+):
+    path = ArtifactoryPath(
+        f"art://{server.removeprefix('http://')}/artifactory/repo/{name}", token="invalid"
+    )
+    monkeypatch.setattr(path, "_endpoint_url", f"{server}/artifactory")
+    if operation == "cli_source_check":
+        from asanypath.cli import _exists_or_virtual_dir
+
+        check = _exists_or_virtual_dir(path)
+    else:
+        check = getattr(path, operation)()
+    with pytest.raises(error):
+        await check
+
+
+@pytest.mark.parametrize("operation", ["exists", "is_dir", "is_file", "cli_source_check"])
+@pytest.mark.parametrize("name", ["missing", "present"])
+async def test_artifactory_source_checks_distinguish_missing_files(
+    server, monkeypatch, operation, name
+):
+    path = ArtifactoryPath(
+        f"art://{server.removeprefix('http://')}/artifactory/repo/{name}", token="invalid"
+    )
+    monkeypatch.setattr(path, "_endpoint_url", f"{server}/artifactory")
+    present = name == "present"
+    if operation == "cli_source_check":
+        from asanypath.cli import _exists_or_virtual_dir
+
+        assert await _exists_or_virtual_dir(path) == (present, False)
+    else:
+        assert await getattr(path, operation)() == (present and operation != "is_dir")
+
+
+@pytest.mark.parametrize(
+    "name,message",
+    [("unauthorized", "Authentication failed"), ("denied", "Permission denied")],
+)
+def test_artifactory_cp_reports_auth_errors(server, monkeypatch, tmp_path, name, message):
+    from click.testing import CliRunner
+
+    import asanypath.cli as cli_module
+
+    base = f"{server.removeprefix('http://')}/artifactory"
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", base)
+    monkeypatch.setenv("ARTIFACTORY_IDENTITY_TOKEN", "sdf")
+    make_path = cli_module._make_path
+
+    def local_http_path(*args, **kwargs):
+        path = make_path(*args, **kwargs)
+        if isinstance(path, ArtifactoryPath):
+            assert path._token == "sdf"
+            path._endpoint_url = f"{server}/artifactory"
+        return path
+
+    monkeypatch.setattr(cli_module, "_make_path", local_http_path)
+    destination = tmp_path / "model.bin"
+    result = CliRunner().invoke(
+        cli_module.cli, ["cp", "-vv", f"art://repo/{name}", str(destination)]
+    )
+    assert result.exit_code == 2
+    assert message in result.output
+    assert "No such file or directory" not in result.output
+    if name == "unauthorized":
+        assert "Props Authentication Token not found" in result.output
+        assert "ARTIFACTORY_IDENTITY_TOKEN" in result.output
+    assert not destination.exists()
 
 
 async def test_401_is_an_authentication_error_with_the_reason(server):

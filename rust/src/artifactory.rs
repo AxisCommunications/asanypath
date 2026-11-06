@@ -302,10 +302,16 @@ impl CloudBackend for ArtCreds {
         async move {
             let url = self.storage_url(path);
             let headers = self.auth_headers();
-            let (status, _body) = do_request_light("GET", &url, &headers, None, use_h2)
+            let (status, body) = do_request_light("GET", &url, &headers, None, use_h2)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e))?;
-            Ok(status.is_success())
+            if status.is_success() {
+                Ok(true)
+            } else if status == reqwest::StatusCode::NOT_FOUND {
+                Ok(false)
+            } else {
+                Err(status_to_pyerr(status, &self.error_path(path), &body))
+            }
         }
     }
 
