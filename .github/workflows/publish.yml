@@ -44,7 +44,7 @@ jobs:
           - os: macos-15-intel
             target: x86_64
             manylinux: off
-          - os: macos-14
+          - os: macos-15
             target: aarch64
             manylinux: off
           - os: windows-latest
