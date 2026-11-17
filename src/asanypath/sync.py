@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import threading
 from abc import ABC
 from collections.abc import AsyncIterator
@@ -72,6 +73,15 @@ class _SyncRunner:
                 yield asyncio.run_coroutine_threadsafe(_collect_next(), self._loop).result()
             except StopAsyncIteration:
                 return
+
+
+def _reset_after_fork() -> None:
+    _SyncRunner._instance = None
+    _SyncRunner._lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 class _SyncProxy:

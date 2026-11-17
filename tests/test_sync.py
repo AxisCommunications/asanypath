@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import multiprocessing
+
 import pytest
 
 from asanypath.exceptions import UnsupportedProtocolError
 from asanypath.local import SyncPath
-from asanypath.sync import AsAnyPath, _SyncProxy
+from asanypath.sync import AsAnyPath, _SyncProxy, _SyncRunner
 from asanypath.unsupported import UnsupportedProtocolPath
 
 
@@ -170,6 +172,38 @@ class TestSyncProxy:
         p = AsAnyPath("s3://bucket")
         for child in p.iterdir():
             assert isinstance(child, _SyncProxy)
+
+    @pytest.mark.skipif(
+        "fork" not in multiprocessing.get_all_start_methods(), reason="requires fork"
+    )
+    @pytest.mark.parametrize("operation", ["read_bytes", "iterdir"])
+    def test_sync_after_fork(self, mock_s3, operation):
+        p = AsAnyPath("s3://bucket")
+        assert p.read_bytes() == b"mock data"
+        runner = _SyncRunner.get()
+
+        def check_child():
+            if operation == "read_bytes":
+                assert p.read_bytes() == b"mock data"
+            else:
+                assert [child.name for child in p.iterdir()] == ["a.txt", "b.txt"]
+            assert _SyncRunner.get() is not runner
+
+        process = multiprocessing.get_context("fork").Process(target=check_child)
+        with _SyncRunner._lock:
+            process.start()
+        try:
+            process.join(timeout=5)
+            assert not process.is_alive(), "forked child hung using the sync runner"
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            process.close()
+
+        assert _SyncRunner.get() is runner
+        assert p.read_bytes() == b"mock data"
 
 
 class TestSyncUnsupportedProtocol:

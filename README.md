@@ -216,6 +216,9 @@ for child in p.parent.iterdir():  # yields synchronously
 Local paths (`file://` or bare `/path`) bypass the proxy entirely and use
 `pathlib.Path` directly — zero threading overhead.
 
+Cloud paths share a background event loop per process. After `fork`, the child
+resets the inherited runner and starts its own loop lazily on the next sync call.
+
 ### Large uploads stream automatically
 
 Writing or copying a large object never buffers the whole thing in memory — it
