@@ -13,6 +13,7 @@ import pytest
 
 from asanypath import TransferBudget
 from asanypath._transfer import iter_transfer_chunks, upload_parts
+from asanypath.common import DirEntry
 from tests.test_azure import _make_azure_path
 from tests.test_gcs import _make_gcs_path
 from tests.test_s3 import _make_s3path
@@ -534,6 +535,11 @@ async def test_cross_backend_copy_uses_spooled_upload(recursive, monkeypatch):
 
     monkeypatch.setattr("asanypath.cloud.SPOOL_MAX_SIZE", 4)
     monkeypatch.setattr(S3Path, "is_dir", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        S3Path,
+        "_fetch_listing",
+        AsyncMock(side_effect=AssertionError("Unexpected listing request")),
+    )
     monkeypatch.setattr(source, "iter_bytes", lambda _: chunks())
     monkeypatch.setattr(type(destination), "exists", AsyncMock(return_value=False))
     monkeypatch.setattr(type(destination), "_upload_buffer", upload)
@@ -548,10 +554,10 @@ async def test_cross_backend_copy_uses_spooled_upload(recursive, monkeypatch):
         monkeypatch.setattr(child, "iter_bytes", lambda _: chunks())
 
         async def children():
-            yield child
+            yield DirEntry(child, is_dir=False)
 
         monkeypatch.setattr(source, "is_dir", AsyncMock(return_value=True))
-        monkeypatch.setattr(source, "iterdir", children)
+        monkeypatch.setattr(source, "scandir", children)
     with TransferBudget(min_range_size=8):
         await source.copy(
             destination, recursive=recursive, chunk_size=4, destination_backend_options=options
