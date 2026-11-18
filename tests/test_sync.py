@@ -173,6 +173,35 @@ class TestSyncProxy:
         for child in p.iterdir():
             assert isinstance(child, _SyncProxy)
 
+    def test_scandir_wraps_paths_without_mutating_entries(self, monkeypatch):
+        from asanypath import DirEntry, S3Path
+
+        root = S3Path("s3://bucket")
+        original = [
+            DirEntry(root / "file.txt", False, 3, 7.0),
+            DirEntry(root / "sub", True),
+        ]
+
+        async def scandir(self, *, stat=False):
+            for entry in original:
+                yield entry
+
+        monkeypatch.setattr(S3Path, "scandir", scandir)
+        entries = list(AsAnyPath("s3://bucket").scandir(stat=True))
+
+        assert len(entries) == len(original)
+        for entry, source in zip(entries, original):
+            assert isinstance(entry, DirEntry)
+            assert isinstance(entry.path, _SyncProxy)
+            assert str(entry.path) == str(source.path)
+            assert (entry.is_dir, entry.size, entry.mtime) == (
+                source.is_dir,
+                source.size,
+                source.mtime,
+            )
+            assert isinstance(source.path, S3Path)
+            assert entry is not source
+
     @pytest.mark.skipif(
         "fork" not in multiprocessing.get_all_start_methods(), reason="requires fork"
     )

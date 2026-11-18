@@ -45,11 +45,14 @@ def test_parse_listing_mtime(text, expected):
 async def test_local_scandir(tree):
     entries = {e.path.name: e async for e in AsyncPath(tree).scandir(stat=True)}
     assert isinstance(entries["f.txt"].path, AsyncPath)
-    assert entries["f.txt"][1:3] == (False, 3)
+    assert entries["f.txt"].is_dir is False
+    assert entries["f.txt"].size == 3
     assert entries["f.txt"].mtime is not None
     assert entries["sub"].is_dir is True
     # A dangling symlink is listed as a non-directory without metadata.
-    assert entries["broken"][1:] == (False, None, None)
+    assert entries["broken"].is_dir is False
+    assert entries["broken"].size is None
+    assert entries["broken"].mtime is None
 
 
 async def test_local_scandir_without_stat(tree):
