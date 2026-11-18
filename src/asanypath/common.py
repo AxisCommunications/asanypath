@@ -14,12 +14,13 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from os import PathLike, getenv, sep
 from pathlib import Path, PurePath, PurePosixPath
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from typing import Self
 
+import msgspec
 from anyio import Path as AioPath
 from yarl import URL
 
@@ -34,7 +35,7 @@ OS_SEP = sep
 _FILL_CONCURRENCY = 32
 
 
-class DirEntry(NamedTuple):
+class DirEntry(msgspec.Struct, frozen=True):
     """One directory listing entry with the metadata the backend reported.
 
     ``None`` means the field is unknown: the listing did not include it and

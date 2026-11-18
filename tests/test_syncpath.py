@@ -4,6 +4,9 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
+import copy
+import multiprocessing
+import pickle
 from pathlib import Path
 
 import pytest
@@ -14,6 +17,10 @@ from asanypath.sync import _SyncProxy
 from tests.conftest import classtest_factory
 
 testbase = classtest_factory("_TestSyncPath", SyncPath)
+
+
+def _echo_path(path):
+    return path
 
 
 class TestSyncPath(testbase):
@@ -47,6 +54,37 @@ class TestSyncPath(testbase):
 
     def test___str__(self, p):
         assert str(p) == "testdir/nested/file.txt"
+
+    @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+    def test_pickle_roundtrip(self, tmp, protocol):
+        path = tmp / "file.txt"
+        path.write_text("payload")
+
+        restored = pickle.loads(pickle.dumps(path, protocol=protocol))
+
+        assert isinstance(restored, SyncPath)
+        assert restored == path
+        assert restored.read_text() == "payload"
+
+    @pytest.mark.parametrize("clone", [copy.copy, copy.deepcopy], ids=["shallow", "deep"])
+    def test_copy_roundtrip(self, p, clone):
+        restored = clone(p)
+
+        assert isinstance(restored, SyncPath)
+        assert restored is not p
+        assert restored == p
+        assert restored.__dict__ == p.__dict__
+
+    def test_spawn_pool_roundtrip(self, tmp):
+        path = tmp / "file.txt"
+        path.write_text("payload")
+
+        with multiprocessing.get_context("spawn").Pool(1) as pool:
+            restored = pool.apply_async(_echo_path, (path,)).get(timeout=10)
+
+        assert isinstance(restored, SyncPath)
+        assert restored == path
+        assert restored.read_text() == "payload"
 
     def test___truediv__(self, p):
         result = p / "sub"

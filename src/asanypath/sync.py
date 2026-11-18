@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import threading
 from abc import ABC
 from collections.abc import AsyncIterator
@@ -72,6 +73,15 @@ class _SyncRunner:
                 yield asyncio.run_coroutine_threadsafe(_collect_next(), self._loop).result()
             except StopAsyncIteration:
                 return
+
+
+def _reset_after_fork() -> None:
+    _SyncRunner._instance = None
+    _SyncRunner._lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 class _SyncProxy:
@@ -155,12 +165,14 @@ class _SyncProxy:
         if inspect.isasyncgenfunction(attr):  # pragma: no cover
 
             def _sync_iter_method(*args, **kwargs):  # pragma: no cover
+                from msgspec.structs import replace
+
                 from asanypath.common import DirEntry
 
                 async_it = attr(*args, **kwargs)
                 for item in _SyncRunner.get().iter(async_it):  # pragma: no cover
                     if isinstance(item, DirEntry):
-                        yield item._replace(path=_wrap(item.path))
+                        yield replace(item, path=_wrap(item.path))
                     else:
                         yield _wrap(item) if _is_path(item) else item
 

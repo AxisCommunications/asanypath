@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import multiprocessing
+
 import pytest
 
 from asanypath.exceptions import UnsupportedProtocolError
 from asanypath.local import SyncPath
-from asanypath.sync import AsAnyPath, _SyncProxy
+from asanypath.sync import AsAnyPath, _SyncProxy, _SyncRunner
 from asanypath.unsupported import UnsupportedProtocolPath
 
 
@@ -170,6 +172,67 @@ class TestSyncProxy:
         p = AsAnyPath("s3://bucket")
         for child in p.iterdir():
             assert isinstance(child, _SyncProxy)
+
+    def test_scandir_wraps_paths_without_mutating_entries(self, monkeypatch):
+        from asanypath import DirEntry, S3Path
+
+        root = S3Path("s3://bucket")
+        original = [
+            DirEntry(root / "file.txt", False, 3, 7.0),
+            DirEntry(root / "sub", True),
+        ]
+
+        async def scandir(self, *, stat=False):
+            for entry in original:
+                yield entry
+
+        monkeypatch.setattr(S3Path, "scandir", scandir)
+        entries = list(AsAnyPath("s3://bucket").scandir(stat=True))
+
+        assert len(entries) == len(original)
+        for entry, source in zip(entries, original):
+            assert isinstance(entry, DirEntry)
+            assert isinstance(entry.path, _SyncProxy)
+            assert str(entry.path) == str(source.path)
+            assert (entry.is_dir, entry.size, entry.mtime) == (
+                source.is_dir,
+                source.size,
+                source.mtime,
+            )
+            assert isinstance(source.path, S3Path)
+            assert entry is not source
+
+    @pytest.mark.skipif(
+        "fork" not in multiprocessing.get_all_start_methods(), reason="requires fork"
+    )
+    @pytest.mark.parametrize("operation", ["read_bytes", "iterdir"])
+    def test_sync_after_fork(self, mock_s3, operation):
+        p = AsAnyPath("s3://bucket")
+        assert p.read_bytes() == b"mock data"
+        runner = _SyncRunner.get()
+
+        def check_child():
+            if operation == "read_bytes":
+                assert p.read_bytes() == b"mock data"
+            else:
+                assert [child.name for child in p.iterdir()] == ["a.txt", "b.txt"]
+            assert _SyncRunner.get() is not runner
+
+        process = multiprocessing.get_context("fork").Process(target=check_child)
+        with _SyncRunner._lock:
+            process.start()
+        try:
+            process.join(timeout=5)
+            assert not process.is_alive(), "forked child hung using the sync runner"
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            process.close()
+
+        assert _SyncRunner.get() is runner
+        assert p.read_bytes() == b"mock data"
 
 
 class TestSyncUnsupportedProtocol:

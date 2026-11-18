@@ -136,6 +136,7 @@ class AsAnyPath(AsAnyPurePath):
         dst: PathPart,
         *,
         recursive: bool = False,
+        concurrency: int = ...,
         remove_src: bool = False,
         force: bool = False,
         atomic: bool = False,

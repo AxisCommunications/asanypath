@@ -140,12 +140,27 @@ report those errors rather than claiming the file does not exist.
 # Copy a single file (cross-backend supported)
 await src.copy(dst)
 
-# Copy entire directory tree
+# Copy entire directory tree (cloud sources copy files concurrently)
 await src.copy(dst, recursive=True)
+
+# Tune recursive cloud-copy concurrency, or use 1 for sequential copying
+await src.copy(dst, recursive=True, concurrency=16)
 
 # Remove directory and all its contents
 await path.rmdir(recursive=True)
 ```
+
+Recursive copies from S3, GCS, Azure, Artifactory and HTTP/HTTPS reuse
+directory-listing metadata where available instead of probing each entry's
+type. The default file concurrency is `min(12, os.cpu_count() or 1)`. A bounded
+queue feeds the file workers, so a large tree does not create one task per
+file. `concurrency=1` restores sequential file copying. Local, SSH and FTP
+source backends are unchanged.
+Progress callbacks remain serialized with cumulative byte totals, but files
+may finish in any order. If a listing, transfer or callback fails, outstanding
+workers are cancelled and awaited before the error is raised and `on_done`
+is called. Some files may already have been copied (or moved); recursive
+copies are not transactional.
 
 On S3, GCS and Azure a recursive delete lists the prefix once at every depth
 and deletes each key below it, directory marker objects included, in bulk: S3
@@ -214,7 +229,12 @@ for child in p.parent.iterdir():  # yields synchronously
 ```
 
 Local paths (`file://` or bare `/path`) bypass the proxy entirely and use
-`pathlib.Path` directly — zero threading overhead.
+`SyncPath`, a wrapper around `pathlib.Path` — zero threading overhead.
+These local path objects can be pickled and passed to spawned multiprocessing
+workers.
+
+Cloud paths share a background event loop per process. After `fork`, the child
+resets the inherited runner and starts its own loop lazily on the next sync call.
 
 ### Large uploads stream automatically
 
