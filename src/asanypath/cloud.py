@@ -1249,17 +1249,16 @@ class CloudPathMixin(CommonPurePathMixin):
         directory prefixes need no per-entry probes.
         ``follow_symlinks`` is accepted for API parity; cloud objects have no symlinks.
         """
+        dirs: list[Self] = []
+        files: list[Self] = []
         try:
-            entries = [entry async for entry in self.scandir()]
+            async for entry in self.scandir():
+                (dirs if entry.is_dir else files).append(entry.path)
         except OSError as e:
             if on_error is not None:
                 on_error(e)
                 return
             raise
-        dirs: list[Self] = []
-        files: list[Self] = []
-        for entry in entries:
-            (dirs if entry.is_dir else files).append(entry.path)
         if top_down:
             yield self, [d.name for d in dirs], [f.name for f in files]
         for d in dirs:
