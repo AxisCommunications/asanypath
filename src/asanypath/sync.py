@@ -140,7 +140,8 @@ class _SyncProxy:
         # (every cloud path method call triggers these branches), but edge cases
         # like "non-callable attributes that are collections" are hard to trigger
         # directly without synthetic mocking.
-        attr = getattr(self._async, name)
+        # Pickle probes __setstate__ before restoring the _async slot.
+        attr = getattr(object.__getattribute__(self, "_async"), name)
 
         # Properties and plain values
         if not callable(attr):  # pragma: no cover

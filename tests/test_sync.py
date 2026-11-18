@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import multiprocessing
+from multiprocessing.reduction import ForkingPickler
 
 import pytest
 
@@ -60,6 +61,28 @@ class TestSyncProxy:
     def test_s3_returns_proxy(self):
         p = AsAnyPath("s3://bucket/key.txt")
         assert isinstance(p, _SyncProxy)
+
+    def test_s3_forking_pickler_roundtrip(self):
+        path = AsAnyPath(
+            "s3://bucket/key.txt",
+            endpoint_url="https://s3.example.invalid",
+            aws_region="us-east-1",
+            aws_access_key_id="test-key",
+            aws_secret_access_key="test-secret",
+        )
+
+        restored = ForkingPickler.loads(ForkingPickler.dumps(path))
+
+        assert isinstance(restored, _SyncProxy)
+        assert restored == path
+        assert restored.endpoint_url == "https://s3.example.invalid"
+        assert restored._native_kwargs == path._native_kwargs
+
+    def test_s3_spawn_pool_accepts_proxy(self):
+        path = AsAnyPath("s3://bucket/key.txt", aws_region="us-east-1")
+
+        with multiprocessing.get_context("spawn").Pool(1) as pool:
+            assert pool.apply_async(str, (path,)).get(timeout=10) == "s3://bucket/key.txt"
 
     def test_cloud_is_an_asanypath_instance(self):
         p = AsAnyPath("s3://bucket/key.txt")

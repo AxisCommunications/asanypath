@@ -235,6 +235,9 @@ workers.
 
 Cloud paths share a background event loop per process. After `fork`, the child
 resets the inherited runner and starts its own loop lazily on the next sync call.
+An S3 sync path passed to a spawned worker retains its backend configuration,
+including any credentials stored on the path. Don't share or store its pickle
+as if it were just a URL.
 
 ### Large uploads stream automatically
 
