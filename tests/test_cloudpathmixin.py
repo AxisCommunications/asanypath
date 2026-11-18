@@ -5,6 +5,7 @@
 # https://opensource.org/licenses/MIT.
 
 import asyncio
+import os
 from os.path import expanduser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -754,6 +755,296 @@ class TestCopyCallbacks:
 
         assert progress_calls[-1] == (7, 7)
         assert done_calls == [(7, True, None)]
+
+
+class TestRecursiveCopy:
+    @pytest.fixture
+    def tree(self, monkeypatch):
+        src = _make_s3().parent
+        files = [src / f"file{i}.txt" for i in range(12)]
+        subdir = src / "sub"
+        files.append(subdir / "nested.txt")
+        listings = {
+            str(src): [
+                *((str(path), False, 7, None) for path in files[:-1]),
+                (str(subdir), True, None, None),
+                (str(src / "empty"), True, None, None),
+            ],
+            str(subdir): [(str(files[-1]), False, 7, None)],
+            str(src / "empty"): [],
+        }
+
+        async def fetch_listing(path):
+            return listings[str(path)]
+
+        async def is_dir(path):
+            assert path == src, "Listed entries should not need directory probes"
+            return True
+
+        monkeypatch.setattr(S3Path, "_fetch_listing", fetch_listing)
+        monkeypatch.setattr(S3Path, "is_dir", is_dir)
+        return src, files
+
+    @pytest.mark.parametrize("concurrency", [None, 1, 3])
+    async def test_bounded_copy_reuses_listing_and_checks_destination_once(
+        self, tree, tmp_path, monkeypatch, concurrency
+    ):
+        from asanypath.local import AsyncPath
+
+        src, files = tree
+        active = peak = 0
+        reads = []
+        probes = []
+        original_is_file = AsyncPath.is_file
+
+        async def is_file(path):
+            probes.append(str(path))
+            return await original_is_file(path)
+
+        async def read_bytes(path):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.001)
+                reads.append(path)
+                return b"payload"
+            finally:
+                active -= 1
+
+        monkeypatch.setattr(S3Path, "read_bytes", read_bytes)
+        monkeypatch.setattr(AsyncPath, "is_file", is_file)
+        progress = []
+        done = []
+
+        async def on_progress(delta, total, source, destination):
+            assert source is src
+            assert str(destination) == str(tmp_path)
+            progress.append((delta, total))
+            await asyncio.sleep(0)
+            assert progress[-1] == (delta, total), "Progress callbacks must not overlap"
+
+        def on_done(source, destination, total, ok, error):
+            done.append((total, ok, error))
+
+        kwargs = {} if concurrency is None else {"concurrency": concurrency}
+        result = await src.copy(
+            tmp_path,
+            recursive=True,
+            chunk_size=0,
+            on_progress=on_progress,
+            on_done=on_done,
+            **kwargs,
+        )
+
+        assert str(result) == str(tmp_path)
+        assert peak == (min(12, os.cpu_count() or 1) if concurrency is None else concurrency)
+        assert set(reads) == set(files)
+        if concurrency == 1:
+            assert reads == files
+        assert len(probes) == len(files)
+        assert len(set(probes)) == len(files)
+        assert (tmp_path / "empty").is_dir()
+        for path in files:
+            assert (tmp_path / path.relative_to(src)).read_bytes() == b"payload"
+        assert progress == [(7, 7 * i) for i in range(1, len(files) + 1)]
+        assert done == [(7 * len(files), True, None)]
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    async def test_failure_or_cancellation_joins_workers(self, tree, tmp_path, monkeypatch, cancel):
+        src, _ = tree
+        started = asyncio.Event()
+        blocked = asyncio.Event()
+        active = 0
+        finished = []
+        yielded = []
+        done = []
+        failure = OSError("read failed")
+        original_scandir = S3Path.scandir
+
+        async def scandir(path):
+            async for entry in original_scandir(path):
+                yielded.append(entry.path)
+                yield entry
+
+        async def read_bytes(path):
+            nonlocal active
+            active += 1
+            if active == 3:
+                started.set()
+            try:
+                await started.wait()
+                if path.name == "file0.txt" and not cancel:
+                    raise failure
+                await blocked.wait()
+                return b"payload"
+            finally:
+                active -= 1
+                finished.append(path)
+
+        monkeypatch.setattr(S3Path, "read_bytes", read_bytes)
+        monkeypatch.setattr(S3Path, "scandir", scandir)
+        unlink = AsyncMock()
+        monkeypatch.setattr(S3Path, "unlink", unlink)
+        rmdir = AsyncMock()
+        monkeypatch.setattr(S3Path, "rmdir", rmdir)
+
+        task = asyncio.create_task(
+            src.copy(
+                tmp_path,
+                recursive=True,
+                concurrency=3,
+                chunk_size=0,
+                atomic=True,
+                remove_src=True,
+                on_done=lambda *args: done.append(args),
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else OSError) as exc:
+            await asyncio.wait_for(task, timeout=2)
+
+        assert active == 0
+        assert len(finished) == 3
+        assert len(yielded) <= 7  # Three active, three queued, one waiting for queue space.
+        assert not list(tmp_path.rglob(".*.tmp-*"))
+        assert len(done) == 1
+        assert done[0][3] is False
+        assert done[0][4] is exc.value
+        if not cancel:
+            assert exc.value is failure
+        unlink.assert_not_awaited()
+        rmdir.assert_not_awaited()
+
+    @pytest.mark.parametrize("force, identical", [(False, False), (False, True), (True, False)])
+    async def test_existing_destination_and_move(
+        self, tree, tmp_path, monkeypatch, force, identical
+    ):
+        src, files = tree
+        for path in files:
+            destination = tmp_path / path.relative_to(src)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"payload" if identical else b"old")
+        monkeypatch.setattr(S3Path, "read_bytes", AsyncMock(return_value=b"payload"))
+        monkeypatch.setattr(S3Path, "checksums", AsyncMock(return_value={}))
+        unlink = AsyncMock()
+        monkeypatch.setattr(S3Path, "unlink", unlink)
+        rmdir = AsyncMock()
+        monkeypatch.setattr(S3Path, "rmdir", rmdir)
+
+        if not force and not identical:
+            with pytest.raises(FileExistsError):
+                await src.copy(tmp_path, recursive=True, remove_src=True, chunk_size=0)
+            unlink.assert_not_awaited()
+            rmdir.assert_not_awaited()
+        else:
+            await src.copy(tmp_path, recursive=True, force=force, remove_src=True, chunk_size=0)
+            assert unlink.await_count == len(files)
+            rmdir.assert_awaited_once()
+            for path in files:
+                assert (tmp_path / path.relative_to(src)).read_bytes() == b"payload"
+
+    @pytest.mark.parametrize("concurrency", [0, -1, 1.5, True])
+    async def test_invalid_concurrency(self, concurrency, tmp_path):
+        with pytest.raises(ValueError, match="concurrency"):
+            await _make_s3().copy(tmp_path, recursive=True, concurrency=concurrency)
+
+    @pytest.mark.parametrize("server_side", [False, True])
+    async def test_remote_destination_preserves_options_and_move(
+        self, tree, monkeypatch, server_side
+    ):
+        src, files = tree
+        dst = src._spawn("s3://bucket/target" if server_side else "s3://other/target")
+        options = BackendOptions(headers={"x-amz-meta-source": "test"})
+        monkeypatch.setattr(S3Path, "mkdir", AsyncMock())
+        monkeypatch.setattr(S3Path, "is_file", AsyncMock(return_value=False))
+        unlink = AsyncMock()
+        monkeypatch.setattr(S3Path, "unlink", unlink)
+        rmdir = AsyncMock()
+        monkeypatch.setattr(S3Path, "rmdir", rmdir)
+        copies = []
+
+        async def copy(path, target, **kwargs):
+            copies.append((path, target, kwargs))
+            await asyncio.sleep(0)
+            return 7
+
+        monkeypatch.setattr(S3Path, "_server_side_copy" if server_side else "_copy_to_remote", copy)
+        assert (
+            await src.copy(
+                dst, recursive=True, remove_src=True, destination_backend_options=options
+            )
+            is dst
+        )
+
+        assert {path for path, _, _ in copies} == set(files)
+        for path, target, kwargs in copies:
+            assert str(target) == str(dst / path.relative_to(src))
+            assert kwargs == (
+                {"want_size": False, "destination_backend_options": options}
+                if server_side
+                else {"chunk_size": None, "backend_options": options}
+            )
+        assert unlink.await_count == len(files)
+        rmdir.assert_awaited_once()
+
+    @pytest.mark.parametrize("origin", ["listing", "callback"])
+    async def test_listing_or_callback_error_cancels_active_copies(
+        self, tree, tmp_path, monkeypatch, origin
+    ):
+        src, _ = tree
+        started = asyncio.Event()
+        blocked = asyncio.Event()
+        active = 0
+        done = []
+        failure = OSError(f"{origin} failed")
+        original_fetch = S3Path._fetch_listing
+
+        async def fetch_listing(path):
+            if path.name == "sub":
+                await started.wait()
+                raise failure
+            rows = await original_fetch(path)
+            return [*rows[:3], rows[-2]] if path == src else rows
+
+        async def read_bytes(path):
+            nonlocal active
+            active += 1
+            if active == 3:
+                started.set()
+            try:
+                await started.wait()
+                if origin == "callback" and path.name == "file0.txt":
+                    return b"payload"
+                await blocked.wait()
+            finally:
+                active -= 1
+
+        def progress(*args):
+            raise failure
+
+        if origin == "listing":
+            # Reach the subdirectory listing while file transfers are blocked.
+            monkeypatch.setattr(S3Path, "_fetch_listing", fetch_listing)
+        monkeypatch.setattr(S3Path, "read_bytes", read_bytes)
+        with pytest.raises(OSError) as exc:
+            await asyncio.wait_for(
+                src.copy(
+                    tmp_path,
+                    recursive=True,
+                    concurrency=3,
+                    chunk_size=0,
+                    on_progress=progress if origin == "callback" else None,
+                    on_done=lambda *args: done.append(args),
+                ),
+                timeout=2,
+            )
+        assert exc.value is failure
+        assert active == 0
+        assert len(done) == 1
+        assert done[0][3:] == (False, failure)
 
 
 class TestRenameReplaceCallbacks:

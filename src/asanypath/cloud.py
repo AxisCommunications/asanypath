@@ -988,6 +988,7 @@ class CloudPathMixin(CommonPurePathMixin):
         dst,
         *,
         recursive: bool = False,
+        concurrency: int = min(12, os.cpu_count() or 1),
         remove_src: bool = False,
         force: bool = False,
         atomic: bool = False,
@@ -1000,13 +1001,18 @@ class CloudPathMixin(CommonPurePathMixin):
         """Copy this path to *dst*.
 
         *dst* can be any path type (cross-backend supported).
-        With ``recursive=True``, copies entire directory tree.
+        With ``recursive=True``, copies entire directory tree with up to
+        ``concurrency`` file transfers in flight (default: CPU count, capped at
+        12, or 1 if unknown; pass 1 for sequential).
+        Progress callbacks are serialized, but files may finish in any order.
         With ``remove_src=True``, deletes source after copy (move semantics).
         Returns the destination path.
         """
         from asanypath import AsAnyPath
 
         _validate_chunk_size(chunk_size)
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be a positive integer")
         dst = dst if has_async_transfer_api(dst) else AsAnyPath(str(dst))
         same_native = self._can_server_side_copy(dst)
         if atomic and getattr(dst, "protocol", None) != "file" and not same_native:
@@ -1027,15 +1033,17 @@ class CloudPathMixin(CommonPurePathMixin):
             )
         transferred = 0
         error: BaseException | None = None
+        progress_lock = asyncio.Lock()
 
         async def _emit_progress(delta: int) -> None:
             nonlocal transferred
             if on_progress is None or delta <= 0:  # pragma: no cover
                 return
-            transferred += delta
-            maybe = on_progress(delta, transferred, self, dst)
-            if inspect.isawaitable(maybe):  # pragma: no cover
-                await maybe
+            async with progress_lock:
+                transferred += delta
+                maybe = on_progress(delta, transferred, self, dst)
+                if inspect.isawaitable(maybe):  # pragma: no cover
+                    await maybe
 
         async def _emit_done() -> None:
             if on_done is None:  # pragma: no cover
@@ -1044,66 +1052,101 @@ class CloudPathMixin(CommonPurePathMixin):
             if inspect.isawaitable(maybe):  # pragma: no cover
                 await maybe
 
-        async def _copy_recursive(src_node: Self, dst_node: Self) -> None:
-            if await src_node.is_dir():
-                await dst_node.mkdir(parents=True, exist_ok=True)
-                async for child in src_node.iterdir():
-                    await _copy_recursive(child, dst_node / child.name)
-            else:
-
-                async def _copy_leaf() -> int:
-                    if not needs_copy:
-                        return 0
-                    if src_node._can_server_side_copy(dst_node):
-                        return await src_node._server_side_copy(
-                            dst_node,
-                            want_size=on_progress is not None,
-                            destination_backend_options=destination_backend_options,
-                        )
-                    if getattr(dst_node, "protocol", None) == "file":
-                        await dst_node.copy_from(
-                            src_node,
-                            force=force,
-                            atomic=atomic,
-                            chunk_size=chunk_size,
-                            on_progress=lambda delta, transferred, _src, _dst: _emit_progress(
-                                delta
-                            ),
-                        )
-                        return 0
-                    await dst_node.parent.mkdir(parents=True, exist_ok=True)
-                    return await src_node._copy_to_remote(
-                        dst_node,
-                        chunk_size=chunk_size,
-                        backend_options=destination_backend_options,
-                    )
-
-                needs_copy, same_path, destination_exists = await async_destination_state(
-                    src_node, dst_node
-                )
-                if not needs_copy:
-                    if same_path:
-                        return
-                elif destination_exists and not force:
-                    require_force(force, dst_node)
-
-                await run_transfer_async(
-                    src=src_node,
-                    dst=dst_node,
-                    copy_fn=_copy_leaf,
-                    remove_fn=src_node.unlink,
-                    remove_src=remove_src and not same_path,
+        async def _copy_leaf(src_node: Self, dst_node: Any) -> None:
+            if getattr(dst_node, "protocol", None) == "file":
+                # copy_from owns destination checks, atomic writes and source removal.
+                await dst_node.copy_from(
+                    src_node,
+                    remove_src=remove_src,
+                    force=force,
+                    atomic=atomic,
+                    chunk_size=chunk_size,
                     on_progress=lambda delta, transferred, _src, _dst: _emit_progress(delta),
-                    on_done=None,
                 )
+                return
+
+            async def _copy_file() -> int:
+                if not needs_copy:
+                    return 0
+                if src_node._can_server_side_copy(dst_node):
+                    return await src_node._server_side_copy(
+                        dst_node,
+                        want_size=on_progress is not None,
+                        destination_backend_options=destination_backend_options,
+                    )
+                await dst_node.parent.mkdir(parents=True, exist_ok=True)
+                return await src_node._copy_to_remote(
+                    dst_node,
+                    chunk_size=chunk_size,
+                    backend_options=destination_backend_options,
+                )
+
+            needs_copy, same_path, destination_exists = await async_destination_state(
+                src_node, dst_node
+            )
+            if not needs_copy:
+                if same_path:
+                    return
+            elif destination_exists and not force:
+                require_force(force, dst_node)
+
+            await run_transfer_async(
+                src=src_node,
+                dst=dst_node,
+                copy_fn=_copy_file,
+                remove_fn=src_node.unlink,
+                remove_src=remove_src and not same_path,
+                on_progress=lambda delta, transferred, _src, _dst: _emit_progress(delta),
+                on_done=None,
+            )
+
+        async def _copy_tree() -> None:
+            queue: asyncio.Queue[tuple[Self, Any] | None] = asyncio.Queue(maxsize=concurrency)
+
+            async def produce(src_node: Self, dst_node: Any) -> None:
+                await dst_node.mkdir(parents=True, exist_ok=True)
+                async for entry in src_node.scandir():
+                    target = dst_node / entry.path.name
+                    is_dir = entry.is_dir
+                    if is_dir is None:
+                        is_dir = await entry.path.is_dir()
+                    if is_dir:
+                        await produce(entry.path, target)
+                    elif concurrency == 1:
+                        await _copy_leaf(entry.path, target)
+                    else:
+                        await queue.put((entry.path, target))
+
+            if concurrency == 1:
+                await produce(self, dst)
+                return
+
+            async def producer() -> None:
+                await produce(self, dst)
+                for _ in range(concurrency):
+                    await queue.put(None)
+
+            async def worker() -> None:
+                while (item := await queue.get()) is not None:
+                    await _copy_leaf(*item)
+
+            tasks = [asyncio.create_task(producer())]
+            tasks.extend(asyncio.create_task(worker()) for _ in range(concurrency))
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
-            if recursive and await self.is_dir():
+            is_directory = await self.is_dir()
+            if recursive and is_directory:
                 same_path = str(self) == str(dst)
-                await _copy_recursive(self, dst)
+                await _copy_tree()
                 if remove_src and not same_path:
                     await self.rmdir()
-            elif await self.is_dir():
+            elif is_directory:
                 raise IsADirectoryError(21, f"Is a directory: '{self}' (use recursive=True)")
             else:
 
