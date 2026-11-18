@@ -229,7 +229,9 @@ for child in p.parent.iterdir():  # yields synchronously
 ```
 
 Local paths (`file://` or bare `/path`) bypass the proxy entirely and use
-`pathlib.Path` directly — zero threading overhead.
+`SyncPath`, a wrapper around `pathlib.Path` — zero threading overhead.
+These local path objects can be pickled and passed to spawned multiprocessing
+workers.
 
 Cloud paths share a background event loop per process. After `fork`, the child
 resets the inherited runner and starts its own loop lazily on the next sync call.

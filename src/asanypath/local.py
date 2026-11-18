@@ -201,7 +201,8 @@ class SyncPath(CommonPurePathMixin):
         return str(self._path)
 
     def __getattr__(self, name):
-        return getattr(self._path, name)
+        # Pickle probes __setstate__ before restoring _path.
+        return getattr(object.__getattribute__(self, "_path"), name)
 
     def iterdir(self) -> Generator[S]:
         for entry in self._path.iterdir():
