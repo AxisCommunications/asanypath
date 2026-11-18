@@ -912,8 +912,10 @@ class TestRecursiveCopy:
         assert not list(tmp_path.rglob(".*.tmp-*"))
         assert len(done) == 1
         assert done[0][3] is False
-        assert done[0][4] is exc.value
-        if not cancel:
+        if cancel:
+            assert isinstance(done[0][4], asyncio.CancelledError)
+        else:
+            assert done[0][4] is exc.value
             assert exc.value is failure
         unlink.assert_not_awaited()
         rmdir.assert_not_awaited()
