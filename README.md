@@ -555,6 +555,20 @@ syntax. Transport-managed headers such as `Host` and
 visible in shell history or process listings, so use the HTTP auth environment
 variables for secrets.
 
+For SSH copies, config aliases can be used as `alias:path` (relative to the
+remote home) or `ssh://alias/absolute/path`. Source overrides use constructor
+option names, not OpenSSH directive names, and each requires a separate flag:
+
+```sh
+asanypath cp alias:logs/output.txt ./output.txt \
+  --src-option ssh.username=deploy \
+  --src-option ssh.port=2222 \
+  --src-option ssh.client_keys=/path/to/private-key
+```
+
+These override the corresponding config values. Passwords and other secrets
+passed on the command line may be visible in shell history or process listings.
+
 ### Shell Completions (Beta)
 
 Path completions are available for all subcommands that take cloud paths: `ls`, `cp`, `mv`, `rm`, `stat`, `cat`, `exists`, `touch`, `checksums`, `mkdir`, `presign`, and `sync`.
