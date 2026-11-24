@@ -79,15 +79,15 @@ with path.open("rb") as f:
     chunk = f.read(512)
 ```
 
-Files smaller than the buffer size are fetched in one shot automatically.
-Supported on S3, GCS, Azure, and Artifactory.
+The buffer size controls prefetch; smaller files may be fetched in one shot.
+Supported on S3, GCS, Azure, Artifactory, and HTTP/HTTPS.
 
-HTTP and HTTPS paths also support read-only `open("rb")` and `open("r")`
-with both context-manager styles. These download the entire response on entry
-and return a seekable in-memory handle, so servers do not need to support HEAD
-or range requests. Text mode accepts `encoding`, `errors`, and `newline`.
-Existing HTTP authentication and read-cache settings apply; anonymous URLs
-require no token.
+HTTP and HTTPS paths support read-only `open("rb")` and `open("r")` with both
+context-manager styles. They use lazy range reads when a HEAD response supplies
+the size, falling back to a full download when HEAD or ranges are unavailable.
+If the download cache is enabled, `open()` uses it instead of range reads.
+Text mode accepts `encoding`, `errors`, and `newline`. Existing HTTP
+authentication settings apply; anonymous URLs require no token.
 
 ### Service endpoints
 

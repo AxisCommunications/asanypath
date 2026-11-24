@@ -486,6 +486,13 @@ async def test_not_implemented(method, args):
             await coro_or_gen
 
 
+@pytest.fixture
+def head_not_supported():
+    with patch(f"{_HTTP_NATIVE}.http_request", AsyncMock(return_value=(405, b"", {}))):
+        yield
+
+
+@pytest.mark.usefixtures("head_not_supported")
 @pytest.mark.parametrize("path_type", [HTTPPath, HTTPSPath])
 @pytest.mark.parametrize("mode", ["rb", "br"])
 async def test_open_binary(path_type, mode):
@@ -502,6 +509,194 @@ async def test_open_binary(path_type, mode):
     get.assert_awaited_once_with(str(p), headers=p._merge_headers(None))
 
 
+@pytest.mark.parametrize("path_type", [HTTPPath, HTTPSPath])
+@pytest.mark.parametrize("sync", [False, True])
+async def test_open_reads_http_ranges_lazily(path_type, sync):
+    data = b"0123456789abcdef"
+    path = path_type(f"{path_type.protocol}://example.com/file")
+    requests = []
+
+    async def request(method, url, *, body, headers):
+        requests.append((method, dict(headers or [])))
+        if method == "HEAD":
+            return (
+                200,
+                b"",
+                {
+                    "content-length": str(len(data)),
+                    "accept-ranges": "bytes",
+                    "etag": '"v1"',
+                },
+            )
+        headers = dict(headers)
+        start, end = map(int, headers["range"].removeprefix("bytes=").split("-"))
+        return 206, data[start : end + 1], {"content-range": f"bytes {start}-{end}/{len(data)}"}
+
+    get = AsyncMock(side_effect=AssertionError("unexpected full download"))
+    with (
+        patch(f"{_HTTP_NATIVE}.http_request", side_effect=request),
+        patch(f"{_HTTP_NATIVE}.http_get", get),
+    ):
+        context = path.open("rb", buffering=4)
+        if sync:
+            with context as f:
+                assert len(requests) == 1
+                assert f.read(2) == b"01"
+                f.seek(10)
+                assert f.read(2) == b"ab"
+        else:
+            async with context as f:
+                assert len(requests) == 1
+                assert f.read(2) == b"01"
+                f.seek(10)
+                assert f.read(2) == b"ab"
+
+    assert [method for method, _ in requests] == ["HEAD", "GET", "GET"]
+    assert [headers["range"] for _, headers in requests[1:]] == ["bytes=0-3", "bytes=10-13"]
+    assert all(headers["if-match"] == '"v1"' for _, headers in requests[1:])
+    get.assert_not_awaited()
+
+
+def test_sync_adapter_uses_unbuffered_http_ranges(monkeypatch):
+    from asanypath.sync import AsAnyPath
+
+    data = b"0123456789abcdef"
+    requests = []
+    monkeypatch.delenv("HTTP_AUTH_USER", raising=False)
+    monkeypatch.delenv("HTTP_AUTH_PASSWORD", raising=False)
+    monkeypatch.setenv("HTTP_AUTH_URL", "https://example.com")
+    monkeypatch.setenv("HTTP_AUTH_HEADER", "User-Agent")
+    monkeypatch.setenv("HTTP_AUTH_TOKEN", "test-viewer")
+
+    async def request(method, url, *, body, headers):
+        headers = dict(headers)
+        requests.append((method, headers))
+        if method == "HEAD":
+            return 200, b"", {"content-length": str(len(data))}
+        start, end = map(int, headers["range"].removeprefix("bytes=").split("-"))
+        return 206, data[start : end + 1], {"content-range": f"bytes {start}-{end}/{len(data)}"}
+
+    with patch(f"{_HTTP_NATIVE}.http_request", side_effect=request):
+        with AsAnyPath("https://example.com/file").open("rb", buffering=0) as f:
+            assert f.read(2) == b"01"
+            f.seek(-2, 2)
+            assert f.read(2) == b"ef"
+        assert f.closed
+
+    assert [headers.get("range") for _, headers in requests] == [None, "bytes=0-1", "bytes=14-15"]
+    assert all(headers["User-Agent"] == "test-viewer" for _, headers in requests)
+
+
+async def test_open_reuses_response_when_server_ignores_range():
+    data = b"0123456789abcdef"
+    path = _hp()
+    request = AsyncMock(
+        side_effect=[
+            (200, b"", {"content-length": str(len(data)), "accept-ranges": "bytes"}),
+            (200, data, {}),
+        ]
+    )
+    get = AsyncMock(side_effect=AssertionError("unexpected second download"))
+    with patch(f"{_HTTP_NATIVE}.http_request", request), patch(f"{_HTTP_NATIVE}.http_get", get):
+        async with path.open("rb", buffering=4) as f:
+            f.seek(6)
+            assert f.read(2) == b"67"
+            f.seek(0)
+            assert f.read() == data
+    assert request.await_count == 2
+    get.assert_not_awaited()
+
+
+async def test_open_uses_full_read_when_range_unavailable_or_cache_enabled():
+    path = _hp()
+    get = AsyncMock(return_value=b"data")
+    head = AsyncMock(return_value=(200, b"", {"content-length": "4", "accept-ranges": "none"}))
+    with patch(f"{_HTTP_NATIVE}.http_request", head), patch(f"{_HTTP_NATIVE}.http_get", get):
+        async with path.open("rb") as f:
+            assert f.read() == b"data"
+    head.assert_awaited_once()
+    get.assert_awaited_once()
+
+    with (
+        patch("asanypath.cache.cache_enabled", return_value=True),
+        patch.object(path, "read_bytes", AsyncMock(return_value=b"cached")) as read,
+        patch(f"{_HTTP_NATIVE}.http_request", AsyncMock()) as head,
+    ):
+        async with path.open("rb") as f:
+            assert f.read() == b"cached"
+    read.assert_awaited_once()
+    head.assert_not_awaited()
+
+
+async def test_open_rejects_changed_length_when_range_ignored():
+    request = AsyncMock(
+        side_effect=[
+            (200, b"", {"content-length": "16", "accept-ranges": "bytes"}),
+            (200, b"changed", {}),
+        ]
+    )
+    with patch(f"{_HTTP_NATIVE}.http_request", request):
+        async with _hp().open("rb", buffering=4) as f:
+            with pytest.raises(OSError, match="Source changed"):
+                f.read(2)
+
+
+async def test_open_does_not_retry_rate_limited_head_as_full_get():
+    head = AsyncMock(return_value=(429, b"", {}))
+    get = AsyncMock()
+    with patch(f"{_HTTP_NATIVE}.http_request", head), patch(f"{_HTTP_NATIVE}.http_get", get):
+        with pytest.raises(RuntimeError, match="429"):
+            async with _hp().open("rb"):
+                pytest.fail("open must not succeed")
+    get.assert_not_awaited()
+
+
+async def test_open_preserves_get_authentication_error_after_unauthorized_head():
+    from asanypath.exceptions import AuthenticationError
+
+    head = AsyncMock(return_value=(401, b"", {}))
+    get = AsyncMock(side_effect=AuthenticationError("rejected"))
+    with patch(f"{_HTTP_NATIVE}.http_request", head), patch(f"{_HTTP_NATIVE}.http_get", get):
+        with pytest.raises(AuthenticationError, match="rejected"):
+            async with _hp().open("rb"):
+                pytest.fail("open must not succeed")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [(412, b"", {}), (206, b"0123", {"content-range": "bytes 0-3/17"})],
+)
+async def test_open_propagates_invalid_range_response(response):
+    request = AsyncMock(
+        side_effect=[
+            (200, b"", {"content-length": "16", "etag": '"v1"'}),
+            response,
+        ]
+    )
+    with patch(f"{_HTTP_NATIVE}.http_request", request):
+        async with _hp().open("rb", buffering=4) as f:
+            with pytest.raises(OSError):
+                f.read(2)
+
+
+async def test_open_text_uses_ranges():
+    data = b"first\nsecond\n"
+
+    async def request(method, url, *, body, headers):
+        if method == "HEAD":
+            return 200, b"", {"content-length": str(len(data))}
+        start, end = map(int, dict(headers)["range"].removeprefix("bytes=").split("-"))
+        end = min(end, len(data) - 1)
+        return 206, data[start : end + 1], {"content-range": f"bytes {start}-{end}/{len(data)}"}
+
+    with patch(f"{_HTTP_NATIVE}.http_request", side_effect=request):
+        async with _hp().open("r", buffering=4) as f:
+            assert f.readline() == "first\n"
+            assert f.readline() == "second\n"
+        assert f.closed
+
+
+@pytest.mark.usefixtures("head_not_supported")
 @pytest.mark.parametrize("mode", ["r", "rt", "tr"])
 async def test_open_text(mode):
     p = _hp()
@@ -530,6 +725,7 @@ def test_open_rejects_unbuffered_text():
         _hp().open("r", buffering=0)
 
 
+@pytest.mark.usefixtures("head_not_supported")
 async def test_open_propagates_download_error():
     with patch(f"{_HTTP_NATIVE}.http_get", AsyncMock(side_effect=PermissionError("HTTP 403"))):
         with pytest.raises(PermissionError, match="403"):
@@ -537,6 +733,7 @@ async def test_open_propagates_download_error():
                 pytest.fail("open must not succeed")
 
 
+@pytest.mark.usefixtures("head_not_supported")
 async def test_open_closes_on_error():
     with patch(f"{_HTTP_NATIVE}.http_get", AsyncMock(return_value=b"data")):
         with pytest.raises(RuntimeError, match="consumer error"):
