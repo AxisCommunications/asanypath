@@ -15,7 +15,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from os import getenv
 from pathlib import Path
 from types import SimpleNamespace
@@ -408,7 +408,7 @@ class ArtifactoryPath(CloudPathMixin, ServiceEndpointMixin):
         if ts.endswith("Z"):
             ts = ts[:-1] + "+00:00"
         try:
-            return datetime.fromisoformat(ts).astimezone(timezone.utc).timestamp()
+            return datetime.fromisoformat(ts).astimezone(UTC).timestamp()
         except ValueError:
             return None
 
