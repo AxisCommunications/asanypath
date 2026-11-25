@@ -4,6 +4,7 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
+import os
 import re
 from urllib.parse import urlparse
 
@@ -223,6 +224,201 @@ def test_register_overrides_builtin():
         "print(PROTOCOL_MAP['s3'] is AsyncPath)"
     )
     assert out == "True"
+
+
+def test_concurrent_https_and_local_dispatch_during_lazy_import(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    import asanypath.asanypath as factory
+    from asanypath.http import HTTPSPath
+    from asanypath.local import AsyncPath
+
+    registry = factory._LazyDict()
+    monkeypatch.setattr(factory, "PROTOCOL_MAP", registry)
+    original_import = factory.import_module
+    importing = Event()
+    resume = Event()
+
+    def blocked_import(name):
+        if name == "asanypath.local" and not importing.is_set():
+            importing.set()
+            if not resume.wait(5):
+                raise TimeoutError("local backend import was not released")
+        return original_import(name)
+
+    monkeypatch.setattr(factory, "import_module", blocked_import)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        https = executor.submit(AsAnyPath, "https://example.com/file")
+        try:
+            assert importing.wait(5)
+            local = AsAnyPath("/tmp/cfg.yaml")
+        finally:
+            resume.set()
+        assert isinstance(https.result(timeout=10), HTTPSPath)
+    assert isinstance(local, AsyncPath)
+    assert str(local) == "/tmp/cfg.yaml"
+
+
+@pytest.mark.parametrize("import_fails", [False, True])
+def test_register_while_lazy_import_is_in_progress(monkeypatch, import_fails):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from types import SimpleNamespace
+
+    import asanypath.asanypath as factory
+
+    class Builtin:
+        pass
+
+    class Override:
+        pass
+
+    registry = factory._LazyDict()
+    registry._pending = {"file": ("backend", "Builtin")}
+    importing = Event()
+    resume = Event()
+
+    def blocked_import(name):
+        importing.set()
+        if not resume.wait(5):
+            raise TimeoutError("backend import was not released")
+        if import_fails:
+            raise ImportError("optional backend unavailable")
+        return SimpleNamespace(Builtin=Builtin)
+
+    monkeypatch.setattr(factory, "import_module", blocked_import)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        lookup = executor.submit(registry.__getitem__, "file")
+        try:
+            assert importing.wait(5)
+            registry["file"] = Override
+        finally:
+            resume.set()
+        assert lookup.result(timeout=5) is Override
+    assert registry["file"] is Override
+
+
+def test_failed_import_does_not_hide_another_import_in_progress(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from types import SimpleNamespace
+
+    import asanypath.asanypath as factory
+
+    class Builtin:
+        pass
+
+    registry = factory._LazyDict()
+    registry._pending = {"file": ("backend", "Builtin")}
+    first_started, second_started = Event(), Event()
+    fail_first, finish_second = Event(), Event()
+
+    def blocked_import(name):
+        if not first_started.is_set():
+            first_started.set()
+            if not fail_first.wait(5):
+                raise TimeoutError("first import was not released")
+            raise ImportError("temporarily unavailable")
+        if not second_started.is_set():
+            second_started.set()
+            if not finish_second.wait(5):
+                raise TimeoutError("second import was not released")
+        return SimpleNamespace(Builtin=Builtin)
+
+    monkeypatch.setattr(factory, "import_module", blocked_import)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(registry.__getitem__, "file")
+        try:
+            assert first_started.wait(5)
+            second = executor.submit(registry.__getitem__, "file")
+            assert second_started.wait(5)
+            fail_first.set()
+            assert first.result(timeout=5) is UnsupportedProtocolPath
+            assert registry["file"] is Builtin
+        finally:
+            fail_first.set()
+            finish_second.set()
+        assert second.result(timeout=5) is Builtin
+
+
+def test_missing_backend_is_not_reimported(monkeypatch):
+    import asanypath.asanypath as factory
+
+    registry = factory._LazyDict()
+    registry._pending = {"file": ("backend", "Builtin")}
+    attempts = []
+
+    def missing_import(name):
+        attempts.append(name)
+        raise ImportError("backend unavailable")
+
+    monkeypatch.setattr(factory, "import_module", missing_import)
+    assert registry["file"] is UnsupportedProtocolPath
+    assert registry["file"] is UnsupportedProtocolPath
+    assert attempts == ["backend"]
+
+
+def test_in_progress_import_can_finish_after_fork_reset(monkeypatch):
+    from types import SimpleNamespace
+
+    import asanypath.asanypath as factory
+
+    class Builtin:
+        pass
+
+    registry = factory._LazyDict()
+    registry._pending = {"file": ("backend", "Builtin")}
+
+    def import_after_fork(name):
+        registry._after_fork()
+        return SimpleNamespace(Builtin=Builtin)
+
+    monkeypatch.setattr(factory, "import_module", import_after_fork)
+    assert registry["file"] is Builtin
+    assert registry["file"] is Builtin
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_registry_lock_is_reinitialized_after_fork():
+    import multiprocessing
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    import asanypath.asanypath as factory
+    from asanypath.local import AsyncPath
+
+    ctx = multiprocessing.get_context("fork")
+    parent, child = ctx.Pipe(duplex=False)
+    locked, release = Event(), Event()
+
+    def hold_lock():
+        with factory.PROTOCOL_MAP._lock:
+            locked.set()
+            release.wait(10)
+
+    def child_lookup():
+        child.send(factory.PROTOCOL_MAP.get("file") is AsyncPath)
+        child.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(hold_lock)
+        process = ctx.Process(target=child_lookup)
+        try:
+            assert locked.wait(5)
+            process.start()
+            assert parent.poll(5), "child blocked on the inherited registry lock"
+            assert parent.recv()
+            process.join(5)
+            assert process.exitcode == 0
+        finally:
+            release.set()
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+                process.join()
+            holder.result(timeout=5)
+            parent.close()
+            child.close()
 
 
 def test_lazy_exports_and_dir():
