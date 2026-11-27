@@ -16,7 +16,7 @@ locally before connecting to a cloud account.
 
 ## Requirements
 
-- Python 3.10 through 3.15.
+- Python 3.11 through 3.15.
 - Access credentials for each cloud service that your application uses.
 
 S3 authentication accepts explicit keys or uses the AWS SDK credential provider
@@ -79,15 +79,15 @@ with path.open("rb") as f:
     chunk = f.read(512)
 ```
 
-Files smaller than the buffer size are fetched in one shot automatically.
-Supported on S3, GCS, Azure, and Artifactory.
+The buffer size controls prefetch; smaller files may be fetched in one shot.
+Supported on S3, GCS, Azure, Artifactory, and HTTP/HTTPS.
 
-HTTP and HTTPS paths also support read-only `open("rb")` and `open("r")`
-with both context-manager styles. These download the entire response on entry
-and return a seekable in-memory handle, so servers do not need to support HEAD
-or range requests. Text mode accepts `encoding`, `errors`, and `newline`.
-Existing HTTP authentication and read-cache settings apply; anonymous URLs
-require no token.
+HTTP and HTTPS paths support read-only `open("rb")` and `open("r")` with both
+context-manager styles. They use lazy range reads when a HEAD response supplies
+the size, falling back to a full download when HEAD or ranges are unavailable.
+If the download cache is enabled, `open()` uses it instead of range reads.
+Text mode accepts `encoding`, `errors`, and `newline`. Existing HTTP
+authentication settings apply; anonymous URLs require no token.
 
 ### Service endpoints
 
@@ -554,6 +554,20 @@ syntax. Transport-managed headers such as `Host` and
 `Content-Length` are rejected. Header values passed on the command line may be
 visible in shell history or process listings, so use the HTTP auth environment
 variables for secrets.
+
+For SSH copies, config aliases can be used as `alias:path` (relative to the
+remote home) or `ssh://alias/absolute/path`. Source overrides use constructor
+option names, not OpenSSH directive names, and each requires a separate flag:
+
+```sh
+asanypath cp alias:logs/output.txt ./output.txt \
+  --src-option ssh.username=deploy \
+  --src-option ssh.port=2222 \
+  --src-option ssh.client_keys=/path/to/private-key
+```
+
+These override the corresponding config values. Passwords and other secrets
+passed on the command line may be visible in shell history or process listings.
 
 ### Shell Completions (Beta)
 

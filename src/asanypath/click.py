@@ -171,7 +171,11 @@ def _maybe_rewrite_scp_style(value: str) -> str:
         return value
     if not _discover_ssh_config():
         return value
-    if _resolve_alias(host, None, None)[0] == host:
+    try:
+        resolved_host = _resolve_alias(host, None, None)[0]
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if resolved_host == host:
         # No Host block matched — leave alone (don't probe DNS).
         return value
     prefix = f"{user}@" if user else ""

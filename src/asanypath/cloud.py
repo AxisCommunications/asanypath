@@ -1321,24 +1321,6 @@ class _CloudRawIO(io.RawIOBase):
         return self._pos
 
 
-class _SpooledWriteBuffer(tempfile.SpooledTemporaryFile):
-    """Spooled write buffer exposing the IOBase probes ``TextIOWrapper`` needs.
-
-    Python 3.10's ``SpooledTemporaryFile`` omits ``readable``/``writable``/
-    ``seekable`` (added in 3.11); the buffer is always opened ``w+b`` so all
-    three are unconditionally true.
-    """
-
-    def readable(self) -> bool:
-        return True
-
-    def writable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return True
-
-
 class _CloudFile:
     """File handle backed by cloud read/write with lazy range-read support.
 
@@ -1381,7 +1363,7 @@ class _CloudFile:
         self._range_read = range_read
         self._buf: IO[bytes] | None = None
         self._text_wrapper: io.TextIOWrapper | None = None
-        self._reader: io.BufferedReader | None = None
+        self._reader: io.BufferedReader | io.RawIOBase | None = None
         self._closed = False
         self._sync = False
 
@@ -1402,7 +1384,7 @@ class _CloudFile:
         if "r" in self._mode:
             self._buf = io.BytesIO(data or b"")
         else:
-            self._buf = _SpooledWriteBuffer(max_size=self._SPOOL_MAX_SIZE, mode="w+b")
+            self._buf = tempfile.SpooledTemporaryFile(max_size=self._SPOOL_MAX_SIZE, mode="w+b")
         if "b" not in self._mode:
             self._text_wrapper = io.TextIOWrapper(
                 self._buf,
@@ -1415,11 +1397,12 @@ class _CloudFile:
 
     def _make_reader(self, size: int) -> io.IOBase:
         """Create a lazily-filled reader backed by range reads."""
-        raw = _CloudRawIO(self._path, size)
+        raw = self._make_raw_reader(size)
         if self._buffering == 0:
             # Unbuffered: return raw directly (binary only)
             if "b" not in self._mode:
                 raise ValueError("can't have unbuffered text I/O")
+            self._reader = raw
             return raw
         reader = io.BufferedReader(raw, buffer_size=self._chunk_size)
         self._reader = reader
@@ -1431,6 +1414,9 @@ class _CloudFile:
                 newline=self._newline,
             )
         return reader
+
+    def _make_raw_reader(self, size: int) -> _CloudRawIO:
+        return _CloudRawIO(self._path, size)
 
     def _spool_for_upload(self) -> tuple[IO[bytes], int]:
         """Flush any text layer and rewind the spool; return ``(buffer, size)``."""
