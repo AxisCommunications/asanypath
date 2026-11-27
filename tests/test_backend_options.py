@@ -153,6 +153,57 @@ def test_cli_src_and_dst_options_are_scoped():
     assert by_path["s3://b/k"] == {"aws_region": "r0", "profile": "dst"}
 
 
+def test_cli_ssh_alias_source_options(monkeypatch, tmp_path):
+    monkeypatch.setenv("SSH_CONFIG", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "asanypath.ssh.ssh_resolve_config",
+        lambda host, paths: ("real.example.com", 2222, "deploy", None, None, None),
+    )
+    calls = []
+
+    def fake(path, **kwargs):
+        calls.append((path, kwargs))
+        result = MagicMock()
+        result.exists = AsyncMock(return_value=True)
+        result.is_dir = AsyncMock(return_value=False)
+        result.copy = AsyncMock()
+        return result
+
+    with patch("asanypath.cli.AsAnyPath", side_effect=fake):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "cp",
+                "alias:file",
+                str(tmp_path / "out"),
+                "--src-option",
+                "ssh.port=2223",
+                "--src-option",
+                "username=other",
+                "--src-option",
+                "client_keys=/keys/example",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert dict(calls)["ssh://alias/~/file"] == {
+        "port": 2223,
+        "username": "other",
+        "client_keys": "/keys/example",
+    }
+
+
+def test_cli_scp_style_reports_config_parse_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("SSH_CONFIG", str(tmp_path / "config"))
+
+    def fail(host, paths):
+        raise RuntimeError("ssh_config parse: invalid port")
+
+    monkeypatch.setattr("asanypath.ssh.ssh_resolve_config", fail)
+    result = CliRunner().invoke(cli, ["cp", "alias:file", str(tmp_path / "out")])
+    assert result.exit_code != 0
+    assert "ssh_config parse: invalid port" in result.output
+
+
 def test_cli_http_headers_are_repeatable_and_scoped():
     calls = []
 

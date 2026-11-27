@@ -179,12 +179,9 @@ def _resolve_alias(
     cfg_paths = _discover_ssh_config()
     if not host or not cfg_paths:
         return host, port, user, None, None, None
-    try:
-        cfg_host, cfg_port, cfg_user, cfg_identity, cfg_strict, cfg_known = ssh_resolve_config(
-            host, cfg_paths
-        )
-    except Exception:  # noqa: BLE001
-        return host, port, user, None, None, None
+    cfg_host, cfg_port, cfg_user, cfg_identity, cfg_strict, cfg_known = ssh_resolve_config(
+        host, cfg_paths
+    )
     resolved_host = cfg_host or host
     resolved_port = port or cfg_port
     resolved_user = user or cfg_user
@@ -356,7 +353,7 @@ class SSHPath(CloudPathMixin):
         # Auth precedence mirrors ssh: explicit password, then key file
         # (explicit kwarg/env, else ssh_config IdentityFile), else agent.
         keys = self._client_keys or ()
-        key_path = keys[0] if keys else getattr(self, "_config_identity", None)
+        key_path = keys[0] if keys else self._expand_ssh_tokens(self._config_identity)
         if key_path is not None:
             key_path = str(Path(key_path).expanduser())
         if self._password is not None:
