@@ -10,6 +10,7 @@ import logging
 import re
 from base64 import b64encode
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from datetime import UTC
 from os import getenv, linesep
 from typing import TYPE_CHECKING, Literal
 from xml.etree.ElementTree import XMLParser
@@ -597,7 +598,7 @@ class HTTPPath(CloudPathMixin):
         remaining ``stat`` fields. Returns a ``SimpleNamespace`` matching the
         cloud-backend convention (see ``S3Path.stat``).
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
         from email.utils import parsedate_to_datetime
         from types import SimpleNamespace
 
@@ -613,7 +614,7 @@ class HTTPPath(CloudPathMixin):
                 try:
                     mtime = (
                         datetime.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT")
-                        .replace(tzinfo=timezone.utc)
+                        .replace(tzinfo=UTC)
                         .timestamp()
                     )
                 except ValueError:

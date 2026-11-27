@@ -4,7 +4,7 @@ Thank you for contributing to AsAnyPath.
 
 ## Getting Started
 
-Use Python 3.10 or newer and install the development dependencies:
+Use Python 3.11 or newer and install the development dependencies:
 
 ```bash
 uv sync --extra dev
@@ -31,7 +31,7 @@ cargo check --manifest-path rust/Cargo.toml
 ## Pull Requests
 
 Keep pull requests focused and include tests for changed behavior. Preserve
-compatibility with Python 3.10 through 3.15. Describe user-visible changes and
+compatibility with Python 3.11 through 3.15. Describe user-visible changes and
 document new configuration, credentials, or backend behavior in the README.
 
 Do not include credentials, private endpoints, customer data, or other

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from os import getenv
 from types import SimpleNamespace
 from uuid import uuid4
@@ -264,7 +264,7 @@ class AzurePath(CloudPathMixin, ServiceEndpointMixin):
         if last_modified:
             mtime = (
                 datetime.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT")
-                .replace(tzinfo=timezone.utc)
+                .replace(tzinfo=UTC)
                 .timestamp()
             )
         return SimpleNamespace(

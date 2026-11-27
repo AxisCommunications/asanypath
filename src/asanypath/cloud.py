@@ -1321,24 +1321,6 @@ class _CloudRawIO(io.RawIOBase):
         return self._pos
 
 
-class _SpooledWriteBuffer(tempfile.SpooledTemporaryFile):
-    """Spooled write buffer exposing the IOBase probes ``TextIOWrapper`` needs.
-
-    Python 3.10's ``SpooledTemporaryFile`` omits ``readable``/``writable``/
-    ``seekable`` (added in 3.11); the buffer is always opened ``w+b`` so all
-    three are unconditionally true.
-    """
-
-    def readable(self) -> bool:
-        return True
-
-    def writable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return True
-
-
 class _CloudFile:
     """File handle backed by cloud read/write with lazy range-read support.
 
@@ -1402,7 +1384,7 @@ class _CloudFile:
         if "r" in self._mode:
             self._buf = io.BytesIO(data or b"")
         else:
-            self._buf = _SpooledWriteBuffer(max_size=self._SPOOL_MAX_SIZE, mode="w+b")
+            self._buf = tempfile.SpooledTemporaryFile(max_size=self._SPOOL_MAX_SIZE, mode="w+b")
         if "b" not in self._mode:
             self._text_wrapper = io.TextIOWrapper(
                 self._buf,
