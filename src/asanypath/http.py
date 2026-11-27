@@ -29,7 +29,7 @@ from asanypath_native import (
 from yarl import URL
 
 from asanypath._transfer import RangeNotSupportedError
-from asanypath.cloud import CloudPathMixin, _CloudFile, _service_origin
+from asanypath.cloud import CloudPathMixin, _CloudFile, _CloudRawIO, _service_origin
 
 logger = logging.getLogger(__name__)
 
@@ -483,8 +483,8 @@ class HTTPPath(CloudPathMixin):
     def open(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
         """Open a seekable read-only handle with sync or async context management.
 
-        Downloads the response on context entry using read_bytes(), including
-        its authentication and cache settings. No HEAD or range support is required.
+        Read ranges lazily when the server provides a usable size. Servers that
+        do not support HEAD or ranges fall back to a full download.
         """
         if mode not in ("r", "rt", "tr", "rb", "br"):
             raise ValueError("HTTPPath.open() supports only read modes ('r', 'rt', 'rb')")
@@ -492,7 +492,7 @@ class HTTPPath(CloudPathMixin):
             raise ValueError("binary mode doesn't take an encoding, errors or newline argument")
         if buffering == 0 and "b" not in mode:
             raise ValueError("can't have unbuffered text I/O")
-        return _CloudFile(self, mode, buffering, encoding, errors, newline, range_read=False)
+        return _HTTPCloudFile(self, mode, buffering, encoding, errors, newline)
 
     async def _read_bytes_uncached(self) -> bytes:
         return await http_get(str(self), headers=self._merge_headers(None))
@@ -666,3 +666,84 @@ class HTTPSPath(HTTPPath):
     """Async path implementation for HTTPS."""
 
     protocol: str = "https"
+
+
+class _HTTPRawIO(_CloudRawIO):
+    def __init__(self, path, size: int, etag: str | None, last_modified: str | None):
+        super().__init__(path, size)
+        self._etag = etag
+        self._last_modified = last_modified
+        self._whole_response: bytes | None = None
+
+    def readinto(self, b):
+        if self._pos >= self._size or not b:
+            return 0
+        end = min(self._pos + len(b), self._size)
+        if self._whole_response is None:
+            from asanypath.sync import _SyncRunner
+
+            try:
+                data = _SyncRunner.get().run(
+                    self._path._range_read(
+                        self._pos,
+                        end - 1,
+                        etag=self._etag,
+                        last_modified=self._last_modified,
+                        total_size=self._size,
+                    )
+                )
+            except RangeNotSupportedError as error:
+                if len(error.data) != self._size:
+                    raise OSError("Source changed during ranged read") from error
+                self._whole_response = error.data
+                data = error.data[self._pos : end]
+        else:
+            data = self._whole_response[self._pos : end]
+        b[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
+class _HTTPCloudFile(_CloudFile):
+    async def _range_metadata(self):
+        from asanypath.cache import cache_enabled
+
+        if cache_enabled(None) or http_request is None:
+            return None
+        response = await self._path.request("HEAD", headers={"accept-encoding": "identity"})
+        if response.status_code in (400, 401, 403, 404, 405, 501):
+            logger.debug("HTTP HEAD unavailable; falling back to a full read")
+            return None
+        if not response.ok:
+            raise RuntimeError(f"HTTP {response.status_code} during HEAD request")
+        headers = {key.lower(): value for key, value in response.headers.items()}
+        if headers.get("accept-ranges", "").lower() == "none":
+            return None
+        if headers.get("content-encoding", "identity").lower() != "identity":
+            return None
+        size = self._get_size(headers)
+        if size is None or size <= 0:
+            return None
+        return size, headers.get("etag"), headers.get("last-modified")
+
+    def _make_raw_reader(self, size: int) -> _CloudRawIO:
+        return _HTTPRawIO(self._path, size, self._etag, self._last_modified)
+
+    def __enter__(self):
+        from asanypath.sync import _SyncRunner
+
+        self._sync = True
+        runner = _SyncRunner.get()
+        metadata = runner.run(self._range_metadata())
+        if metadata is not None:
+            size, self._etag, self._last_modified = metadata
+            return self._make_reader(size)
+        return self._make_buffer(runner.run(self._path.read_bytes()))
+
+    async def __aenter__(self):
+        self._sync = False
+        metadata = await self._range_metadata()
+        if metadata is not None:
+            size, self._etag, self._last_modified = metadata
+            return self._make_reader(size)
+        return self._make_buffer(await self._path.read_bytes())
