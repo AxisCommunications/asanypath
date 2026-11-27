@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 
@@ -291,7 +291,7 @@ class S3Path(CloudPathMixin, ServiceEndpointMixin):
         if last_modified:
             mtime = (
                 datetime.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT")
-                .replace(tzinfo=timezone.utc)
+                .replace(tzinfo=UTC)
                 .timestamp()
             )
         return SimpleNamespace(

@@ -56,7 +56,7 @@ import hashlib
 import netrc
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from os import getenv
 from types import SimpleNamespace
 from typing import IO, TYPE_CHECKING, TypeVar, cast
@@ -111,7 +111,7 @@ def _parse_mlst_mtime(modify: str | None) -> float | None:
     if not modify:
         return None
     fmt = "%Y%m%d%H%M%S.%f" if "." in modify else "%Y%m%d%H%M%S"
-    return datetime.strptime(modify, fmt).replace(tzinfo=timezone.utc).timestamp()
+    return datetime.strptime(modify, fmt).replace(tzinfo=UTC).timestamp()
 
 
 _NETRC_WARNED = False

@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -455,11 +455,11 @@ class TestFTPPath(testbase):
     [
         (
             "20240115093045",
-            datetime(2024, 1, 15, 9, 30, 45, tzinfo=timezone.utc).timestamp(),
+            datetime(2024, 1, 15, 9, 30, 45, tzinfo=UTC).timestamp(),
         ),
         (
             "20240115093045.250000",
-            datetime(2024, 1, 15, 9, 30, 45, 250000, tzinfo=timezone.utc).timestamp(),
+            datetime(2024, 1, 15, 9, 30, 45, 250000, tzinfo=UTC).timestamp(),
         ),
         (None, None),
         ("", None),

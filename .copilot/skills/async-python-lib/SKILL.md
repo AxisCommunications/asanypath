@@ -4,7 +4,7 @@
 Guide development of async Python libraries with clean APIs, proper typing, and thorough testing.
 
 ## Technical Stack
-- **Python**: 3.10+ with full async/await
+- **Python**: 3.11+ with full async/await
 - **Package Manager**: uv (sync, run, build)
 - **Build**: hatchling
 - **Lint/Format**: ruff

@@ -14,8 +14,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from click.testing import CliRunner
 
 from asanypath import AsAnyPath
+from asanypath.cli import cli
 from asanypath.options import AccessGrant, AccessPolicyPatch
 from asanypath.ssh import SSHPath, disconnect_all
 from tests.conftest import classtest_factory
@@ -46,6 +48,41 @@ async def test_ssh_copy_uses_size_aware_parallel_ranges(ssh, tmp_path):
     assert await dst.read_bytes() == data
     assert peak == 4
     ssh.read.assert_not_awaited()
+
+
+def test_cli_copies_alias_to_local_with_source_options(ssh, tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_CONFIG", str(tmp_path / "config"))
+    monkeypatch.setattr(SSHPath, "_env_config", None)
+    monkeypatch.setattr(
+        "asanypath.ssh.ssh_resolve_config",
+        lambda host, paths: ("real.example.com", 2222, "deploy", None, "yes", None),
+    )
+    ssh.stat.return_value = _stat(size=7)
+    ssh.read.return_value = b"payload"
+    destination = tmp_path / "download"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "cp",
+            "alias:file",
+            str(destination),
+            "--chunk-size",
+            "0",
+            "--src-option",
+            "ssh.port=2223",
+            "--src-option",
+            "ssh.username=other",
+            "--src-option",
+            "ssh.client_keys=/keys/example",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert destination.read_bytes() == b"payload"
+    assert ssh.read.await_args.kwargs["path"] == "./file"
+    assert ssh.read.await_args.kwargs["host"] == "real.example.com"
+    assert ssh.read.await_args.kwargs["port"] == 2223
+    assert ssh.read.await_args.kwargs["user"] == "other"
+    assert ssh.read.await_args.kwargs["key_path"] == "/keys/example"
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +640,18 @@ def test_unknown_alias_passes_through(resolve_config):
 def test_explicit_kwargs_override_alias(resolve_config):
     p = SSHPath("ssh://myalias/x", port=9999)
     assert p._resolved_port == 9999
+
+
+def test_config_identity_expands_connection_tokens(resolve_config):
+    resolve_config.return_value = ("real.example.com", 2222, "deploy", "/keys/%r-%h-%p", None, None)
+    p = SSHPath("ssh://myalias/x")
+    assert p._native_kwargs["key_path"] == "/keys/deploy-real.example.com-2222"
+
+
+def test_config_parse_error_is_not_silently_ignored(resolve_config):
+    resolve_config.side_effect = RuntimeError("ssh_config parse: invalid port")
+    with pytest.raises(RuntimeError, match="ssh_config parse: invalid port"):
+        SSHPath("ssh://myalias/x")
 
 
 def test_no_ssh_config_means_no_resolution(monkeypatch):
