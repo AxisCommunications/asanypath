@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from importlib import import_module
 from os import PathLike, stat_result
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -48,25 +50,60 @@ class _LazyDict(dict):
     def __init__(self) -> None:
         super().__init__()
         self._pending = dict(_BUILTIN_PROTOCOLS)
+        self._lock = Lock()
+        self._loading: dict[str, int] = {}
+        self._generation = 0
+
+    def _after_fork(self):
+        self._lock = Lock()
+        self._loading.clear()
+        self._generation += 1
 
     def _load(self, key) -> bool:
-        spec = self._pending.pop(key, None)
-        if spec is None:
-            return False
+        with self._lock:
+            if super().__contains__(key):
+                self._pending.pop(key, None)
+                return True
+            spec = self._pending.get(key)
+            if spec is None:
+                return False
+            self._loading[key] = self._loading.get(key, 0) + 1
+            generation = self._generation
+
+        unavailable = False
         try:
-            klass = getattr(import_module(spec[0]), spec[1])
-        except ImportError:  # optional backend dependency not installed
-            return False
-        self.setdefault(key, klass)
-        return True
+            # Do not hold the registry lock while Python's import locks are held.
+            try:
+                klass = getattr(import_module(spec[0]), spec[1])
+            except ImportError:  # optional backend dependency not installed
+                unavailable = True
+                return False
+            with self._lock:
+                self.setdefault(key, klass)
+                if self._pending.get(key) == spec:
+                    self._pending.pop(key)
+            return True
+        finally:
+            with self._lock:
+                if self._generation == generation:
+                    remaining = self._loading[key] - 1
+                    if remaining:
+                        self._loading[key] = remaining
+                    else:
+                        del self._loading[key]
+                        if unavailable and self._pending.get(key) == spec:
+                            self._pending.pop(key)
 
     def _ensure(self):
-        for key in list(self._pending):
+        with self._lock:
+            pending = list(self._pending)
+        for key in pending:
             self._load(key)
 
     def __setitem__(self, key, value):
-        self._pending.pop(key, None)
-        super().__setitem__(key, value)
+        with self._lock:
+            super().__setitem__(key, value)
+            self._pending.pop(key, None)
 
     def items(self):
         self._ensure()
@@ -97,12 +134,13 @@ class _LazyDict(dict):
         return super().get(key, default)
 
     def __missing__(self, key):
-        if self._load(key):
-            return self[key]
-        return UnsupportedProtocolPath
+        self._load(key)
+        return super().get(key, UnsupportedProtocolPath)
 
 
 PROTOCOL_MAP = _LazyDict()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=PROTOCOL_MAP._after_fork)
 
 # Flavors whose abstract-method implementation has been validated once.
 _VALIDATED_FLAVORS: set[type] = set()
